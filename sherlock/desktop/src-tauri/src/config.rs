@@ -325,6 +325,20 @@ mod tests {
         assert_eq!(result, dunce::canonicalize(dir.path()).expect("canon"));
     }
 
+    /// GVFS mount names contain `:` and `,` and `=`, e.g.
+    /// `smb-share:server=nas,share=fotos`. They must round-trip unchanged.
+    #[test]
+    fn expand_and_canonicalize_gvfs_style_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gvfs = dir.path().join("smb-share:server=nas,share=fotos");
+        std::fs::create_dir_all(&gvfs).expect("create gvfs dir");
+
+        let raw = gvfs.to_str().expect("utf8");
+        let result = expand_and_canonicalize(raw).expect("gvfs path");
+        assert_eq!(result, dunce::canonicalize(&gvfs).expect("canon"));
+        assert!(result.to_string_lossy().contains("server=nas,share=fotos"));
+    }
+
     #[test]
     fn expand_and_canonicalize_tilde() {
         if let Some(home) = dirs::home_dir() {

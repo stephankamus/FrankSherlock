@@ -447,3 +447,48 @@
   color: var(--text-secondary);
   font-style: italic;
 }
+
+/* ── Offline roots ────────────────────────────────────────── */
+/* The share is unreachable right now, but every indexed row is kept. */
+.root-card-offline {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--warning-bg, rgba(226, 160, 50, 0.18));
+  color: var(--warning, #e2a032);
+  font-size: 0.6rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.root-card-scan-offline span {
+  display: block;
+  white-space: normal;
+  color: var(--warning, #e2a032);
+}
+
+/* ── Storage info / compaction ────────────────────────────── */
+.sidebar-item-muted {
+  opacity: 0.7;
+}
+
+.sidebar-compact-btn {
+  margin: 6px 12px 4px;
+  padding: 3px 8px;
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 0.65rem;
+  cursor: pointer;
+}
+
+.sidebar-compact-btn:hover:not(:disabled) {
+  border-color: var(--border-focus);
+}
+
+.sidebar-compact-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}

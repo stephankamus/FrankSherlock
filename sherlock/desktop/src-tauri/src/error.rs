@@ -14,6 +14,11 @@ pub enum AppError {
     Config(String),
     #[error("task join error: {0}")]
     Join(String),
+    /// The scan root exists in the index but cannot be reached right now
+    /// (unmounted share, disconnected network drive, stale GVFS path, ...).
+    /// Aborts the scan without touching any indexed rows.
+    #[error("root unavailable: {0}")]
+    RootUnavailable(String),
 }
 
 pub type AppResult<T> = Result<T, AppError>;

@@ -74,7 +74,16 @@ export type DbStats = {
   roots: number;
   files: number;
   dbSizeBytes: number;
+  /** Bytes that actually hold rows. Drops after deletes, unlike dbSizeBytes. */
+  dbLogicalBytes?: number;
+  /** Bytes sitting in the SQLite freelist, reclaimable with VACUUM. */
+  dbFreeBytes?: number;
   thumbsSizeBytes: number;
+};
+
+export type CompactResult = {
+  beforeBytes: number;
+  afterBytes: number;
 };
 
 export type RuntimeStatus = {
@@ -146,6 +155,10 @@ export type RootInfo = {
   createdAt: number;
   lastScanAt: number | null;
   fileCount: number;
+  /** Roots are never deleted automatically when unreachable; they are flagged. */
+  availability?: "online" | "offline" | "unknown";
+  lastSeenAt?: number | null;
+  lastError?: string | null;
 };
 
 export type DeleteFilesResult = {

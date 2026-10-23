@@ -27,6 +27,9 @@ type SidebarProps = {
   onRescanRoot: (root: RootInfo) => void;
   onRefreshRoot: (root: RootInfo) => void;
   onCopyRootPath: (root: RootInfo) => void;
+  onRelinkRoot?: (root: RootInfo) => void;
+  onCompactDatabase?: () => void;
+  compacting?: boolean;
   onDetectFaces: (root: RootInfo) => void;
   onCancelFaceDetect: () => void;
   onCancelScan: (scan: ScanJobStatus) => void;
@@ -54,6 +57,7 @@ export default function Sidebar({
   setupReady, albums, smartFolders, activeAlbumName, activeSmartFolderId,
   selectedSubdir, faceProgress, onSelectSubdir,
   onSelectRoot, onDeleteRoot, onRescanRoot, onRefreshRoot, onCopyRootPath, onPickAndScan,
+  onRelinkRoot, onCompactDatabase, compacting,
   onDetectFaces, onCancelFaceDetect,
   onCancelScan, onResumeScan,
   onSelectAlbum, onDeleteAlbum, onSelectSmartFolder, onDeleteSmartFolder,
@@ -107,6 +111,7 @@ export default function Sidebar({
                   onRescan={() => onRescanRoot(root)}
                   onRefresh={() => onRefreshRoot(root)}
                   onCopyPath={() => onCopyRootPath(root)}
+                  onRelink={!readOnly && onRelinkRoot ? () => onRelinkRoot(root) : undefined}
                   onDetectFaces={!readOnly ? () => onDetectFaces(root) : undefined}
                   onCancelScan={scan?.status === "running" ? () => onCancelScan(scan) : undefined}
                   onResumeScan={scan?.status === "interrupted" ? () => onResumeScan(scan) : undefined}
@@ -226,7 +231,23 @@ export default function Sidebar({
         <div className="sidebar-section"><span>Info</span></div>
         <div className="sidebar-item">Files: <span>{dbStats?.files ?? "..."}</span></div>
         <div className="sidebar-item">DB size: <span>{dbStats ? formatBytes(dbStats.dbSizeBytes) : "..."}</span></div>
+        {dbStats?.dbLogicalBytes != null && dbStats.dbLogicalBytes !== dbStats.dbSizeBytes && (
+          <div className="sidebar-item sidebar-item-muted">
+            In use: <span>{formatBytes(dbStats.dbLogicalBytes)}</span>
+          </div>
+        )}
         <div className="sidebar-item">Thumbs: <span>{dbStats ? formatBytes(dbStats.thumbsSizeBytes) : "..."}</span></div>
+        {!readOnly && onCompactDatabase && (dbStats?.dbFreeBytes ?? 0) > 0 && (
+          <button
+            type="button"
+            className="sidebar-compact-btn"
+            onClick={onCompactDatabase}
+            disabled={compacting}
+            title="Reclaim free space in the database with VACUUM"
+          >
+            {compacting ? "Compacting…" : `Compact DB (${formatBytes(dbStats?.dbFreeBytes ?? 0)} free)`}
+          </button>
+        )}
       </div>
     </aside>
   );

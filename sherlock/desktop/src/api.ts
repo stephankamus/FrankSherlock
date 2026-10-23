@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   Album,
   ClusterResult,
+  CompactResult,
   DbStats,
   DeleteFilesResult,
   DuplicatesResponse,
@@ -83,6 +84,24 @@ export async function removeRoot(rootId: number): Promise<PurgeResult> {
 
 export async function listRoots(): Promise<RootInfo[]> {
   return invoke<RootInfo[]>("list_roots");
+}
+
+/**
+ * Re-check every root and return the refreshed list. Unreachable roots are
+ * marked `offline` instead of being deleted.
+ */
+export async function probeRoots(): Promise<RootInfo[]> {
+  return invoke<RootInfo[]>("probe_roots");
+}
+
+/** Point an existing root at a new path, keeping its index and classification. */
+export async function relinkRoot(rootId: number, newPath: string): Promise<RootInfo[]> {
+  return invoke<RootInfo[]>("relink_root", { rootId, newPath });
+}
+
+/** Run VACUUM to reclaim space left by deletes or purges. */
+export async function compactDatabase(): Promise<CompactResult> {
+  return invoke<CompactResult>("compact_database");
 }
 
 export async function listSubdirectories(rootId: number, parentPrefix: string): Promise<SubdirEntry[]> {

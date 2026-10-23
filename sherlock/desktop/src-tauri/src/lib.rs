@@ -24,10 +24,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use config::{prepare_dirs, resolve_paths, AppPaths};
 use error::AppError;
 use models::{
-    Album, DeleteFilesResult, DuplicatesResponse, HealthCheckOutcome, HealthStatus, PdfPassword,
-    ProtectedPdfInfo, PurgeResult, RenameFileResult, RetryProtectedPdfsResult, RootInfo,
-    RuntimeStatus, ScanJobStatus, SearchRequest, SearchResponse, SetupDownloadStatus, SetupStatus,
-    SmartFolder, SubdirEntry, VenvProvisionStatus,
+    Album, CompactResult, DeleteFilesResult, DuplicatesResponse, HealthCheckOutcome, HealthStatus,
+    PdfPassword, ProtectedPdfInfo, PurgeResult, RenameFileResult, RetryProtectedPdfsResult,
+    RootInfo, RuntimeStatus, ScanJobStatus, SearchRequest, SearchResponse, SetupDownloadStatus,
+    SetupStatus, SmartFolder, SubdirEntry, VenvProvisionStatus,
 };
 use tauri::Manager;
 use tauri::State;
@@ -394,6 +394,54 @@ fn remove_root(root_id: i64, state: State<'_, AppState>) -> Result<PurgeResult, 
 #[tauri::command]
 fn list_roots(state: State<'_, AppState>) -> Result<Vec<RootInfo>, String> {
     db::list_roots(&state.paths.db_file).map_err(|e| e.to_string())
+}
+
+/// Refresh `roots.availability` for every root.
+///
+/// Read-only mode only lists, because probing writes the availability column.
+#[tauri::command]
+fn probe_roots(state: State<'_, AppState>) -> Result<Vec<RootInfo>, String> {
+    if state.read_only {
+        return db::list_roots(&state.paths.db_file).map_err(|e| e.to_string());
+    }
+    db::probe_roots(&state.paths.db_file).map_err(|e| e.to_string())
+}
+
+/// Repoint a root at a new location, preserving its whole index.
+#[tauri::command]
+fn relink_root(
+    root_id: i64,
+    new_path: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<RootInfo>, String> {
+    require_writable(state.inner())?;
+    let canonical = config::expand_and_canonicalize(&new_path).map_err(|e| e.to_string())?;
+    db::relink_root(
+        &state.paths.db_file,
+        root_id,
+        &canonical.display().to_string(),
+    )
+    .map_err(|e| e.to_string())?;
+    db::probe_roots(&state.paths.db_file).map_err(|e| e.to_string())
+}
+
+/// Reclaim disk space with `VACUUM` after deletions or a root purge.
+#[tauri::command]
+async fn compact_database(state: State<'_, AppState>) -> Result<CompactResult, String> {
+    require_writable(state.inner())?;
+    if !state
+        .running_scan_jobs
+        .lock()
+        .expect("scan job mutex poisoned")
+        .is_empty()
+    {
+        return Err("Cannot compact the database while a scan is running".to_string());
+    }
+    let db_path = state.paths.db_file.clone();
+    tauri::async_runtime::spawn_blocking(move || db::compact_database(&db_path))
+        .await
+        .map_err(|e| AppError::Join(e.to_string()).to_string())?
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1726,14 +1774,22 @@ pub fn run() {
                     }
                 }
 
-                match db::validate_and_purge_stale_roots(&paths.db_file, &paths.thumbnails_dir) {
-                    Ok(purged) => {
-                        for root in &purged {
-                            log::info!("Purged stale root: {root}");
+                // Probe roots instead of deleting them. A network share that is
+                // unmounted at boot, after suspend, or after a logout used to be
+                // purged here, destroying every indexed row and thumbnail.
+                // Unreachable roots are now flagged `offline` and can be relinked.
+                match db::probe_roots(&paths.db_file) {
+                    Ok(roots) => {
+                        for root in roots.iter().filter(|r| r.availability == "offline") {
+                            log::warn!(
+                                "Root offline at startup ({} files kept): {}",
+                                root.file_count,
+                                root.root_path
+                            );
                         }
                     }
                     Err(e) => {
-                        log::warn!("Stale root validation failed: {e}");
+                        log::warn!("Root probe failed: {e}");
                     }
                 }
 
@@ -1818,6 +1874,9 @@ pub fn run() {
             cancel_scan,
             remove_root,
             list_roots,
+            probe_roots,
+            relink_root,
+            compact_database,
             list_subdirectories,
             load_user_config,
             save_user_config,

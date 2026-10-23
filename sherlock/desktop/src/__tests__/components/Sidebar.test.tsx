@@ -72,6 +72,54 @@ describe("Sidebar", () => {
     expect(screen.getByText("48.8 MB")).toBeInTheDocument();
   });
 
+  it("marks unreachable roots offline and offers a locate action", async () => {
+    const onRelinkRoot = vi.fn();
+    const offlineRoot: RootInfo = {
+      ...sampleRoot,
+      availability: "offline",
+      lastError: "not a directory or unavailable",
+    };
+    render(
+      <Sidebar
+        {...defaultProps}
+        roots={[offlineRoot]}
+        onRelinkRoot={onRelinkRoot}
+      />,
+    );
+
+    expect(screen.getByText("Offline")).toBeInTheDocument();
+    expect(screen.getByText(/files stay indexed/)).toBeInTheDocument();
+
+    await userEvent.click(screen.getByText("Locate…"));
+    expect(onRelinkRoot).toHaveBeenCalledWith(offlineRoot);
+  });
+
+  it("offers database compaction when free pages exist", async () => {
+    const onCompactDatabase = vi.fn();
+    render(
+      <Sidebar
+        {...defaultProps}
+        dbStats={{
+          files: 0,
+          roots: 1,
+          dbSizeBytes: 633 * 1024 * 1024,
+          dbLogicalBytes: 33 * 1024 * 1024,
+          dbFreeBytes: 600 * 1024 * 1024,
+          thumbsSizeBytes: 0,
+        }}
+        onCompactDatabase={onCompactDatabase}
+      />,
+    );
+
+    // The file size and the in-use size are both shown, so a purged database
+    // does not look full.
+    expect(screen.getByText("633.0 MB")).toBeInTheDocument();
+    expect(screen.getByText("33.0 MB")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: /Compact DB/ }));
+    expect(onCompactDatabase).toHaveBeenCalled();
+  });
+
   it("disables add button when setup not ready", () => {
     render(<Sidebar {...defaultProps} setupReady={false} />);
     const addBtn = screen.getByTitle("Add folder to scan");

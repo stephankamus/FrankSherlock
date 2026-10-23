@@ -1,9 +1,10 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
-  cancelScan, copyFilesToClipboard, deleteFiles, ensureDatabase,
+  cancelScan, compactDatabase, copyFilesToClipboard, deleteFiles, ensureDatabase,
   getCliFolderPath, getFileMetadata, getFileProperties, listRoots,
-  removeRoot, renameFile, reorderRoots, startScan, updateFileMetadata,
+  relinkRoot, removeRoot, renameFile, reorderRoots, startScan, updateFileMetadata,
 } from "./api";
 import type {
   DbStats,
@@ -17,7 +18,7 @@ import type {
   SortOrder,
 } from "./types";
 import { errorMessage } from "./utils";
-import { fileName } from "./utils/format";
+import { fileName, formatBytes } from "./utils/format";
 import Titlebar from "./components/Titlebar/Titlebar";
 import Sidebar from "./components/Sidebar/Sidebar";
 import Content from "./components/Content/Content";
@@ -69,6 +70,7 @@ export default function App() {
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [dbStats, setDbStats] = useState<DbStats | null>(null);
   const [roots, setRoots] = useState<RootInfo[]>([]);
+  const [compacting, setCompacting] = useState(false);
   const [selectedRootId, setSelectedRootId] = useState<number | null>(null);
   const [readOnly, setReadOnly] = useState(false);
   const [showResumeModal, setShowResumeModal] = useState(false);
@@ -346,6 +348,47 @@ export default function App() {
       await runSearch(0, false);
     } catch (err) {
       setError(errorMessage(err));
+    }
+  }
+
+  /**
+   * Point an existing root at a newly mounted folder. The index, classification,
+   * albums and faces are preserved because only the path prefix changes.
+   */
+  async function onRelinkRoot(root: RootInfo) {
+    if (readOnly) return;
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: `Locate "${root.rootName}"`,
+      });
+      if (typeof selected !== "string") return;
+      const updated = await relinkRoot(root.id, selected);
+      setRoots(updated);
+      setNotice(
+        `Relinked "${root.rootName}". Existing index kept — run Refresh Metadata to validate the files.`,
+      );
+    } catch (err) {
+      setError(errorMessage(err));
+    }
+  }
+
+  /** Reclaim space left by deletions or a purged root. */
+  async function onCompactDatabase() {
+    if (readOnly) return;
+    setCompacting(true);
+    try {
+      const result = await compactDatabase();
+      const stats = await ensureDatabase();
+      setDbStats(stats);
+      setNotice(
+        `Database compacted: ${formatBytes(result.beforeBytes)} → ${formatBytes(result.afterBytes)}`,
+      );
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setCompacting(false);
     }
   }
 
@@ -727,6 +770,9 @@ export default function App() {
             copyFilesToClipboard([root.rootPath]).catch(() => {});
             setNotice(`Copied path: ${root.rootPath}`);
           }}
+          onRelinkRoot={onRelinkRoot}
+          onCompactDatabase={onCompactDatabase}
+          compacting={compacting}
           onPickAndScan={() => scanManager.onPickAndScan(setup, readOnly)}
           onCancelScan={(scan) => scanManager.onCancelScan(scan, readOnly)}
           onResumeScan={(scan) => scanManager.onResumeScan(scan, readOnly)}

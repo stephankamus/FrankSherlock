@@ -13,13 +13,14 @@ type RootCardProps = {
   onRescan: () => void;
   onRefresh: () => void;
   onCopyPath: () => void;
+  onRelink?: () => void;
   onDetectFaces?: () => void;
   onCancelScan?: () => void;
   onResumeScan?: () => void;
   onCancelFaceDetect?: () => void;
 };
 
-export default function RootCard({ root, isSelected, scan, readOnly, faceProgress, onSelect, onDelete, onRescan, onRefresh, onCopyPath, onDetectFaces, onCancelScan, onResumeScan, onCancelFaceDetect }: RootCardProps) {
+export default function RootCard({ root, isSelected, scan, readOnly, faceProgress, onSelect, onDelete, onRescan, onRefresh, onCopyPath, onRelink, onDetectFaces, onCancelScan, onResumeScan, onCancelFaceDetect }: RootCardProps) {
   const [showMenu, setShowMenu] = useState(false);
   const [menuPos, setMenuPos] = useState({ x: 0, y: 0 });
   const menuRef = useRef<HTMLDivElement>(null);
@@ -109,7 +110,27 @@ export default function RootCard({ root, isSelected, scan, readOnly, faceProgres
       </div>
       <div className="root-card-meta">
         <span>{root.fileCount.toLocaleString()} files</span>
+        {root.availability === "offline" && (
+          <span
+            className="root-card-offline"
+            title={root.lastError ?? "Folder is not reachable right now"}
+          >
+            Offline
+          </span>
+        )}
       </div>
+      {root.availability === "offline" && (
+        <div className="root-card-scan root-card-scan-offline">
+          <span>Folder not reachable. {root.fileCount.toLocaleString()} files stay indexed.</span>
+          {!readOnly && onRelink && (
+            <button
+              type="button"
+              className="root-card-scan-btn"
+              onClick={(e) => { e.stopPropagation(); onRelink(); }}
+            >Locate…</button>
+          )}
+        </div>
+      )}
       {scan?.status === "running" && scan.phase === "discovering" && (
         <div className="root-card-scan">
           <div className="root-card-discovery-bar" />
@@ -178,6 +199,9 @@ export default function RootCard({ root, isSelected, scan, readOnly, faceProgres
           role="menu"
         >
           <button role="menuitem" onClick={(e) => { e.stopPropagation(); onCopyPath(); setShowMenu(false); }}>Copy Path</button>
+          {root.availability === "offline" && onRelink && (
+            <button role="menuitem" onClick={(e) => { e.stopPropagation(); onRelink(); setShowMenu(false); }}>Locate Folder…</button>
+          )}
           <button role="menuitem" onClick={(e) => { e.stopPropagation(); onRefresh(); setShowMenu(false); }}>Refresh Metadata</button>
           <button role="menuitem" onClick={(e) => { e.stopPropagation(); onRescan(); setShowMenu(false); }}>Rescan</button>
           {onDetectFaces && (

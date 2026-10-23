@@ -12,6 +12,11 @@ pub struct DbStats {
     pub roots: u64,
     pub files: u64,
     pub db_size_bytes: u64,
+    /// Bytes actually holding rows (`page_size * (page_count - freelist_count)`).
+    /// Stays small after a large delete, unlike `db_size_bytes`.
+    pub db_logical_bytes: u64,
+    /// Bytes sitting in the freelist, recoverable with `VACUUM`.
+    pub db_free_bytes: u64,
     pub thumbs_size_bytes: u64,
 }
 
@@ -355,6 +360,20 @@ pub struct RootInfo {
     pub created_at: i64,
     pub last_scan_at: Option<i64>,
     pub file_count: u64,
+    /// `online`, `offline` or `unknown`. Roots are never deleted automatically;
+    /// an unreachable root is kept and flagged so its index survives.
+    pub availability: String,
+    /// Unix seconds of the last successful reachability probe.
+    pub last_seen_at: Option<i64>,
+    /// Human readable reason for the last failed probe.
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactResult {
+    pub before_bytes: u64,
+    pub after_bytes: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
@@ -11,7 +11,8 @@ use walkdir::WalkDir;
 use crate::classify;
 use crate::config::canonical_root_path;
 use crate::db;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
+use crate::platform::fs::probe_dir;
 use std::path::PathBuf;
 
 use crate::models::{ExistingFile, FileRecordUpsert, ScanContext, ScanJobStatus, ScanSummary};
@@ -48,7 +49,31 @@ struct FileProbe {
     status: FileStatus,
 }
 
+/// Upper bound for the reachability checks that guard a scan.
+///
+/// `stat()` on a dead CIFS/SMB mount can block for minutes, so the check runs
+/// on a worker thread and the scan is aborted instead of waiting.
+const ROOT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Indexed files below this count are never subject to the collapse heuristic;
+/// a small library can legitimately change shape between scans.
+const SAFETY_MIN_EXISTING_FILES: usize = 100;
+
+/// A scan that finds less than this fraction of the indexed files is treated as
+/// a broken mount rather than as mass deletion.
+const SAFETY_MIN_RATIO: f64 = 0.5;
+
 pub fn start_or_resume_scan_job(db_path: &Path, root_path: &str) -> AppResult<ScanJobStatus> {
+    let probe = probe_dir(Path::new(root_path), ROOT_PROBE_TIMEOUT);
+    if !probe.is_dir {
+        return Err(AppError::RootUnavailable(format!(
+            "{root_path}: {}",
+            probe
+                .error
+                .unwrap_or_else(|| "path is not available".to_string())
+        )));
+    }
+
     let canonical_root = canonical_root_path(root_path)?;
     db::create_or_resume_scan_job(db_path, &canonical_root.display().to_string())
 }
@@ -72,6 +97,22 @@ fn run_scan_job_internal(
     let started = Instant::now();
     let db_path = &ctx.db_path;
     let job = db::get_scan_job_state(db_path, job_id)?;
+
+    // Never start discovery on an unreachable root: with zero files found the
+    // cleanup phase would soft-delete every row and delete its thumbnails.
+    let probe = probe_dir(Path::new(&job.root_path), ROOT_PROBE_TIMEOUT);
+    if !probe.is_dir {
+        let message = probe
+            .error
+            .unwrap_or_else(|| "path is not available".to_string());
+        db::mark_root_offline(db_path, job.root_id, &message)?;
+        return Err(AppError::RootUnavailable(format!(
+            "{}: {message}",
+            job.root_path
+        )));
+    }
+    db::mark_root_online(db_path, job.root_id)?;
+
     let root_path = canonical_root_path(&job.root_path)?;
 
     log::info!(
@@ -116,9 +157,17 @@ fn run_scan_job_internal(
             .push(file);
     }
 
+    // Rows soft-deleted by an earlier failed scan, indexed by rel_path so a
+    // reappearing file can be revived with its classification intact.
+    let mut deleted_by_path: HashMap<String, ExistingFile> =
+        db::load_deleted_files(db_path, job.root_id)?
+            .into_iter()
+            .map(|f| (f.rel_path.clone(), f))
+            .collect();
+
     // Phase 1: Incremental discovery (metadata-only for unchanged files)
     let discovery_start = Instant::now();
-    let probes = collect_image_probes_incremental(
+    let discovery = collect_image_probes_incremental(
         &root_path,
         &existing_by_path,
         &excluded_prefixes,
@@ -126,6 +175,8 @@ fn run_scan_job_internal(
         job_id,
         cancel_flag,
     )?;
+    let walk_errors = discovery.walk_errors;
+    let probes = discovery.probes;
 
     // If cancelled during discovery, bail out
     if cancel_flag.is_some_and(|f| f.load(Ordering::Relaxed)) {
@@ -141,6 +192,20 @@ fn run_scan_job_internal(
             deleted: 0,
             elapsed_ms: started.elapsed().as_millis() as u64,
         });
+    }
+
+    // Safety net: a share that is unmounted but whose mountpoint directory still
+    // exists enumerates as empty. Without this check, cleanup would soft-delete
+    // the whole index and purge thumbnails.
+    ensure_discovery_is_sane(probes.len(), existing_by_path.len()).inspect_err(|err| {
+        let _ = db::mark_root_offline(db_path, job.root_id, &err.to_string());
+    })?;
+
+    if walk_errors > 0 {
+        log::warn!(
+            "Scan job {}: {walk_errors} discovery error(s); cleanup will be skipped to protect the index",
+            job_id
+        );
     }
 
     let total_files = probes.len() as u64;
@@ -336,6 +401,49 @@ fn run_scan_job_internal(
                     modified += 1;
                 }
                 FileStatus::New => {
+                    // A row that was soft-deleted by an earlier failed scan can be
+                    // revived, keeping its description, OCR text, dhash, faces and
+                    // album membership instead of re-running the LLM on it.
+                    if let Some(candidate) = deleted_by_path.remove(&probe.rel_path) {
+                        if candidate.size_bytes == probe.size_bytes {
+                            db::restore_file_by_id(
+                                db_path,
+                                candidate.id,
+                                &probe.abs_path,
+                                probe.mtime_ns,
+                                probe.size_bytes,
+                                job.scan_marker,
+                            )?;
+                            // Thumbnails are removed when a row is soft-deleted,
+                            // so regenerate the ones that are gone.
+                            let thumb_result = thumbnail_only(ctx, probe);
+                            if let Some(ref thumb) = thumb_result.thumb_path {
+                                db::update_file_thumb_path(
+                                    db_path,
+                                    job.root_id,
+                                    &probe.rel_path,
+                                    thumb,
+                                )?;
+                            }
+                            unchanged += 1;
+                            processed_files += 1;
+                            last_cursor = Some(probe.rel_path.clone());
+                            db::checkpoint_scan_job(
+                                db_path,
+                                job_id,
+                                "thumbnailing",
+                                total_files,
+                                processed_files,
+                                last_cursor.as_deref(),
+                                added,
+                                modified,
+                                moved,
+                                unchanged,
+                            )?;
+                            continue;
+                        }
+                    }
+
                     // Check for move detection by fingerprint
                     if let Some(candidates) = by_fingerprint.get(&fingerprint) {
                         if let Some(candidate) = candidates.iter().find(|c| {
@@ -565,12 +673,26 @@ fn run_scan_job_internal(
         job_id
     );
 
-    // Phase 4: Cleanup deleted files
-    let deleted_at_before = db::now_epoch_secs_pub();
-    let deleted = db::mark_missing_as_deleted(db_path, job.root_id, job.scan_marker)?;
-    if deleted > 0 {
-        cleanup_deleted_caches(db_path, job.root_id, deleted_at_before, &ctx.thumbnails_dir);
-    }
+    // Phase 4: Cleanup deleted files.
+    //
+    // Skipped whenever discovery reported errors: a partial walk cannot prove
+    // that a file is gone, and a wrong soft-delete also drops its thumbnail and
+    // face crops from disk.
+    let deleted = if walk_errors > 0 {
+        log::warn!(
+            "Scan job {}: skipping cleanup after {} discovery error(s)",
+            job_id,
+            walk_errors
+        );
+        0
+    } else {
+        let deleted_at_before = db::now_epoch_secs_pub();
+        let deleted = db::mark_missing_as_deleted(db_path, job.root_id, job.scan_marker)?;
+        if deleted > 0 {
+            cleanup_deleted_caches(db_path, job.root_id, deleted_at_before, &ctx.thumbnails_dir);
+        }
+        deleted
+    };
     db::touch_root_scan(db_path, job.root_id)?;
 
     let summary = ScanSummary {
@@ -771,6 +893,38 @@ fn resume_start_index(probes: &[FileProbe], cursor_rel_path: Option<&str>) -> us
         .unwrap_or(probes.len())
 }
 
+/// Result of a discovery walk.
+struct Discovery {
+    probes: Vec<FileProbe>,
+    /// Number of entries the walk could not read. A non-zero value means the
+    /// file list may be incomplete, so cleanup must not run.
+    walk_errors: u64,
+}
+
+/// Reject a discovery result that cannot be trusted to describe the root.
+///
+/// Covers the classic network failure: the mountpoint directory still exists but
+/// the share is not mounted, so the walk succeeds and returns nothing. Deleting
+/// the index in that case is data loss, not cleanup.
+fn ensure_discovery_is_sane(probes_len: usize, existing_len: usize) -> AppResult<()> {
+    if probes_len == 0 && existing_len > 0 {
+        return Err(AppError::RootUnavailable(format!(
+            "discovery found 0 files but {existing_len} are indexed; is the share mounted?"
+        )));
+    }
+
+    if existing_len >= SAFETY_MIN_EXISTING_FILES
+        && (probes_len as f64) < existing_len as f64 * SAFETY_MIN_RATIO
+    {
+        return Err(AppError::RootUnavailable(format!(
+            "discovery found {probes_len} files but {existing_len} are indexed (below {:.0}%); refusing to delete index entries",
+            SAFETY_MIN_RATIO * 100.0
+        )));
+    }
+
+    Ok(())
+}
+
 /// Incremental file discovery: only reads file content for new/modified files.
 fn collect_image_probes_incremental(
     root: &Path,
@@ -779,10 +933,17 @@ fn collect_image_probes_incremental(
     db_path: &Path,
     job_id: i64,
     cancel_flag: Option<&AtomicBool>,
-) -> AppResult<Vec<FileProbe>> {
+) -> AppResult<Discovery> {
     let mut probes = Vec::new();
     let mut discovered: u64 = 0;
     let mut walk_entries: u64 = 0;
+    let mut walk_errors: u64 = 0;
+
+    // Some CIFS/SMB servers truncate or round timestamps, which would otherwise
+    // mark every file as modified on every scan and force needless re-thumbnailing
+    // and reclassification. On network mounts the timestamp may drift slightly.
+    let tolerant_mtime = crate::platform::fs::is_network_mount(root);
+    const MTIME_TOLERANCE_NS: u64 = 2_000_000_000;
     for entry in WalkDir::new(root)
         .follow_links(false)
         .into_iter()
@@ -793,14 +954,26 @@ fn collect_image_probes_incremental(
             }
             true
         })
-        .filter_map(|entry| entry.ok())
     {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                walk_errors += 1;
+                if walk_errors <= 5 {
+                    log::warn!("Discovery error under {}: {err}", root.display());
+                }
+                continue;
+            }
+        };
         walk_entries += 1;
 
         // Check cancel flag during discovery
         if let Some(flag) = cancel_flag {
             if flag.load(Ordering::Relaxed) {
-                return Ok(probes);
+                return Ok(Discovery {
+                    probes,
+                    walk_errors,
+                });
             }
         }
 
@@ -845,7 +1018,12 @@ fn collect_image_probes_incremental(
         let size_bytes = metadata.len() as i64;
 
         if let Some(existing) = existing_by_path.get(&rel) {
-            if existing.mtime_ns == mtime_ns && existing.size_bytes == size_bytes {
+            let same_timestamp = existing.mtime_ns == mtime_ns;
+            let tolerated_timestamp = tolerant_mtime
+                && existing.size_bytes == size_bytes
+                && existing.mtime_ns.abs_diff(mtime_ns) <= MTIME_TOLERANCE_NS;
+
+            if (same_timestamp || tolerated_timestamp) && existing.size_bytes == size_bytes {
                 // Unchanged: reuse DB fingerprint, no file content read
                 probes.push(FileProbe {
                     rel_path: rel,
@@ -891,12 +1069,16 @@ fn collect_image_probes_incremental(
     let sort_ms = sort_start.elapsed().as_millis();
 
     log::info!(
-        "Discovery breakdown: {} walkdir entries, {} supported files, sort {}ms (fingerprints deferred to phase 2)",
+        "Discovery breakdown: {} walkdir entries, {} supported files, {} errors, sort {}ms (fingerprints deferred to phase 2)",
         walk_entries,
         discovered,
+        walk_errors,
         sort_ms,
     );
-    Ok(probes)
+    Ok(Discovery {
+        probes,
+        walk_errors,
+    })
 }
 
 fn cleanup_deleted_caches(db_path: &Path, root_id: i64, deleted_at: i64, thumbnails_dir: &Path) {
@@ -1181,8 +1363,8 @@ mod tests {
             None,
         )
         .expect("probes");
-        assert_eq!(probes.len(), 1);
-        assert!(matches!(probes[0].status, FileStatus::Unchanged));
+        assert_eq!(probes.probes.len(), 1);
+        assert!(matches!(probes.probes[0].status, FileStatus::Unchanged));
     }
 
     #[test]
@@ -1231,8 +1413,8 @@ mod tests {
             None,
         )
         .expect("probes");
-        assert_eq!(probes.len(), 1);
-        assert!(matches!(probes[0].status, FileStatus::New));
+        assert_eq!(probes.probes.len(), 1);
+        assert!(matches!(probes.probes[0].status, FileStatus::New));
     }
 
     #[test]
@@ -1262,7 +1444,7 @@ mod tests {
             None,
         )
         .expect("probes all");
-        assert_eq!(probes_all.len(), 2);
+        assert_eq!(probes_all.probes.len(), 2);
 
         // With child dir excluded: only parent file found
         let excluded = vec![child_dir.clone()];
@@ -1275,8 +1457,8 @@ mod tests {
             None,
         )
         .expect("probes filtered");
-        assert_eq!(probes_filtered.len(), 1);
-        assert_eq!(probes_filtered[0].filename, "parent.jpg");
+        assert_eq!(probes_filtered.probes.len(), 1);
+        assert_eq!(probes_filtered.probes[0].filename, "parent.jpg");
     }
 
     #[test]
@@ -1336,11 +1518,11 @@ mod tests {
         )
         .expect("probes");
 
-        let filenames: Vec<&str> = probes.iter().map(|p| p.filename.as_str()).collect();
+        let filenames: Vec<&str> = probes.probes.iter().map(|p| p.filename.as_str()).collect();
         assert!(filenames.contains(&"photo.jpg"));
         assert!(filenames.contains(&"note.pdf"));
         assert!(!filenames.contains(&"spacer.gif"));
         assert!(!filenames.contains(&"favicon.png"));
-        assert_eq!(probes.len(), 2);
+        assert_eq!(probes.probes.len(), 2);
     }
 }

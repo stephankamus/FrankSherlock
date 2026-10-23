@@ -1,4 +1,5 @@
 pub mod clipboard;
+pub mod fs;
 pub mod gpu;
 pub mod paths;
 pub mod process;

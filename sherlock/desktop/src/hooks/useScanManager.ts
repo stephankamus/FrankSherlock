@@ -8,7 +8,7 @@ import {
   getScanJob,
   getSetupStatus,
   listActiveScans,
-  listRoots,
+  probeRoots,
   startScan,
   startSetupDownload,
   startVenvProvision,
@@ -65,7 +65,9 @@ export function useScanManager(cb: ScanManagerCallbacks) {
 
   const refreshRoots = useCallback(async () => {
     try {
-      const r = await listRoots();
+      // probeRoots re-checks reachability and flags offline roots instead of
+      // deleting them. It degrades to a plain list on a read-only database.
+      const r = await probeRoots();
       cb.setRoots(r);
     } catch {
       // Silently ignore
@@ -143,7 +145,7 @@ export function useScanManager(cb: ScanManagerCallbacks) {
         getSetupStatus(),
         getRuntimeStatus(),
         listActiveScans(),
-        listRoots(),
+        probeRoots(),
         appHealth(),
       ]);
       cb.setDbStats(db);

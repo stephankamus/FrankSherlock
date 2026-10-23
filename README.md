@@ -69,7 +69,15 @@ Recommended override values:
 
 Experimental alternatives such as `minicpm-v:8b` or `moondream` may work if installed in Ollama, but the prompts are tuned for `qwen2.5vl`.
 
+## Network shares and NAS paths
+
+Roots are indexed by path, so shares deserve care. A share that is unmounted at startup, after suspend or after a logout is no longer purged: it is kept and flagged `Offline` in the sidebar, and `Locate…` repoints the existing root at a new mount path while keeping classification, albums, duplicates and faces. Scans refuse to run when discovery collapses to zero files instead of deleting the index.
+
+See [docs/network-shares-linux.md](docs/network-shares-linux.md) for systemd automount setup, GVFS caveats, relinking and database compaction.
+
 ## Building from source
+
+For a full Ubuntu walkthrough (Rust, system libraries, Node, Ollama), see [docs/dev-setup-linux.md](docs/dev-setup-linux.md).
 
 ```bash
 # 1. Download native libraries for your platform

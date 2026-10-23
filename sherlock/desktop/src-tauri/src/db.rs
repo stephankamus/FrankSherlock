@@ -7,8 +7,8 @@ use rusqlite_migration::{HookError, Migrations, M};
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    Album, DbStats, DuplicateFile, DuplicateGroup, DuplicatesResponse, ExistingFile, FileMetadata,
-    FileProperties, FileRecordUpsert, HealthCheckOutcome, ParsedQuery, PdfPassword,
+    Album, CompactResult, DbStats, DuplicateFile, DuplicateGroup, DuplicatesResponse, ExistingFile,
+    FileMetadata, FileProperties, FileRecordUpsert, HealthCheckOutcome, ParsedQuery, PdfPassword,
     ProtectedPdfInfo, PurgeResult, RootInfo, ScanJobState, ScanJobStatus, SearchItem,
     SearchRequest, SearchResponse, SmartFolder, SortField, SortOrder, SubdirEntry,
 };
@@ -292,6 +292,18 @@ fn run_migrations(conn: &mut Connection) -> AppResult<()> {
             CREATE INDEX IF NOT EXISTS idx_people_name ON people(name COLLATE NOCASE);
             "#,
         ),
+        // Migration 13: Non-destructive root availability tracking.
+        //
+        // Roots are no longer deleted when their path becomes unreachable
+        // (unmounted network share, stale GVFS path after reboot). They are
+        // flagged instead, so a later relink or remount keeps the whole index.
+        M::up(
+            r#"
+            ALTER TABLE roots ADD COLUMN availability TEXT NOT NULL DEFAULT 'unknown';
+            ALTER TABLE roots ADD COLUMN last_seen_at INTEGER;
+            ALTER TABLE roots ADD COLUMN last_error TEXT;
+            "#,
+        ),
     ]);
 
     migrations
@@ -320,12 +332,30 @@ pub fn database_stats(db_path: &Path) -> AppResult<DbStats> {
         [],
         |r| r.get(0),
     )?;
+    let (logical_bytes, free_bytes) = db_page_stats(&conn)?;
     Ok(DbStats {
         roots: roots as u64,
         files: files as u64,
         db_size_bytes: 0,
+        db_logical_bytes: logical_bytes,
+        db_free_bytes: free_bytes,
         thumbs_size_bytes: 0,
     })
+}
+
+/// Logical (used) and freelist (reclaimable) bytes for an open database.
+///
+/// After a large delete the file on disk keeps its size while these numbers
+/// drop, which is why the UI reports both.
+fn db_page_stats(conn: &Connection) -> AppResult<(u64, u64)> {
+    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+    let freelist: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+    let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+    let used_pages = (page_count - freelist).max(0);
+    Ok((
+        (used_pages * page_size) as u64,
+        (freelist.max(0) * page_size) as u64,
+    ))
 }
 
 #[cfg(test)]
@@ -775,6 +805,37 @@ pub fn load_existing_files(db_path: &Path, root_id: i64) -> AppResult<Vec<Existi
     Ok(out)
 }
 
+/// Soft-deleted rows for a root.
+///
+/// A file that reappears at the same `rel_path` after a transient outage can
+/// be revived instead of being re-inserted with a blank classification, which
+/// would otherwise throw away every LLM description and OCR result.
+pub fn load_deleted_files(db_path: &Path, root_id: i64) -> AppResult<Vec<ExistingFile>> {
+    let conn = open_conn(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, rel_path, fingerprint, mtime_ns, size_bytes, confidence
+         FROM files
+         WHERE root_id = ?1 AND deleted_at IS NOT NULL",
+    )?;
+
+    let rows = stmt.query_map(params![root_id], |row| {
+        Ok(ExistingFile {
+            id: row.get(0)?,
+            rel_path: row.get(1)?,
+            fingerprint: row.get(2)?,
+            mtime_ns: row.get(3)?,
+            size_bytes: row.get(4)?,
+            confidence: row.get::<_, f64>(5)? as f32,
+        })
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 pub fn touch_file_scan_marker(
     db_path: &Path,
@@ -965,6 +1026,47 @@ pub fn move_file_by_id(
     Ok(())
 }
 
+/// Bring a soft-deleted row back into the index, keeping its classification.
+///
+/// Only filesystem-derived fields are refreshed; `description`,
+/// `extracted_text`, `canonical_mentions`, `confidence`, `media_type`, `dhash`,
+/// face detections and album links stay attached to the same row. Used when a
+/// file reappears after a transient outage or when a share is remounted.
+pub fn restore_file_by_id(
+    db_path: &Path,
+    file_id: i64,
+    abs_path: &str,
+    mtime_ns: i64,
+    size_bytes: i64,
+    scan_marker: i64,
+) -> AppResult<()> {
+    let conn = open_conn(db_path)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        r#"
+        UPDATE files
+        SET abs_path = ?2,
+            mtime_ns = ?3,
+            size_bytes = ?4,
+            scan_marker = ?5,
+            updated_at = ?6,
+            deleted_at = NULL
+        WHERE id = ?1
+        "#,
+        params![
+            file_id,
+            abs_path,
+            mtime_ns,
+            size_bytes,
+            scan_marker,
+            now_epoch_secs()
+        ],
+    )?;
+    refresh_fts(&tx, file_id)?;
+    tx.commit()?;
+    Ok(())
+}
+
 pub fn mark_missing_as_deleted(db_path: &Path, root_id: i64, scan_marker: i64) -> AppResult<u64> {
     let conn = open_conn(db_path)?;
     let tx = conn.unchecked_transaction()?;
@@ -1038,7 +1140,8 @@ pub fn list_roots(db_path: &Path) -> AppResult<Vec<RootInfo>> {
     let conn = open_conn(db_path)?;
     let mut stmt = conn.prepare(
         "SELECT r.id, r.root_path, r.root_name, r.created_at, r.last_scan_at,
-                (SELECT COUNT(*) FROM files f WHERE f.root_id = r.id AND f.deleted_at IS NULL)
+                (SELECT COUNT(*) FROM files f WHERE f.root_id = r.id AND f.deleted_at IS NULL),
+                r.availability, r.last_seen_at, r.last_error
          FROM roots r ORDER BY r.sort_order, r.id",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -1049,6 +1152,9 @@ pub fn list_roots(db_path: &Path) -> AppResult<Vec<RootInfo>> {
             created_at: row.get(3)?,
             last_scan_at: row.get(4)?,
             file_count: row.get::<_, i64>(5)? as u64,
+            availability: row.get(6)?,
+            last_seen_at: row.get(7)?,
+            last_error: row.get(8)?,
         })
     })?;
     let mut out = Vec::new();
@@ -1254,6 +1360,43 @@ pub fn recreate_database(db_path: &Path) -> AppResult<()> {
     init_database(db_path)
 }
 
+/// Reclaim disk space left behind by deletes (purged roots, soft-deleted files).
+///
+/// A SQLite file never shrinks on its own: a database that lost every row can
+/// still be hundreds of MB on disk. `VACUUM` rewrites it at its logical size.
+/// FTS5 segments are merged first so the search index shrinks too, and
+/// `auto_vacuum` is switched to incremental so later deletes release pages
+/// without another full rewrite.
+pub fn compact_database(db_path: &Path) -> AppResult<CompactResult> {
+    let before_bytes = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
+
+    let conn = open_conn(db_path)?;
+    // A VACUUM cannot run with a pending WAL; fold it into the main file first.
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    let _ = conn.execute("INSERT INTO files_fts(files_fts) VALUES('optimize')", []);
+    conn.execute_batch("VACUUM;")?;
+
+    let auto_vacuum: i64 = conn
+        .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+        .unwrap_or(0);
+    if auto_vacuum != 2 {
+        // Setting auto_vacuum only takes effect after a VACUUM.
+        conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;")?;
+    }
+    drop(conn);
+
+    let after_bytes = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
+    log::info!(
+        "Database compacted: {} -> {} bytes",
+        before_bytes,
+        after_bytes
+    );
+    Ok(CompactResult {
+        before_bytes,
+        after_bytes,
+    })
+}
+
 pub fn startup_health_check(db_path: &Path, backup_dir: &Path) -> AppResult<HealthCheckOutcome> {
     if !db_path.exists() {
         return Ok(HealthCheckOutcome::Healthy);
@@ -1271,31 +1414,132 @@ pub fn startup_health_check(db_path: &Path, backup_dir: &Path) -> AppResult<Heal
     Ok(HealthCheckOutcome::Recreated)
 }
 
-pub fn validate_and_purge_stale_roots(
-    db_path: &Path,
-    thumbnails_dir: &Path,
-) -> AppResult<Vec<String>> {
+/// Timeout for a single root reachability probe.
+///
+/// A dead CIFS/SMB mount can block `stat()` for minutes, so every probe is
+/// bounded even when the share is a local path.
+const ROOT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Refresh `roots.availability` without deleting anything.
+///
+/// This replaces the old `validate_and_purge_stale_roots`, which hard-deleted
+/// every file, thumbnail and face crop for a root that happened to be
+/// unreachable at startup. Network shares are routinely absent at boot, after
+/// suspend or after a logout, so that behavior destroyed indexes in normal use.
+/// Roots are now kept and flagged, and the UI offers a relink action.
+pub fn probe_roots(db_path: &Path) -> AppResult<Vec<RootInfo>> {
     let roots = list_roots(db_path)?;
-    let mut purged = Vec::new();
-    for root in roots {
-        if !Path::new(&root.root_path).is_dir() {
-            let result = purge_root(db_path, root.id)?;
-            // Also try to clean up the thumbnail subtree for this root
-            let thumb_root = thumbnails_dir.join(&root.root_name);
-            if thumb_root.is_dir() {
-                let _ = std::fs::remove_dir_all(&thumb_root);
-            }
-            log::info!(
-                "Purged stale root '{}': {} files, {} jobs, {} thumbs cleaned",
+    let conn = open_conn(db_path)?;
+    let now = now_epoch_secs();
+
+    for root in &roots {
+        let probe = crate::platform::fs::probe_dir(Path::new(&root.root_path), ROOT_PROBE_TIMEOUT);
+        if probe.is_dir {
+            conn.execute(
+                "UPDATE roots SET availability = 'online', last_seen_at = ?1, last_error = NULL
+                 WHERE id = ?2",
+                params![now, root.id],
+            )?;
+        } else {
+            let message = probe
+                .error
+                .unwrap_or_else(|| "path is not available".to_string());
+            conn.execute(
+                "UPDATE roots SET availability = 'offline', last_error = ?1 WHERE id = ?2",
+                params![message, root.id],
+            )?;
+            log::warn!(
+                "Root '{}' is offline ({} files kept): {}",
                 root.root_path,
-                result.files_removed,
-                result.jobs_removed,
-                result.thumbs_cleaned
+                root.file_count,
+                message
             );
-            purged.push(root.root_path);
         }
     }
-    Ok(purged)
+    drop(conn);
+
+    list_roots(db_path)
+}
+
+/// Mark a single root as offline, e.g. when a scan preflight fails.
+pub fn mark_root_offline(db_path: &Path, root_id: i64, error: &str) -> AppResult<()> {
+    let conn = open_conn(db_path)?;
+    conn.execute(
+        "UPDATE roots SET availability = 'offline', last_error = ?1 WHERE id = ?2",
+        params![error, root_id],
+    )?;
+    Ok(())
+}
+
+/// Mark a single root as reachable again.
+pub fn mark_root_online(db_path: &Path, root_id: i64) -> AppResult<()> {
+    let conn = open_conn(db_path)?;
+    conn.execute(
+        "UPDATE roots SET availability = 'online', last_seen_at = ?1, last_error = NULL
+         WHERE id = ?2",
+        params![now_epoch_secs(), root_id],
+    )?;
+    Ok(())
+}
+
+/// Point an existing root at a new location without losing its index.
+///
+/// Network shares get remounted at different paths: a GVFS `smb-share:` name
+/// embeds the server, share and login user, and an fstab mountpoint can move.
+/// Since `rel_path` is root-relative, only `roots.root_path`,
+/// `scan_jobs.root_path` and `files.abs_path` need to change; classification,
+/// albums, duplicates and faces stay attached to the same rows.
+pub fn relink_root(db_path: &Path, root_id: i64, new_path: &str) -> AppResult<()> {
+    let conn = open_conn(db_path)?;
+    let old_path: String = conn
+        .query_row(
+            "SELECT root_path FROM roots WHERE id = ?1",
+            params![root_id],
+            |r| r.get(0),
+        )
+        .map_err(|_| AppError::InvalidPath(format!("root {root_id} does not exist")))?;
+
+    let new_prefix = crate::platform::paths::normalize_rel_path(new_path);
+    let new_prefix = new_prefix.trim_end_matches('/').to_string();
+    if new_prefix.is_empty() {
+        return Err(AppError::InvalidPath("empty path".into()));
+    }
+
+    let old_prefix = crate::platform::paths::normalize_rel_path(&old_path);
+    let old_prefix = old_prefix.trim_end_matches('/').to_string();
+    if old_prefix == new_prefix {
+        return Ok(());
+    }
+
+    if let Ok(other) = conn.query_row(
+        "SELECT id FROM roots WHERE root_path = ?1 AND id <> ?2",
+        params![new_prefix, root_id],
+        |r| r.get::<_, i64>(0),
+    ) {
+        return Err(AppError::InvalidPath(format!(
+            "another root (id {other}) already uses {new_prefix}"
+        )));
+    }
+
+    let now = now_epoch_secs();
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE roots
+         SET root_path = ?1, availability = 'online', last_seen_at = ?2, last_error = NULL
+         WHERE id = ?3",
+        params![new_prefix, now, root_id],
+    )?;
+    tx.execute(
+        "UPDATE scan_jobs SET root_path = ?1 WHERE root_id = ?2",
+        params![new_prefix, root_id],
+    )?;
+    // `rel_path` is unchanged, so the new absolute path is prefix + rel_path.
+    tx.execute(
+        "UPDATE files SET abs_path = ?1 || '/' || rel_path WHERE root_id = ?2",
+        params![new_prefix, root_id],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -4313,33 +4557,172 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_and_purge_stale_roots() {
+    fn probe_roots_keeps_offline_root_and_its_files() {
         let (dir, db_path) = test_db_path();
         init_database(&db_path).expect("init");
 
-        // Insert root for a non-existent directory
+        let root_dir = dir.path().join("share");
+        std::fs::create_dir_all(&root_dir).expect("root dir");
+        let root_id = upsert_root(&db_path, root_dir.to_str().expect("utf8")).expect("root");
+        let rec = sample_record(root_id, "keep.jpg", "fp-keep");
+        upsert_file_record(&db_path, &rec).expect("upsert");
+
+        // Simulate a share disappearing, e.g. a GVFS path gone after reboot.
+        std::fs::remove_dir_all(&root_dir).expect("remove root dir");
+
+        let roots = probe_roots(&db_path).expect("probe");
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].availability, "offline");
+        assert!(roots[0].last_error.is_some());
+        assert_eq!(roots[0].file_count, 1, "offline roots keep their files");
+
+        let stats = database_stats(&db_path).expect("stats");
+        assert_eq!(stats.roots, 1);
+        assert_eq!(stats.files, 1);
+    }
+
+    #[test]
+    fn probe_roots_marks_online_root() {
+        let (dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_dir = dir.path().join("share");
+        std::fs::create_dir_all(&root_dir).expect("root dir");
+        upsert_root(&db_path, root_dir.to_str().expect("utf8")).expect("root");
+
+        let roots = probe_roots(&db_path).expect("probe");
+        assert_eq!(roots[0].availability, "online");
+        assert!(roots[0].last_seen_at.is_some());
+        assert!(roots[0].last_error.is_none());
+    }
+
+    #[test]
+    fn relink_root_rewrites_abs_paths_and_keeps_classification() {
+        let (dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let old_dir = dir.path().join("old-share");
+        std::fs::create_dir_all(&old_dir).expect("old dir");
+        let root_id = upsert_root(&db_path, old_dir.to_str().expect("utf8")).expect("root");
+        let rec = sample_record(root_id, "2026/a.jpg", "fp-a");
+        upsert_file_record(&db_path, &rec).expect("upsert");
+
+        let new_dir = dir.path().join("new-share");
+        std::fs::create_dir_all(&new_dir).expect("new dir");
+        let new_path = new_dir.to_str().expect("utf8");
+
+        relink_root(&db_path, root_id, new_path).expect("relink");
+
+        let roots = list_roots(&db_path).expect("list");
+        assert_eq!(roots[0].root_path, new_path);
+        assert_eq!(roots[0].availability, "online");
+
         let conn = open_conn(&db_path).expect("open");
-        conn.execute(
-            "INSERT INTO roots(root_path, root_name, created_at) VALUES (?1, ?2, ?3)",
-            params![
-                "/nonexistent/path/that/does/not/exist",
-                "ghost",
-                now_epoch_secs()
-            ],
+        let (abs, desc, conf): (String, String, f64) = conn
+            .query_row(
+                "SELECT abs_path, description, confidence FROM files WHERE rel_path = '2026/a.jpg'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("row");
+        assert_eq!(abs, format!("{new_path}/2026/a.jpg"));
+        assert_eq!(desc, "desc of 2026/a.jpg");
+        assert!((conf - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn relink_root_rejects_path_used_by_another_root() {
+        let (dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir_all(&a).expect("a");
+        std::fs::create_dir_all(&b).expect("b");
+        let id_a = upsert_root(&db_path, a.to_str().expect("utf8")).expect("root a");
+        upsert_root(&db_path, b.to_str().expect("utf8")).expect("root b");
+
+        let err = relink_root(&db_path, id_a, b.to_str().expect("utf8"));
+        assert!(matches!(err, Err(AppError::InvalidPath(_))));
+    }
+
+    #[test]
+    fn restore_file_by_id_keeps_classification() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/restore").expect("root");
+        let rec = sample_record(root_id, "back.jpg", "fp-back");
+        let file_id = upsert_file_record(&db_path, &rec).expect("upsert");
+
+        mark_missing_as_deleted(&db_path, root_id, 999).expect("soft delete");
+        assert!(load_existing_files(&db_path, root_id)
+            .expect("live")
+            .is_empty());
+        let deleted = load_deleted_files(&db_path, root_id).expect("deleted");
+        assert_eq!(deleted.len(), 1);
+
+        restore_file_by_id(
+            &db_path,
+            file_id,
+            "/tmp/restore/back.jpg",
+            1_700_000_000_000_000_001,
+            10_000,
+            1000,
         )
-        .expect("insert root");
+        .expect("restore");
+
+        let live = load_existing_files(&db_path, root_id).expect("live");
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id, file_id);
+        assert!(load_deleted_files(&db_path, root_id)
+            .expect("deleted")
+            .is_empty());
+
+        let conn = open_conn(&db_path).expect("open");
+        let (desc, conf): (String, f64) = conn
+            .query_row(
+                "SELECT description, confidence FROM files WHERE id = ?1",
+                params![file_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(desc, "desc of back.jpg");
+        assert!((conf - 0.7).abs() < 1e-6);
+
+        // The FTS row is removed on soft delete and must come back too.
+        let fts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files_fts WHERE rowid = ?1",
+                params![file_id],
+                |r| r.get(0),
+            )
+            .expect("fts");
+        assert_eq!(fts, 1);
+    }
+
+    #[test]
+    fn compact_database_reclaims_free_pages() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/compact").expect("root");
+        for i in 0..200 {
+            let mut rec = sample_record(root_id, &format!("img{i}.jpg"), &format!("fp-{i}"));
+            rec.description = "x".repeat(2_000);
+            upsert_file_record(&db_path, &rec).expect("upsert");
+        }
+
+        let conn = open_conn(&db_path).expect("open");
+        conn.execute("DELETE FROM files", []).expect("delete files");
+        conn.execute("DELETE FROM files_fts", [])
+            .expect("delete fts");
         drop(conn);
 
-        let thumbs_dir = dir.path().join("thumbs");
-        std::fs::create_dir_all(&thumbs_dir).expect("thumbs dir");
+        let before = database_stats(&db_path).expect("stats");
+        assert!(before.db_free_bytes > 0, "deleted pages should be free");
 
-        let purged = validate_and_purge_stale_roots(&db_path, &thumbs_dir).expect("validate");
-        assert_eq!(purged.len(), 1);
-        assert!(purged[0].contains("nonexistent"));
+        let result = compact_database(&db_path).expect("compact");
+        assert!(result.after_bytes <= result.before_bytes);
 
-        // Root should be gone
-        let roots = list_roots(&db_path).expect("list");
-        assert!(roots.is_empty());
+        let after = database_stats(&db_path).expect("stats");
+        assert_eq!(after.db_free_bytes, 0, "VACUUM must clear the freelist");
+        assert_eq!(after.files, 0);
     }
 
     #[test]
@@ -4561,11 +4944,26 @@ mod tests {
         init_database(&db_path).expect("init");
 
         let conn = open_conn(&db_path).expect("open");
-        // Verify user_version is set (13 migrations applied → version 13)
+        // Verify user_version is set (14 migrations applied → version 14)
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
+
+        // Migration 13 adds the non-destructive root availability columns.
+        let root_columns: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(roots)").expect("prepare");
+            stmt.query_map([], |r| r.get::<_, String>(1))
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect")
+        };
+        for column in ["availability", "last_seen_at", "last_error"] {
+            assert!(
+                root_columns.contains(&column.to_string()),
+                "roots.{column} is missing"
+            );
+        }
 
         // Verify all tables exist
         let tables: Vec<String> = {
@@ -4609,8 +5007,8 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        // We have 13 migrations (indices 0..12), so user_version should be 13
-        assert_eq!(version, 13);
+        // We have 14 migrations (indices 0..13), so user_version should be 14
+        assert_eq!(version, 14);
     }
 
     #[test]
