@@ -312,15 +312,18 @@ async fn search_images(
 #[tauri::command]
 fn start_scan(
     root_path: String,
-    skip_classify: Option<bool>,
+    mode: Option<String>,
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<ScanJobStatus, String> {
     require_writable(state.inner())?;
-    let skip = skip_classify.unwrap_or(false);
+    let raw_mode = mode.unwrap_or_else(|| "full".to_string());
+    let mode = scan::ScanMode::parse(&raw_mode)
+        .ok_or_else(|| format!("invalid scan mode '{raw_mode}'"))?;
+    log::info!("start_scan: {} in mode {}", root_path, mode.as_str());
 
-    // Only require Ollama setup for full scans (not metadata-only refreshes)
-    if !skip {
+    // Only require Ollama setup when the scan will actually classify files.
+    if !mode.skips_classification() {
         let setup = compute_setup_status(state.inner());
         if !setup.is_ready {
             return Err(
@@ -335,10 +338,37 @@ fn start_scan(
     // If this root is a child of an existing parent root, adopt files from parent
     let _ = db::adopt_child_files(&state.paths.db_file, job.root_id, &job.root_path);
     let app_state = state.inner().clone();
-    spawn_scan_worker_if_needed(app_state, &app_handle, job.id, skip);
+    spawn_scan_worker_if_needed(app_state, &app_handle, job.id, mode);
     db::get_scan_job(&state.paths.db_file, job.id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "scan job not found after start".to_string())
+}
+
+/// Indexed state of a root, used by the startup prompt.
+///
+/// Returns `None` when the path is not indexed yet (first run).
+#[tauri::command]
+fn pending_scan_summary(
+    root_path: String,
+    state: State<'_, AppState>,
+) -> Result<Option<models::PendingScanInfo>, String> {
+    let canonical = match config::canonical_root_path(&root_path) {
+        Ok(path) => path.display().to_string(),
+        // Unreachable mount: no index to reuse, and the prompt should not block.
+        Err(_) => return Ok(None),
+    };
+    db::pending_scan_info(&state.paths.db_file, &canonical).map_err(|e| e.to_string())
+}
+
+/// Persist the startup behaviour (`ask`, `classify_only`, `full`, `none`).
+#[tauri::command]
+fn set_startup_scan(value: String) -> Result<config::RuntimeSettings, String> {
+    let parsed = config::StartupScan::parse(&value)
+        .ok_or_else(|| format!("invalid startup_scan '{value}'"))?;
+    let mut settings = config::load_runtime_settings().unwrap_or_default();
+    settings.startup_scan = parsed;
+    config::save_runtime_settings(&settings).map_err(|e| e.to_string())?;
+    Ok(settings)
 }
 
 #[tauri::command]
@@ -1785,7 +1815,7 @@ fn spawn_scan_worker_if_needed(
     app_state: AppState,
     app_handle: &tauri::AppHandle,
     job_id: i64,
-    skip_classify: bool,
+    mode: scan::ScanMode,
 ) {
     {
         let mut guard = app_state
@@ -1814,7 +1844,7 @@ fn spawn_scan_worker_if_needed(
     tauri::async_runtime::spawn(async move {
         let flag = cancel_flag;
         let result = tauri::async_runtime::spawn_blocking(move || {
-            scan::run_scan_job(&scan_ctx, job_id, Some(&flag), skip_classify)
+            scan::run_scan_job(&scan_ctx, job_id, Some(&flag), mode)
         })
         .await
         .map_err(|e| AppError::Join(e.to_string()))
@@ -1976,6 +2006,8 @@ pub fn run() {
             start_venv_provision,
             search_images,
             start_scan,
+            pending_scan_summary,
+            set_startup_scan,
             get_scan_job,
             list_active_scans,
             get_runtime_status,

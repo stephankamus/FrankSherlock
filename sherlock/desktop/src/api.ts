@@ -18,9 +18,12 @@ import type {
   ReclusterProgress,
   RenameFileResult,
   RetryProtectedPdfsResult,
+  PendingScanInfo,
   RootInfo,
   RuntimeStatus,
   ScanJobStatus,
+  ScanMode,
+  StartupScanSetting,
   SetupDownloadStatus,
   SetupStatus,
   SmartFolder,
@@ -51,8 +54,20 @@ export async function searchImages(request: SearchRequest): Promise<SearchRespon
   return invoke<SearchResponse>("search_images", { request });
 }
 
-export async function startScan(rootPath: string, skipClassify?: boolean): Promise<ScanJobStatus> {
-  return invoke<ScanJobStatus>("start_scan", { rootPath, skipClassify });
+export async function startScan(
+  rootPath: string,
+  mode: ScanMode = "full",
+): Promise<ScanJobStatus> {
+  return invoke<ScanJobStatus>("start_scan", { rootPath, mode });
+}
+
+/** Indexed state of a root, for the startup prompt. `null` when not indexed. */
+export async function pendingScanSummary(rootPath: string): Promise<PendingScanInfo | null> {
+  return invoke<PendingScanInfo | null>("pending_scan_summary", { rootPath });
+}
+
+export async function setStartupScan(value: StartupScanSetting): Promise<VisionSettings> {
+  return invoke<VisionSettings>("set_startup_scan", { value });
 }
 
 export async function getScanJob(jobId: number): Promise<ScanJobStatus | null> {

@@ -73,7 +73,18 @@ prompt_profile = "concise"
 # OCR for screenshots/documents: "off", "llm" (default, fast) or "surya"
 # (better recall, but spawns a Python process per image).
 ocr_engine = "llm"
+
+# What to do when opening a folder that is already indexed:
+# "ask" (default), "classify_only" (resume pending work without re-walking the
+# tree), "full" or "none".
+startup_scan = "ask"
 ```
+
+When a folder is opened with a CLI argument and it is already indexed, the app never
+re-scans on its own: it asks whether to resume the pending classification, verify changes
+(which walks the tree again — slow on network shares) or just open the existing index. The
+"Continue classification" path skips discovery, thumbnails and cleanup entirely, so nothing
+on disk is touched and nothing can be deleted.
 
 All of these are also editable from the app: open the model & hardware status bar, click
 "Classification settings". The same dialog shows the model list with what fits in the

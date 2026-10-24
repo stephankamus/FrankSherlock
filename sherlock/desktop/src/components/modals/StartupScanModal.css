@@ -1,0 +1,63 @@
+/* ── Startup scan prompt ──────────────────────────────────── */
+.startup-scan-modal {
+  width: min(540px, 100%);
+}
+
+.startup-scan-subtitle {
+  margin: 0 0 12px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.startup-scan-options {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+
+.startup-scan-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.startup-scan-option:hover {
+  background: var(--bg-hover);
+}
+
+.startup-scan-option input {
+  margin-top: 3px;
+  accent-color: var(--accent);
+}
+
+.startup-scan-option-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+}
+
+.startup-scan-hint {
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+}
+
+.startup-scan-remember {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 12px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+}
+
+.startup-scan-remember input {
+  accent-color: var(--accent);
+}

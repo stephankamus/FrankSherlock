@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("../../api", () => ({
   getVisionSettings: vi.fn(),
   setVisionSettings: vi.fn(),
+  setStartupScan: vi.fn(),
   listVisionModels: vi.fn(),
   estimateVisionScan: vi.fn(),
 }));
@@ -13,6 +14,7 @@ import {
   estimateVisionScan,
   getVisionSettings,
   listVisionModels,
+  setStartupScan,
   setVisionSettings,
 } from "../../api";
 import ModelPickerModal from "../../components/modals/ModelPickerModal";
@@ -23,6 +25,7 @@ const settings: VisionSettings = {
   imageMaxSide: 1024,
   promptProfile: "concise",
   ocrEngine: "llm",
+  startupScan: "ask",
 };
 
 const models: VisionModelOption[] = [
@@ -66,6 +69,9 @@ describe("ModelPickerModal", () => {
     (listVisionModels as ReturnType<typeof vi.fn>).mockResolvedValue(models);
     (setVisionSettings as ReturnType<typeof vi.fn>).mockImplementation(
       async (update) => ({ ...settings, ...update, modelOverride: update.model }),
+    );
+    (setStartupScan as ReturnType<typeof vi.fn>).mockImplementation(
+      async (value) => ({ ...settings, startupScan: value }),
     );
     (estimateVisionScan as ReturnType<typeof vi.fn>).mockResolvedValue(estimate);
   });
@@ -172,6 +178,16 @@ describe("ModelPickerModal", () => {
     );
     await screen.findByTestId("vision-estimate");
     expect(onRuntimeChanged).toHaveBeenCalled();
+  });
+
+  it("persists the startup behaviour choice", async () => {
+    const user = userEvent.setup();
+    render(<ModelPickerModal onCancel={() => {}} onConfirm={() => {}} />);
+    await screen.findByText(/qwen2\.5vl:3b/);
+
+    await user.click(screen.getByRole("radio", { name: /Só abrir/ }));
+
+    await waitFor(() => expect(setStartupScan).toHaveBeenCalledWith("none"));
   });
 
   it("confirms and cancels", async () => {

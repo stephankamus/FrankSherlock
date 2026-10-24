@@ -205,6 +205,17 @@ pub struct UnclassifiedFile {
     pub abs_path: String,
 }
 
+/// What the startup prompt needs to know about an already-indexed root.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingScanInfo {
+    pub root_id: i64,
+    /// Indexed files under this root that still have `confidence = 0`.
+    pub unclassified: u64,
+    /// Unix seconds of the last completed scan, if any.
+    pub last_scan_at: Option<i64>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeStatus {

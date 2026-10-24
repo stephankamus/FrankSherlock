@@ -15,7 +15,9 @@ use crate::error::{AppError, AppResult};
 use crate::platform::fs::probe_dir;
 use std::path::PathBuf;
 
-use crate::models::{ExistingFile, FileRecordUpsert, ScanContext, ScanJobStatus, ScanSummary};
+use crate::models::{
+    ExistingFile, FileRecordUpsert, ScanContext, ScanJobState, ScanJobStatus, ScanSummary,
+};
 use crate::platform::paths::normalize_rel_path;
 use crate::thumbnail;
 use crate::video;
@@ -63,6 +65,42 @@ const SAFETY_MIN_EXISTING_FILES: usize = 100;
 /// a broken mount rather than as mass deletion.
 const SAFETY_MIN_RATIO: f64 = 0.5;
 
+/// What a scan job is allowed to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanMode {
+    /// Discovery, thumbnails, classification and cleanup.
+    Full,
+    /// Discovery and thumbnails only (no LLM), with cleanup.
+    Refresh,
+    /// Classify files already in the index. No discovery, no thumbnails and —
+    /// critically — no cleanup: without a discovery pass, every row would look
+    /// "missing" and be soft-deleted.
+    ClassifyOnly,
+}
+
+impl ScanMode {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "full" => Some(ScanMode::Full),
+            "refresh" => Some(ScanMode::Refresh),
+            "classify_only" | "classify-only" | "classify" => Some(ScanMode::ClassifyOnly),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ScanMode::Full => "full",
+            ScanMode::Refresh => "refresh",
+            ScanMode::ClassifyOnly => "classify_only",
+        }
+    }
+
+    pub fn skips_classification(&self) -> bool {
+        matches!(self, ScanMode::Refresh)
+    }
+}
+
 pub fn start_or_resume_scan_job(db_path: &Path, root_path: &str) -> AppResult<ScanJobStatus> {
     let probe = probe_dir(Path::new(root_path), ROOT_PROBE_TIMEOUT);
     if !probe.is_dir {
@@ -82,9 +120,9 @@ pub fn run_scan_job(
     ctx: &ScanContext,
     job_id: i64,
     cancel_flag: Option<&AtomicBool>,
-    skip_classify: bool,
+    mode: ScanMode,
 ) -> AppResult<ScanSummary> {
-    run_scan_job_internal(ctx, job_id, None, cancel_flag, skip_classify)
+    run_scan_job_internal(ctx, job_id, None, cancel_flag, mode)
 }
 
 fn run_scan_job_internal(
@@ -92,7 +130,7 @@ fn run_scan_job_internal(
     job_id: i64,
     max_files_for_test: Option<usize>,
     cancel_flag: Option<&AtomicBool>,
-    skip_classify: bool,
+    mode: ScanMode,
 ) -> AppResult<ScanSummary> {
     let started = Instant::now();
     let db_path = &ctx.db_path;
@@ -114,6 +152,13 @@ fn run_scan_job_internal(
     db::mark_root_online(db_path, job.root_id)?;
 
     let root_path = canonical_root_path(&job.root_path)?;
+
+    // Resuming classification must not pay for a full discovery walk again: on a
+    // network share with tens of thousands of files that is the slowest part of
+    // opening the app.
+    if mode == ScanMode::ClassifyOnly {
+        return run_classify_only(ctx, &job, job_id, cancel_flag, started);
+    }
 
     log::info!(
         "Scan job {}: starting discovery for {}",
@@ -580,7 +625,7 @@ fn run_scan_job_internal(
     }
 
     // Phase 3: Classification loop — LLM classify all unclassified files
-    let unclassified = if skip_classify {
+    let unclassified = if mode.skips_classification() {
         vec![]
     } else {
         db::list_unclassified_files(db_path, job.root_id, job.scan_marker)?
@@ -706,6 +751,101 @@ fn run_scan_job_internal(
         deleted,
         elapsed_ms: started.elapsed().as_millis() as u64,
     };
+    db::complete_scan_job_by_id(db_path, job_id, &summary, last_cursor.as_deref())?;
+    Ok(summary)
+}
+
+/// Classification-only pass over files already in the index.
+///
+/// Used when the app reopens with pending work: discovery, thumbnailing and
+/// cleanup are all skipped, so nothing on disk is inspected and nothing can be
+/// soft-deleted. Only rows with `confidence = 0` are touched.
+fn run_classify_only(
+    ctx: &ScanContext,
+    job: &ScanJobState,
+    job_id: i64,
+    cancel_flag: Option<&AtomicBool>,
+    started: Instant,
+) -> AppResult<ScanSummary> {
+    let db_path = &ctx.db_path;
+    let root_path = canonical_root_path(&job.root_path)?;
+
+    // Deliberately not filtered by `scan_marker`: a job that died during
+    // discovery never stamped any row with its marker, and the previous marker
+    // may belong to an older job.
+    let pending = db::list_unclassified_files_any_marker(db_path, job.root_id)?;
+    let total = pending.len() as u64;
+
+    log::info!(
+        "Scan job {}: classification-only resume for {} ({} pending files, no discovery)",
+        job_id,
+        root_path.display(),
+        total
+    );
+
+    db::checkpoint_scan_job(
+        db_path,
+        job_id,
+        "classifying",
+        total,
+        0,
+        None,
+        job.added,
+        job.modified,
+        job.moved,
+        job.unchanged,
+    )?;
+
+    let mut processed: u64 = 0;
+    let mut last_cursor: Option<String> = None;
+
+    for file in &pending {
+        if let Some(flag) = cancel_flag {
+            if flag.load(Ordering::Relaxed) {
+                db::cancel_scan_job(db_path, job_id)?;
+                return Ok(ScanSummary {
+                    root_id: job.root_id,
+                    root_path: root_path.display().to_string(),
+                    scanned: processed,
+                    added: job.added,
+                    modified: job.modified,
+                    moved: job.moved,
+                    unchanged: job.unchanged,
+                    deleted: 0,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                });
+            }
+        }
+
+        classify_and_update(ctx, file.id, &file.abs_path);
+        processed += 1;
+        last_cursor = Some(file.rel_path.clone());
+        db::checkpoint_scan_job(
+            db_path,
+            job_id,
+            "classifying",
+            total,
+            processed,
+            last_cursor.as_deref(),
+            job.added,
+            job.modified,
+            job.moved,
+            job.unchanged,
+        )?;
+    }
+
+    let summary = ScanSummary {
+        root_id: job.root_id,
+        root_path: root_path.display().to_string(),
+        scanned: total,
+        added: job.added,
+        modified: job.modified,
+        moved: job.moved,
+        unchanged: job.unchanged,
+        deleted: 0,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    };
+    db::touch_root_scan(db_path, job.root_id)?;
     db::complete_scan_job_by_id(db_path, job_id, &summary, last_cursor.as_deref())?;
     Ok(summary)
 }
@@ -1209,7 +1349,7 @@ mod tests {
         let job = start_or_resume_scan_job(&db_path, root_dir.path().to_str().expect("str"))
             .expect("job");
         let ctx = make_scan_context(&db_path);
-        let summary = run_scan_job_internal(&ctx, job.id, None, None, true)
+        let summary = run_scan_job_internal(&ctx, job.id, None, None, ScanMode::Refresh)
             .expect("scan must not fail on an unreadable file");
 
         // Restore permissions so tempdir cleanup succeeds.
@@ -1244,8 +1384,8 @@ mod tests {
         let ctx = make_scan_context(&db_path);
         let first_job = start_or_resume_scan_job(&db_path, root_dir.path().to_str().expect("str"))
             .expect("first job");
-        let summary =
-            run_scan_job_internal(&ctx, first_job.id, None, None, true).expect("first scan");
+        let summary = run_scan_job_internal(&ctx, first_job.id, None, None, ScanMode::Refresh)
+            .expect("first scan");
         assert_eq!(summary.added, 1);
 
         // Grow the file so the rescan sees it as modified, then make it unreadable.
@@ -1267,7 +1407,7 @@ mod tests {
 
         let second_job = start_or_resume_scan_job(&db_path, root_dir.path().to_str().expect("str"))
             .expect("second job");
-        let summary = run_scan_job_internal(&ctx, second_job.id, None, None, true)
+        let summary = run_scan_job_internal(&ctx, second_job.id, None, None, ScanMode::Refresh)
             .expect("scan must not fail on an unreadable file");
 
         // Restore permissions so tempdir cleanup succeeds.
@@ -1396,7 +1536,7 @@ mod tests {
 
         // Set cancel flag before running
         let flag = AtomicBool::new(true);
-        let result = run_scan_job_internal(&ctx, job.id, None, Some(&flag), false);
+        let result = run_scan_job_internal(&ctx, job.id, None, Some(&flag), ScanMode::Full);
         assert!(result.is_ok());
         let summary = result.unwrap();
         // Should return early with minimal processing
@@ -1532,5 +1672,106 @@ mod tests {
         assert!(!filenames.contains(&"spacer.gif"));
         assert!(!filenames.contains(&"favicon.png"));
         assert_eq!(probes.probes.len(), 2);
+    }
+
+    #[test]
+    fn scan_mode_parses_known_values() {
+        assert_eq!(ScanMode::parse("full"), Some(ScanMode::Full));
+        assert_eq!(ScanMode::parse(""), Some(ScanMode::Full));
+        assert_eq!(ScanMode::parse("refresh"), Some(ScanMode::Refresh));
+        assert_eq!(
+            ScanMode::parse("classify_only"),
+            Some(ScanMode::ClassifyOnly)
+        );
+        assert_eq!(
+            ScanMode::parse("classify-only"),
+            Some(ScanMode::ClassifyOnly)
+        );
+        assert_eq!(ScanMode::parse("nonsense"), None);
+        assert!(ScanMode::Refresh.skips_classification());
+        assert!(!ScanMode::Full.skips_classification());
+        assert!(!ScanMode::ClassifyOnly.skips_classification());
+    }
+
+    /// Classify-only resume must not run cleanup.
+    ///
+    /// Without a discovery pass every row looks "not seen in this scan", so the
+    /// cleanup phase would soft-delete the whole index — the exact bug this
+    /// mode has to avoid. It also must not filter pending rows by scan marker:
+    /// the previous job's marker is the only one the rows carry.
+    #[test]
+    fn classify_only_keeps_rows_for_files_missing_on_disk() {
+        let root_dir = tempfile::tempdir().expect("tempdir");
+        let db_dir = tempfile::tempdir().expect("dbdir");
+        let db_path = db_dir.path().join("index.sqlite");
+        db::init_database(&db_path).expect("init");
+
+        write_test_image(&root_dir.path().join("a.jpg"), 0xAA);
+        write_test_image(&root_dir.path().join("b.jpg"), 0xBB);
+
+        let root = root_dir.path().to_str().expect("str").to_string();
+        let first = start_or_resume_scan_job(&db_path, &root).expect("job");
+        let ctx = make_scan_context(&db_path);
+        run_scan_job_internal(&ctx, first.id, None, None, ScanMode::Refresh).expect("index files");
+
+        // The user deletes a file (or the share drops it) while the app is closed.
+        std::fs::remove_file(root_dir.path().join("a.jpg")).expect("remove");
+
+        let job = start_or_resume_scan_job(&db_path, &root).expect("job");
+        let summary = run_scan_job_internal(&ctx, job.id, None, None, ScanMode::ClassifyOnly)
+            .expect("classify only");
+
+        assert_eq!(summary.deleted, 0, "classify-only must never delete");
+        assert_eq!(
+            summary.scanned, 2,
+            "both rows are pending, regardless of their scan marker"
+        );
+
+        let indexed = db::load_existing_files(&db_path, job.root_id).expect("load");
+        assert_eq!(
+            indexed.len(),
+            2,
+            "both rows must survive the classify-only run"
+        );
+
+        let status = db::get_scan_job(&db_path, job.id)
+            .expect("status")
+            .expect("job exists");
+        assert_eq!(status.status, "completed");
+    }
+
+    #[test]
+    fn classify_only_with_nothing_pending_completes_immediately() {
+        let root_dir = tempfile::tempdir().expect("tempdir");
+        let db_dir = tempfile::tempdir().expect("dbdir");
+        let db_path = db_dir.path().join("index.sqlite");
+        db::init_database(&db_path).expect("init");
+
+        write_test_image(&root_dir.path().join("a.jpg"), 0xAA);
+
+        let root = root_dir.path().to_str().expect("str").to_string();
+        let first = start_or_resume_scan_job(&db_path, &root).expect("job");
+        let ctx = make_scan_context(&db_path);
+        run_scan_job_internal(&ctx, first.id, None, None, ScanMode::Refresh).expect("index files");
+
+        // Pretend the file was already classified.
+        let indexed = db::load_existing_files(&db_path, first.root_id).expect("load");
+        for file in indexed {
+            db::update_file_classification(&db_path, file.id, "photo", "done", "", "", 0.9, "en")
+                .expect("mark classified");
+        }
+
+        let job = start_or_resume_scan_job(&db_path, &root).expect("job");
+        let summary = run_scan_job_internal(&ctx, job.id, None, None, ScanMode::ClassifyOnly)
+            .expect("classify only");
+
+        assert_eq!(summary.scanned, 0);
+        let status = db::get_scan_job(&db_path, job.id)
+            .expect("status")
+            .expect("job exists");
+        assert_eq!(
+            status.status, "completed",
+            "empty runs must not stay running"
+        );
     }
 }

@@ -3,15 +3,18 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   cancelScan, compactDatabase, copyFilesToClipboard, deleteFiles, ensureDatabase,
-  getCliFolderPath, getFileMetadata, getFileProperties, listRoots,
-  relinkRoot, removeRoot, renameFile, reorderRoots, startScan, updateFileMetadata,
+  getCliFolderPath, getFileMetadata, getFileProperties, getVisionSettings, listRoots,
+  pendingScanSummary, relinkRoot, removeRoot, renameFile, reorderRoots, startScan,
+  updateFileMetadata,
 } from "./api";
 import type {
   DbStats,
   DuplicateGroup,
   FileMetadata,
+  PendingScanInfo,
   RootInfo,
   RuntimeStatus,
+  ScanJobStatus,
   SearchItem,
   SetupStatus,
   SortField,
@@ -30,6 +33,7 @@ import StatusBar from "./components/StatusBar/StatusBar";
 import ToastContainer from "./components/Toasts/ToastContainer";
 import SetupModal from "./components/modals/SetupModal";
 import ResumeModal from "./components/modals/ResumeModal";
+import StartupScanModal from "./components/modals/StartupScanModal";
 import ScanSummaryModal from "./components/modals/ScanSummaryModal";
 import PreviewModal from "./components/modals/PreviewModal";
 import ConfirmDeleteModal from "./components/modals/ConfirmDeleteModal";
@@ -90,6 +94,15 @@ export default function App() {
   const [visionPicker, setVisionPicker] = useState<{
     rootPath: string | null;
     resolve: ((ok: boolean) => void) | null;
+  } | null>(null);
+  /**
+   * Startup prompt for an already-indexed folder: never re-scan without asking.
+   */
+  const [startupPrompt, setStartupPrompt] = useState<{
+    rootPath: string;
+    rootName: string;
+    info: PendingScanInfo;
+    interrupted: boolean;
   } | null>(null);
   const [editMetadataItem, setEditMetadataItem] = useState<SearchItem | null>(null);
   const [facePreviewItems, setFacePreviewItems] = useState<SearchItem[]>([]);
@@ -201,22 +214,50 @@ export default function App() {
       (s) => s.status === "running" || s.status === "interrupted",
     );
 
+    /** Asks (or applies the saved choice) before touching an indexed folder. */
+    async function maybePromptStartupScan(
+      rootPath: string,
+      rootName: string,
+      jobs: ScanJobStatus[],
+    ) {
+      try {
+        const info = await pendingScanSummary(rootPath);
+        const settings = await getVisionSettings();
+        const interrupted = jobs.some(
+          (s) => s.rootPath === rootPath && s.status === "interrupted",
+        );
+        if (!info || (info.unclassified === 0 && !interrupted)) return;
+
+        if (settings.startupScan === "ask") {
+          setStartupPrompt({ rootPath, rootName, info, interrupted });
+          return;
+        }
+        if (settings.startupScan === "none") return;
+        await scanManager.startScanWithMode(
+          rootPath,
+          settings.startupScan,
+          settings.startupScan === "classify_only"
+            ? `Retomando classificação de ${rootName}`
+            : `Verificando mudanças em ${rootName}`,
+        );
+      } catch {
+        // Failing to read the summary must not block opening the index.
+      }
+    }
+
     if (matchingRoot) {
       setSelectedRootId(matchingRoot.id);
-      const interruptedForRoot = activeOrInterrupted.find(
-        (s) => s.rootPath === cliPath && s.status === "interrupted",
-      );
-      if (interruptedForRoot && !isReadOnly && setupStatus.isReady) {
-        try {
-          const job = await startScan(cliPath);
-          scanManager.addTrackedJobId(job.id);
-        } catch { /* ignore */ }
+      if (!isReadOnly && setupStatus.isReady) {
+        await maybePromptStartupScan(cliPath, matchingRoot.rootName, activeOrInterrupted);
       }
-    } else if (!isReadOnly && setupStatus.isReady) {
+      return;
+    }
+
+    if (!isReadOnly && setupStatus.isReady) {
       const hasRunning = activeOrInterrupted.some((s) => s.status === "running");
       if (hasRunning) return;
       try {
-        const job = await startScan(cliPath);
+        const job = await startScan(cliPath, "full");
         scanManager.addTrackedJobId(job.id);
         await scanManager.refreshRoots();
         const updatedRoots = await listRoots();
@@ -224,13 +265,13 @@ export default function App() {
         if (newRoot) setSelectedRootId(newRoot.id);
       } catch { /* ignore */ }
     }
-  }, [scanManager.initApp]);
+  }, [scanManager.initApp, scanManager.startScanWithMode]);
 
   useAppInit(initApp);
   usePolling(POLL_MS, scanManager.pollRuntimeAndScans, [scanManager.trackedJobIds]);
   useInfiniteScroll(sentinelRef, onLoadMore, [items.length, total, loadingMore]);
 
-  const hasModalOpen = !!(confirmDeleteFiles || renameItem || editMetadataItem || propertiesItem || albumManager.showCreateAlbum || smartFolderManager.showCreateSmartFolder || visionPicker);
+  const hasModalOpen = !!(confirmDeleteFiles || renameItem || editMetadataItem || propertiesItem || albumManager.showCreateAlbum || smartFolderManager.showCreateSmartFolder || visionPicker || startupPrompt);
 
   const onRequestDelete = useCallback(() => {
     const filesToDelete = [...selectedIndices].sort((a, b) => a - b)
@@ -663,6 +704,26 @@ export default function App() {
           onConfigureVision={() => {
             setShowModelInfo(false);
             setVisionPicker({ rootPath: null, resolve: null });
+          }}
+        />
+      )}
+      {startupPrompt && (
+        <StartupScanModal
+          rootName={startupPrompt.rootName}
+          info={startupPrompt.info}
+          interrupted={startupPrompt.interrupted}
+          onCancel={() => setStartupPrompt(null)}
+          onChoose={(choice) => {
+            const prompt = startupPrompt;
+            setStartupPrompt(null);
+            if (choice === "none") return;
+            void scanManager.startScanWithMode(
+              prompt.rootPath,
+              choice,
+              choice === "classify_only"
+                ? `Retomando classificação de ${prompt.rootName}`
+                : `Verificando mudanças em ${prompt.rootName}`,
+            );
           }}
         />
       )}

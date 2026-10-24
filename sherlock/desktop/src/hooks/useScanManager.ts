@@ -18,6 +18,7 @@ import type {
   RootInfo,
   RuntimeStatus,
   ScanJobStatus,
+  ScanMode,
   SetupStatus,
 } from "../types";
 import { basename, errorMessage } from "../utils";
@@ -175,6 +176,30 @@ export function useScanManager(cb: ScanManagerCallbacks) {
     }
   }
 
+  /**
+   * Starts a scan in `mode`, running the pre-scan prompt (vision settings) for
+   * scans that will classify files. Returns the job, or null when the user
+   * cancelled or the call failed.
+   */
+  async function startScanWithMode(rootPath: string, mode: ScanMode, notice: string) {
+    if (mode !== "refresh" && cb.beforeScan && !(await cb.beforeScan(rootPath))) {
+      return null;
+    }
+    try {
+      setCompletedJobs([]);
+      const job = await startScan(rootPath, mode);
+      setTrackedJobIds((prev) => [...prev, job.id]);
+      lastProcessedRef.current = 0;
+      cb.setNotice(notice);
+      await refreshRoots();
+      await pollRuntimeAndScans();
+      return job;
+    } catch (err) {
+      cb.setError(errorMessage(err));
+      return null;
+    }
+  }
+
   async function onPickAndScan(setup: SetupStatus | null, readOnly: boolean) {
     if (readOnly) return;
     if (setup && !setup.isReady) {
@@ -184,14 +209,8 @@ export function useScanManager(cb: ScanManagerCallbacks) {
     try {
       const selected = await open({ directory: true, multiple: false, title: "Select folder to scan" });
       if (!selected) return;
-      if (cb.beforeScan && !(await cb.beforeScan(selected as string))) return;
-      setCompletedJobs([]);
-      const job = await startScan(selected as string);
-      setTrackedJobIds((prev) => [...prev, job.id]);
-      lastProcessedRef.current = 0;
-      cb.setNotice(`Scan started for ${basename(job.rootPath)}`);
-      await refreshRoots();
-      await pollRuntimeAndScans();
+      const rootPath = selected as string;
+      await startScanWithMode(rootPath, "full", `Scan started for ${basename(rootPath)}`);
     } catch (err) {
       cb.setError(errorMessage(err));
     }
@@ -203,33 +222,12 @@ export function useScanManager(cb: ScanManagerCallbacks) {
       cb.setError("Setup is incomplete. Finish Ollama setup before starting scans.");
       return;
     }
-    try {
-      if (cb.beforeScan && !(await cb.beforeScan(root.rootPath))) return;
-      setCompletedJobs([]);
-      const job = await startScan(root.rootPath);
-      setTrackedJobIds((prev) => [...prev, job.id]);
-      lastProcessedRef.current = 0;
-      cb.setNotice(`Rescan started for ${root.rootName}`);
-      await refreshRoots();
-      await pollRuntimeAndScans();
-    } catch (err) {
-      cb.setError(errorMessage(err));
-    }
+    await startScanWithMode(root.rootPath, "full", `Rescan started for ${root.rootName}`);
   }
 
   async function onRefreshRoot(root: RootInfo, readOnly: boolean) {
     if (readOnly) return;
-    try {
-      setCompletedJobs([]);
-      const job = await startScan(root.rootPath, true);
-      setTrackedJobIds((prev) => [...prev, job.id]);
-      lastProcessedRef.current = 0;
-      cb.setNotice(`Refresh started for ${root.rootName}`);
-      await refreshRoots();
-      await pollRuntimeAndScans();
-    } catch (err) {
-      cb.setError(errorMessage(err));
-    }
+    await startScanWithMode(root.rootPath, "refresh", `Refresh started for ${root.rootName}`);
   }
 
   async function onCancelScan(scan: ScanJobStatus, readOnly: boolean) {
@@ -246,36 +244,26 @@ export function useScanManager(cb: ScanManagerCallbacks) {
 
   async function onResumeScan(scan: ScanJobStatus, readOnly: boolean) {
     if (readOnly) return;
-    try {
-      if (cb.beforeScan && !(await cb.beforeScan(scan.rootPath))) return;
-      const job = await startScan(scan.rootPath);
-      setTrackedJobIds((prev) => [...prev, job.id]);
-      setCompletedJobs([]);
-      lastProcessedRef.current = 0;
-      cb.setNotice(`Resuming scan for ${basename(job.rootPath)}`);
-      await pollRuntimeAndScans();
-    } catch (err) {
-      cb.setError(errorMessage(err));
-    }
+    await startScanWithMode(
+      scan.rootPath,
+      "full",
+      `Resuming scan for ${basename(scan.rootPath)}`,
+    );
   }
 
   async function onResumeAllInterrupted() {
     cb.setShowResumeModal(false);
-    const newIds: number[] = [];
-    for (const scan of activeScans.filter((s) => s.status === "interrupted")) {
-      try {
-        if (cb.beforeScan && !(await cb.beforeScan(scan.rootPath))) continue;
-        const job = await startScan(scan.rootPath);
-        newIds.push(job.id);
-        lastProcessedRef.current = 0;
-      } catch (err) {
-        cb.setError(errorMessage(err));
-      }
-    }
-    if (newIds.length > 0) {
-      setTrackedJobIds((prev) => [...prev, ...newIds]);
-      setCompletedJobs([]);
-    }
+    await Promise.all(
+      activeScans
+        .filter((s) => s.status === "interrupted")
+        .map((scan) =>
+          startScanWithMode(
+            scan.rootPath,
+            "full",
+            `Resuming scan for ${basename(scan.rootPath)}`,
+          ),
+        ),
+    );
     await pollRuntimeAndScans();
   }
 
@@ -312,6 +300,7 @@ export function useScanManager(cb: ScanManagerCallbacks) {
     setCompletedJobs,
     pollRuntimeAndScans,
     initApp,
+    startScanWithMode,
     onPickAndScan,
     onRescanRoot,
     onRefreshRoot,

@@ -344,6 +344,18 @@ export type ReclusterProgress = {
 export type VisionPromptProfile = "concise" | "detailed";
 export type VisionOcrEngine = "off" | "llm" | "surya";
 
+/** What a scan job is allowed to do. */
+export type ScanMode = "full" | "refresh" | "classify_only";
+
+/** Startup behaviour for an already-indexed folder. */
+export type StartupScanSetting = "ask" | "classify_only" | "full" | "none";
+
+export type PendingScanInfo = {
+  rootId: number;
+  unclassified: number;
+  lastScanAt: number | null;
+};
+
 /** Mirrors `config::RuntimeSettings` in the Rust backend. */
 export type VisionSettings = {
   modelOverride: string | null;
@@ -351,6 +363,7 @@ export type VisionSettings = {
   imageMaxSide: number;
   promptProfile: VisionPromptProfile;
   ocrEngine: VisionOcrEngine;
+  startupScan: StartupScanSetting;
 };
 
 export type VisionModelOption = {

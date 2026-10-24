@@ -167,6 +167,13 @@ prompt_profile = "concise"
 # - llm    reuse the vision model (fast, lower recall)
 # - surya  dedicated OCR model in a Python venv (better recall, much slower)
 ocr_engine = "llm"
+
+# What to do when the app opens with a folder that is already indexed.
+# - ask           ask every time (default)
+# - classify_only resume pending classification without walking the tree again
+# - full          run a complete scan (discovery + thumbnails + classification)
+# - none          just open the existing index
+startup_scan = "ask"
 "#;
 
 /// Default longest-side for images sent to the vision model.
@@ -233,6 +240,41 @@ impl OcrEngine {
     }
 }
 
+/// What to do when the app opens with a folder that is already indexed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupScan {
+    /// Ask the user (default).
+    Ask,
+    /// Resume pending classification without re-discovering the tree.
+    ClassifyOnly,
+    /// Run a complete scan (discovery + thumbnails + classification).
+    Full,
+    /// Only open the existing index.
+    OpenOnly,
+}
+
+impl StartupScan {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StartupScan::Ask => "ask",
+            StartupScan::ClassifyOnly => "classify_only",
+            StartupScan::Full => "full",
+            StartupScan::OpenOnly => "none",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "ask" => Some(StartupScan::Ask),
+            "classify_only" | "classify-only" | "classify" => Some(StartupScan::ClassifyOnly),
+            "full" | "scan" => Some(StartupScan::Full),
+            "none" | "open" | "open_only" => Some(StartupScan::OpenOnly),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeSettings {
@@ -241,6 +283,8 @@ pub struct RuntimeSettings {
     pub image_max_side: u32,
     pub prompt_profile: PromptProfile,
     pub ocr_engine: OcrEngine,
+    /// Behaviour when opening a folder that is already indexed.
+    pub startup_scan: StartupScan,
 }
 
 impl Default for RuntimeSettings {
@@ -250,6 +294,7 @@ impl Default for RuntimeSettings {
             image_max_side: DEFAULT_IMAGE_MAX_SIDE,
             prompt_profile: PromptProfile::Concise,
             ocr_engine: OcrEngine::Llm,
+            startup_scan: StartupScan::Ask,
         }
     }
 }
@@ -343,6 +388,15 @@ fn parse_runtime_settings(data: &str) -> AppResult<RuntimeSettings> {
                     ),
                 }
             }
+            "startup_scan" => {
+                let parsed = parse_settings_string(value.trim())?;
+                match StartupScan::parse(&parsed) {
+                    Some(v) => settings.startup_scan = v,
+                    None => log::warn!(
+                        "settings.toml: ignoring startup_scan '{parsed}' (expected: ask | classify_only | full | none)"
+                    ),
+                }
+            }
             _ => {}
         }
     }
@@ -364,6 +418,7 @@ pub fn save_runtime_settings(settings: &RuntimeSettings) -> AppResult<()> {
         "image_max_side",
         "prompt_profile",
         "ocr_engine",
+        "startup_scan",
     ];
 
     let model_line = match &settings.model_override {
@@ -391,6 +446,13 @@ pub fn save_runtime_settings(settings: &RuntimeSettings) -> AppResult<()> {
         format!(
             "ocr_engine = {}",
             serde_json::json!(settings.ocr_engine.as_str())
+        ),
+    );
+    replacements.insert(
+        "startup_scan",
+        format!(
+            "startup_scan = {}",
+            serde_json::json!(settings.startup_scan.as_str())
         ),
     );
 
@@ -654,6 +716,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_runtime_settings_startup_scan() {
+        let settings =
+            parse_runtime_settings(r#"startup_scan = "classify_only""#).expect("settings");
+        assert_eq!(settings.startup_scan, StartupScan::ClassifyOnly);
+
+        let open_only = parse_runtime_settings(r#"startup_scan = "none""#).expect("settings");
+        assert_eq!(open_only.startup_scan, StartupScan::OpenOnly);
+
+        let invalid = parse_runtime_settings(r#"startup_scan = "sometimes""#).expect("settings");
+        assert_eq!(
+            invalid.startup_scan,
+            StartupScan::Ask,
+            "invalid falls back to ask"
+        );
+    }
+
+    #[test]
     fn parse_runtime_settings_ignores_unknown_values() {
         let settings = parse_runtime_settings(
             r#"
@@ -680,6 +759,7 @@ mod tests {
             image_max_side: 768,
             prompt_profile: PromptProfile::Detailed,
             ocr_engine: OcrEngine::Off,
+            startup_scan: StartupScan::ClassifyOnly,
         };
         save_runtime_settings(&settings).expect("save");
 
@@ -690,6 +770,7 @@ mod tests {
         assert!(text.contains("image_max_side = 768"));
         assert!(text.contains("prompt_profile = \"detailed\""));
         assert!(text.contains("ocr_engine = \"off\""));
+        assert!(text.contains("startup_scan = \"classify_only\""));
 
         let loaded = parse_runtime_settings(&text).expect("parse");
         assert_eq!(loaded, settings);

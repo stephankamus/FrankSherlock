@@ -3,10 +3,12 @@ import {
   estimateVisionScan,
   getVisionSettings,
   listVisionModels,
+  setStartupScan,
   setVisionSettings,
   type VisionSettingsUpdate,
 } from "../../api";
 import type {
+  StartupScanSetting,
   VisionEstimate,
   VisionModelOption,
   VisionSettings,
@@ -62,6 +64,17 @@ const OCR_ENGINES: { value: "off" | "llm" | "surya"; label: string; hint: string
   { value: "off", label: "Desligado", hint: "não extrai texto" },
   { value: "llm", label: "Modelo de visão", hint: "rápido, recall menor" },
   { value: "surya", label: "Surya", hint: "melhor recall, muito mais lento" },
+];
+
+const STARTUP_OPTIONS: { value: StartupScanSetting; label: string; hint: string }[] = [
+  { value: "ask", label: "Perguntar", hint: "mostra um diálogo ao abrir a pasta indexada" },
+  {
+    value: "classify_only",
+    label: "Continuar classificação",
+    hint: "retoma os pendentes sem reescanear a pasta",
+  },
+  { value: "full", label: "Verificar mudanças", hint: "scan completo a cada abertura" },
+  { value: "none", label: "Só abrir", hint: "nunca processa nada automaticamente" },
 ];
 
 function sourceLabel(source: VisionEstimate["source"]): string {
@@ -159,6 +172,16 @@ export default function ModelPickerModal({
     };
     try {
       const saved = await setVisionSettings(next);
+      setSettings(saved);
+      setError(null);
+    } catch (err) {
+      setError(errorMessage(err));
+    }
+  }
+
+  async function applyStartup(value: StartupScanSetting) {
+    try {
+      const saved = await setStartupScan(value);
       setSettings(saved);
       setError(null);
     } catch (err) {
@@ -284,6 +307,26 @@ export default function ModelPickerModal({
                       name="vision-ocr"
                       checked={settings.ocrEngine === option.value}
                       onChange={() => apply({ ocrEngine: option.value })}
+                    />
+                    <span className="model-picker-option-body">
+                      <strong>{option.label}</strong>
+                      <span className="model-picker-hint">{option.hint}</span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </section>
+
+            <section className="model-picker-section">
+              <h4>Ao abrir uma pasta já indexada</h4>
+              <div className="model-picker-options">
+                {STARTUP_OPTIONS.map((option) => (
+                  <label className="model-picker-option" key={option.value}>
+                    <input
+                      type="radio"
+                      name="startup-scan"
+                      checked={settings.startupScan === option.value}
+                      onChange={() => applyStartup(option.value)}
                     />
                     <span className="model-picker-option-body">
                       <strong>{option.label}</strong>

@@ -703,6 +703,99 @@ pub fn list_unclassified_files(
     Ok(out)
 }
 
+/// Like [`list_unclassified_files`] but ignoring the scan marker.
+///
+/// Classify-only resumes must not depend on the marker: a job that died during
+/// discovery never stamped any row with it, and the marker stored in the job may
+/// belong to an older run.
+pub fn list_unclassified_files_any_marker(
+    db_path: &Path,
+    root_id: i64,
+) -> AppResult<Vec<crate::models::UnclassifiedFile>> {
+    let conn = open_conn(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, rel_path, abs_path FROM files
+         WHERE root_id = ?1 AND confidence = 0.0 AND deleted_at IS NULL
+         ORDER BY rel_path",
+    )?;
+    let rows = stmt.query_map([root_id], |row| {
+        Ok(crate::models::UnclassifiedFile {
+            id: row.get(0)?,
+            rel_path: row.get(1)?,
+            abs_path: row.get(2)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Resolve the root that owns `root_path`.
+///
+/// Exact match first, then the longest root whose path is a prefix — a child
+/// root can be addressed through its parent's path.
+fn find_root_id_conn(conn: &Connection, root_path: &str) -> AppResult<Option<i64>> {
+    let exact: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM roots WHERE root_path = ?1",
+            [root_path],
+            |row| row.get(0),
+        )
+        .ok();
+    if exact.is_some() {
+        return Ok(exact);
+    }
+
+    let mut best: Option<(usize, i64)> = None;
+    let mut stmt = conn.prepare("SELECT id, root_path FROM roots")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for (id, path) in rows.flatten() {
+        let trimmed = path.trim_end_matches('/');
+        let matches = root_path == trimmed || root_path.starts_with(&format!("{trimmed}/"));
+        if matches && best.map(|(len, _)| trimmed.len() > len).unwrap_or(true) {
+            best = Some((trimmed.len(), id));
+        }
+    }
+    Ok(best.map(|(_, id)| id))
+}
+
+/// Summary shown by the startup prompt: is this path indexed, how much work is
+/// pending, and when it was last verified.
+pub fn pending_scan_info(
+    db_path: &Path,
+    root_path: &str,
+) -> AppResult<Option<crate::models::PendingScanInfo>> {
+    let conn = open_conn(db_path)?;
+    let Some(root_id) = find_root_id_conn(&conn, root_path)? else {
+        return Ok(None);
+    };
+
+    let last_scan_at: Option<i64> = conn
+        .query_row(
+            "SELECT last_scan_at FROM roots WHERE id = ?1",
+            [root_id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+    let unclassified: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM files
+         WHERE root_id = ?1 AND confidence = 0.0 AND deleted_at IS NULL",
+        [root_id],
+        |row| row.get(0),
+    )?;
+
+    Ok(Some(crate::models::PendingScanInfo {
+        root_id,
+        unclassified: unclassified.max(0) as u64,
+        last_scan_at,
+    }))
+}
+
 pub fn complete_scan_job_by_id(
     db_path: &Path,
     job_id: i64,
@@ -1139,37 +1232,7 @@ pub fn vision_estimate_rows(
     root_path: &str,
 ) -> AppResult<Option<Vec<(String, String, i64)>>> {
     let conn = open_conn(db_path)?;
-
-    let exact: Option<i64> = conn
-        .query_row(
-            "SELECT id FROM roots WHERE root_path = ?1",
-            [root_path],
-            |row| row.get(0),
-        )
-        .ok();
-
-    let root_id = match exact {
-        Some(id) => Some(id),
-        None => {
-            // Fall back to the longest root that contains the requested path
-            // (child roots can be addressed through their parent's prefix).
-            let mut best: Option<(usize, i64)> = None;
-            let mut stmt = conn.prepare("SELECT id, root_path FROM roots")?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })?;
-            for (id, path) in rows.flatten() {
-                let trimmed = path.trim_end_matches('/');
-                let matches = root_path == trimmed || root_path.starts_with(&format!("{trimmed}/"));
-                if matches && best.map(|(len, _)| trimmed.len() > len).unwrap_or(true) {
-                    best = Some((trimmed.len(), id));
-                }
-            }
-            best.map(|(_, id)| id)
-        }
-    };
-
-    let Some(root_id) = root_id else {
+    let Some(root_id) = find_root_id_conn(&conn, root_path)? else {
         return Ok(None);
     };
 

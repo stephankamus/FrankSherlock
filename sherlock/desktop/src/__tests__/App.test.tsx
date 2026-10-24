@@ -119,12 +119,14 @@ vi.mock("../hooks/useSearch", () => ({
 const mockInitApp = vi.fn<() => Promise<InitAppResult | null>>(() => Promise.resolve(null));
 const mockRefreshRoots = vi.fn(() => Promise.resolve());
 const mockAddTrackedJobId = vi.fn();
+const mockStartScanWithMode = vi.fn(() => Promise.resolve(null));
 
 vi.mock("../hooks/useScanManager", () => ({
   useScanManager: () => ({
     initApp: mockInitApp,
     refreshRoots: mockRefreshRoots,
     addTrackedJobId: mockAddTrackedJobId,
+    startScanWithMode: mockStartScanWithMode,
     trackedJobIds: [] as number[],
     completedJobs: [] as ScanJobStatus[],
     setCompletedJobs: vi.fn(),
@@ -427,26 +429,80 @@ describe("App - API integration on init", () => {
     expect(startScanSpy).not.toHaveBeenCalled();
   });
 
-  it("starts scan when CLI path matches an existing root with interrupted scan", async () => {
-    vi.spyOn(api, "getCliFolderPath").mockResolvedValue("/home/user/photos");
-    const startScanSpy = vi.spyOn(api, "startScan").mockResolvedValue(scanJob({
-      id: 99,
-      status: "running",
-      totalFiles: 0,
-      processedFiles: 0,
-      progressPct: 0,
-      added: 0,
-      phase: "discovering",
-    }));
+  it("asks instead of rescanning when the CLI folder is already indexed", async () => {
+    vi.spyOn(api, "getCliFolderPath").mockResolvedValue(mockRoot.rootPath);
+    const startScanSpy = vi.spyOn(api, "startScan");
+    vi.spyOn(api, "pendingScanSummary").mockResolvedValue({
+      rootId: 1,
+      unclassified: 53748,
+      lastScanAt: null,
+    });
+    vi.spyOn(api, "getVisionSettings").mockResolvedValue({
+      modelOverride: null,
+      imageMaxSide: 1024,
+      promptProfile: "concise",
+      ocrEngine: "llm",
+      startupScan: "ask",
+    });
     mockInitApp.mockResolvedValueOnce(initResult({
       roots: [mockRoot],
       scans: [scanJob()],
     }));
     renderApp();
+
+    expect(await screen.findByTestId("startup-scan-modal")).toBeInTheDocument();
+    expect(screen.getByText(/já está indexada/)).toBeInTheDocument();
+    expect(startScanSpy).not.toHaveBeenCalled();
+    expect(mockStartScanWithMode).not.toHaveBeenCalled();
+  });
+
+  it("applies the saved startup mode without prompting", async () => {
+    vi.spyOn(api, "getCliFolderPath").mockResolvedValue(mockRoot.rootPath);
+    vi.spyOn(api, "pendingScanSummary").mockResolvedValue({
+      rootId: 1,
+      unclassified: 1200,
+      lastScanAt: 1_700_000_000,
+    });
+    vi.spyOn(api, "getVisionSettings").mockResolvedValue({
+      modelOverride: null,
+      imageMaxSide: 1024,
+      promptProfile: "concise",
+      ocrEngine: "llm",
+      startupScan: "classify_only",
+    });
+    mockInitApp.mockResolvedValueOnce(initResult({ roots: [mockRoot] }));
+    renderApp();
+
     await waitFor(() => {
-      expect(startScanSpy).toHaveBeenCalledWith("/home/user/photos");
+      expect(mockStartScanWithMode).toHaveBeenCalledWith(
+        mockRoot.rootPath,
+        "classify_only",
+        expect.any(String),
+      );
     }, { timeout: 3000 });
-    expect(mockAddTrackedJobId).toHaveBeenCalledWith(99);
+    expect(screen.queryByTestId("startup-scan-modal")).toBeNull();
+  });
+
+  it("does not prompt when the root has nothing pending", async () => {
+    vi.spyOn(api, "getCliFolderPath").mockResolvedValue(mockRoot.rootPath);
+    vi.spyOn(api, "pendingScanSummary").mockResolvedValue({
+      rootId: 1,
+      unclassified: 0,
+      lastScanAt: 1_700_000_000,
+    });
+    vi.spyOn(api, "getVisionSettings").mockResolvedValue({
+      modelOverride: null,
+      imageMaxSide: 1024,
+      promptProfile: "concise",
+      ocrEngine: "llm",
+      startupScan: "ask",
+    });
+    mockInitApp.mockResolvedValueOnce(initResult({ roots: [mockRoot] }));
+    renderApp();
+
+    await waitFor(() => expect(api.getCliFolderPath).toHaveBeenCalled());
+    expect(screen.queryByTestId("startup-scan-modal")).toBeNull();
+    expect(mockStartScanWithMode).not.toHaveBeenCalled();
   });
 
   it("starts scan and refreshes roots when CLI path is a new root", async () => {
@@ -470,7 +526,7 @@ describe("App - API integration on init", () => {
     }));
     renderApp();
     await waitFor(() => {
-      expect(api.startScan).toHaveBeenCalledWith("/home/user/new-path");
+      expect(api.startScan).toHaveBeenCalledWith("/home/user/new-path", "full");
     }, { timeout: 3000 });
     await waitFor(() => {
       expect(mockRefreshRoots).toHaveBeenCalled();
