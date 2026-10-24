@@ -28,6 +28,11 @@ import type {
   SearchRequest,
   SearchResponse,
   VenvProvisionStatus,
+  VisionEstimate,
+  VisionModelOption,
+  VisionPromptProfile,
+  VisionOcrEngine,
+  VisionSettings,
 } from "./types";
 
 export async function appHealth(): Promise<HealthStatus> {
@@ -60,6 +65,36 @@ export async function listActiveScans(): Promise<ScanJobStatus[]> {
 
 export async function getRuntimeStatus(): Promise<RuntimeStatus> {
   return invoke<RuntimeStatus>("get_runtime_status");
+}
+
+/* ── Vision configuration ───────────────────────────────────────── */
+
+export async function getVisionSettings(): Promise<VisionSettings> {
+  return invoke<VisionSettings>("get_vision_settings");
+}
+
+export type VisionSettingsUpdate = {
+  model: string | null;
+  imageMaxSide: number;
+  promptProfile: VisionPromptProfile;
+  ocrEngine: VisionOcrEngine;
+};
+
+export async function setVisionSettings(update: VisionSettingsUpdate): Promise<VisionSettings> {
+  return invoke<VisionSettings>("set_vision_settings", { update });
+}
+
+export async function listVisionModels(): Promise<VisionModelOption[]> {
+  return invoke<VisionModelOption[]>("list_vision_models");
+}
+
+/**
+ * Projection of the classification phase for `rootPath` using the settings
+ * currently persisted in settings.toml. The first call calibrates by running a
+ * few real requests; later calls hit the backend cache.
+ */
+export async function estimateVisionScan(rootPath: string): Promise<VisionEstimate> {
+  return invoke<VisionEstimate>("estimate_vision_scan", { rootPath });
 }
 
 export async function getSetupStatus(): Promise<SetupStatus> {

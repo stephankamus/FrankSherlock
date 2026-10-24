@@ -39,6 +39,7 @@ import HelpModal from "./components/modals/HelpModal";
 import EditMetadataModal from "./components/modals/EditMetadataModal";
 import PropertiesModal from "./components/modals/PropertiesModal";
 import ModelInfoModal from "./components/modals/ModelInfoModal";
+import ModelPickerModal from "./components/modals/ModelPickerModal";
 import CreateAlbumModal from "./components/modals/CreateAlbumModal";
 import CreateSmartFolderModal from "./components/modals/CreateSmartFolderModal";
 import { useToast } from "./hooks/useToast";
@@ -82,6 +83,14 @@ export default function App() {
   const [confirmDeleteFiles, setConfirmDeleteFiles] = useState<SearchItem[] | null>(null);
   const [renameItem, setRenameItem] = useState<SearchItem | null>(null);
   const [showModelInfo, setShowModelInfo] = useState(false);
+  /**
+   * Vision settings modal. `resolve` is only set when the modal is gating a
+   * scan start; without it the modal is just a settings screen.
+   */
+  const [visionPicker, setVisionPicker] = useState<{
+    rootPath: string | null;
+    resolve: ((ok: boolean) => void) | null;
+  } | null>(null);
   const [editMetadataItem, setEditMetadataItem] = useState<SearchItem | null>(null);
   const [facePreviewItems, setFacePreviewItems] = useState<SearchItem[]>([]);
   const [propertiesItem, setPropertiesItem] = useState<SearchItem | null>(null);
@@ -161,6 +170,9 @@ export default function App() {
 
   /* ── Scan manager ── */
   const scanManager = useScanManager({
+    // Show vision settings + the time projection before every classification scan.
+    beforeScan: (rootPath: string) =>
+      new Promise<boolean>((resolve) => setVisionPicker({ rootPath, resolve })),
     setSetup,
     setRuntime,
     setDbStats,
@@ -218,7 +230,7 @@ export default function App() {
   usePolling(POLL_MS, scanManager.pollRuntimeAndScans, [scanManager.trackedJobIds]);
   useInfiniteScroll(sentinelRef, onLoadMore, [items.length, total, loadingMore]);
 
-  const hasModalOpen = !!(confirmDeleteFiles || renameItem || editMetadataItem || propertiesItem || albumManager.showCreateAlbum || smartFolderManager.showCreateSmartFolder);
+  const hasModalOpen = !!(confirmDeleteFiles || renameItem || editMetadataItem || propertiesItem || albumManager.showCreateAlbum || smartFolderManager.showCreateSmartFolder || visionPicker);
 
   const onRequestDelete = useCallback(() => {
     const filesToDelete = [...selectedIndices].sort((a, b) => a - b)
@@ -644,7 +656,30 @@ export default function App() {
       )}
       {showHelp && <HelpModal onClose={() => setShowHelp(false)} />}
       {showModelInfo && runtime && (
-        <ModelInfoModal runtime={runtime} setup={setup} onClose={() => setShowModelInfo(false)} />
+        <ModelInfoModal
+          runtime={runtime}
+          setup={setup}
+          onClose={() => setShowModelInfo(false)}
+          onConfigureVision={() => {
+            setShowModelInfo(false);
+            setVisionPicker({ rootPath: null, resolve: null });
+          }}
+        />
+      )}
+      {visionPicker && (
+        <ModelPickerModal
+          rootPath={visionPicker.rootPath}
+          onRuntimeChanged={() => void scanManager.pollRuntimeAndScans()}
+          onCancel={() => {
+            visionPicker.resolve?.(false);
+            setVisionPicker(null);
+            void scanManager.pollRuntimeAndScans();
+          }}
+          onConfirm={() => {
+            visionPicker.resolve?.(true);
+            setVisionPicker(null);
+          }}
+        />
       )}
       {confirmDeleteRoot && (
         <ConfirmDeleteModal
@@ -892,6 +927,7 @@ export default function App() {
         selectedCount={selectedIndices.size}
         faceProgress={faces.faceProgress}
         onShowModelInfo={() => setShowModelInfo(true)}
+        configuredModel={setup?.recommendedModel ?? null}
       />
 
       {/* ── Toasts ── */}

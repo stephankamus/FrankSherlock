@@ -837,6 +837,7 @@ fn classify_and_update(ctx: &ScanContext, file_id: i64, abs_path: &str) {
             None
         };
 
+    let vision = ctx.vision_settings();
     let classification = if is_vid {
         classify::classify_video(
             abs,
@@ -844,6 +845,7 @@ fn classify_and_update(ctx: &ScanContext, file_id: i64, abs_path: &str) {
             &ctx.tmp_dir,
             &ctx.surya_venv_dir,
             &ctx.surya_script,
+            vision,
         )
     } else if is_pdf {
         classify::classify_pdf(
@@ -854,6 +856,7 @@ fn classify_and_update(ctx: &ScanContext, file_id: i64, abs_path: &str) {
             &ctx.surya_script,
             &ctx.pdfium_lib_path,
             pdf_password.as_deref(),
+            vision,
         )
     } else {
         classify::classify_image(
@@ -862,6 +865,7 @@ fn classify_and_update(ctx: &ScanContext, file_id: i64, abs_path: &str) {
             &ctx.tmp_dir,
             &ctx.surya_venv_dir,
             &ctx.surya_script,
+            vision,
         )
     };
 
@@ -1157,6 +1161,7 @@ mod tests {
 
     fn make_scan_context(db_path: &Path) -> ScanContext {
         let tmp = tempfile::tempdir().expect("tempdir");
+        let vision = crate::models::VisionSettings::default();
         ScanContext {
             db_path: db_path.to_path_buf(),
             thumbnails_dir: tmp.path().join("thumbs"),
@@ -1164,6 +1169,9 @@ mod tests {
             surya_venv_dir: tmp.path().join("venv"),
             surya_script: tmp.path().join("surya_ocr.py"),
             model: "qwen2.5vl:7b".to_string(),
+            image_max_side: vision.image_max_side,
+            prompt_profile: vision.prompt_profile,
+            ocr_engine: vision.ocr_engine,
             pdfium_lib_path: tmp.path().join("lib"),
         }
     }

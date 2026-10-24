@@ -10,12 +10,19 @@ type Props = {
   selectedCount: number;
   faceProgress: FaceDetectProgress | null;
   onShowModelInfo?: () => void;
+  /** Model that will be used on the next scan, shown while nothing is loaded. */
+  configuredModel?: string | null;
 };
 
-export default function StatusBar({ runtime, isScanning, runningScansCount, selectedCount, faceProgress, onShowModelInfo }: Props) {
+export default function StatusBar({ runtime, isScanning, runningScansCount, selectedCount, faceProgress, onShowModelInfo, configuredModel }: Props) {
+  const activeModel = runtime?.currentModel ?? null;
+  const modelLabel = activeModel ?? configuredModel ?? "none";
   return (
     <div className="statusbar">
-      <span>Model: {runtime?.currentModel || "none"}</span>
+      <span>
+        Model: {modelLabel}
+        {!activeModel && configuredModel ? " (idle)" : ""}
+      </span>
       <span
         className={onShowModelInfo ? "statusbar-clickable" : undefined}
         onClick={onShowModelInfo}

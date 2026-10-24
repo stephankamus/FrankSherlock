@@ -5,14 +5,17 @@ use crate::platform::process::silent_command;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::llm::{ollama_generate, parse_json_response};
-use crate::models::ClassificationResult;
+use crate::config::{OcrEngine, PromptProfile};
+use crate::llm::{num_ctx_for, ollama_generate, parse_json_response, GenerateParams};
+use crate::models::{ClassificationResult, VisionSettings};
+use crate::vision_prep::{self, PreparedImage};
 
 // ---------------------------------------------------------------------------
 // Prompts (identical to Python prototype)
 // ---------------------------------------------------------------------------
 
-const PRIMARY_PROMPT: &str = concat!(
+/// Detailed schema: adds anime candidates on the first pass (~78 output tokens).
+const PRIMARY_PROMPT_DETAILED: &str = concat!(
     "Analyze this image and respond ONLY with valid JSON. Schema: ",
     r#"{"media_type":"screenshot|anime|manga|photo|document|artwork|other","#,
     r#""contains_text":true,"#,
@@ -31,18 +34,44 @@ const PRIMARY_PROMPT: &str = concat!(
     "6) Favor precision over guesswork.",
 );
 
+/// Concise schema used by default: everything needed to route enrichment and to
+/// search, without the candidate arrays (those live in `ANIME_PROMPT`). Output
+/// drops from ~78 to ~30 tokens, which is where most of the wall time went on
+/// 7b models (`decode` dominates once the image is downscaled).
+const PRIMARY_PROMPT_CONCISE: &str = concat!(
+    "Analyze this image. Return ONLY compact JSON, no markdown. Schema: ",
+    r#"{"media_type":"screenshot|anime|manga|photo|document|artwork|other","#,
+    r#""contains_text":true,"#,
+    r#""description":"max 12 words","#,
+    r#""confidence":0.0}"#,
+    " Rules: ",
+    "1) contains_text=true only when text is clearly visible (UI, receipt, scan, subtitles). ",
+    "2) description must be factual and under 12 words. ",
+    "3) Favor precision over guesswork.",
+);
+
 const PRIMARY_PROMPT_FALLBACK: &str = concat!(
     "Return ONLY valid compact JSON with schema: ",
     r#"{"media_type":"screenshot|anime|manga|photo|document|artwork|other","#,
     r#""contains_text":true,"#,
-    r#""is_anime_related":false,"#,
-    r#""is_document_like":false,"#,
-    r#""description":"max 24 words","#,
-    r#""series_candidates":["max 3 unique names"],"#,
-    r#""character_candidates":["max 3 unique names"],"#,
+    r#""description":"max 12 words","#,
     r#""confidence":0.0}"#,
-    " Never exceed 3 items in candidates arrays. Never repeat entries. No markdown.",
+    " No markdown. No extra keys.",
 );
+
+fn primary_prompt(profile: PromptProfile) -> &'static str {
+    match profile {
+        PromptProfile::Concise => PRIMARY_PROMPT_CONCISE,
+        PromptProfile::Detailed => PRIMARY_PROMPT_DETAILED,
+    }
+}
+
+fn primary_num_predict(profile: PromptProfile) -> u32 {
+    match profile {
+        PromptProfile::Concise => 180,
+        PromptProfile::Detailed => 500,
+    }
+}
 
 const ANIME_PROMPT: &str = concat!(
     "This appears anime/manga-related. Return ONLY valid JSON with schema: ",
@@ -228,20 +257,36 @@ pub fn should_run_anime_enrichment(primary: &Value) -> bool {
     matches!(media_type, "anime" | "manga" | "artwork") || is_anime
 }
 
-pub fn should_run_document_enrichment(primary: &Value) -> bool {
+/// Whether OCR / document-field extraction should run for this classification.
+///
+/// `contains_text` alone must **not** trigger OCR: anime frames with burned-in
+/// subtitles and fan art with text used to pay ~8 s of Surya per image for no
+/// benefit. Surya spawns a fresh Python interpreter (torch + models) per file,
+/// so it is only worth it for actual documents.
+pub fn should_run_document_enrichment(primary: &Value, ocr_engine: OcrEngine) -> bool {
+    if ocr_engine == OcrEngine::Off {
+        return false;
+    }
     let media_type = primary
         .get("media_type")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let contains_text = primary
-        .get("contains_text")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    if matches!(media_type, "anime" | "manga" | "artwork") {
+        return false;
+    }
     let is_doc = primary
         .get("is_document_like")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    matches!(media_type, "document" | "screenshot") || contains_text || is_doc
+    matches!(media_type, "document" | "screenshot") || is_doc
+}
+
+/// Char-boundary-safe truncation for prompt payloads.
+fn truncate_chars(text: &str, max_chars: usize) -> &str {
+    match text.char_indices().nth(max_chars) {
+        Some((idx, _)) => &text[..idx],
+        None => text,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -356,11 +401,25 @@ fn first_frame_if_gif(image_path: &Path, tmp_dir: &Path) -> PathBuf {
 // Stage 1: Primary classification
 // ---------------------------------------------------------------------------
 
-fn classify_primary(model: &str, image_path: &Path, tmp_dir: &Path) -> Value {
-    let effective_path = first_frame_if_gif(image_path, tmp_dir);
+fn classify_primary(model: &str, prepared: &PreparedImage, profile: PromptProfile) -> Value {
+    let prompt = primary_prompt(profile);
+    let num_predict = primary_num_predict(profile);
+    let num_ctx = num_ctx_for(prepared.width, prepared.height, prompt.len(), num_predict);
 
-    // Attempt 1: primary prompt with json_mode
-    let resp1 = ollama_generate(model, PRIMARY_PROMPT, Some(&effective_path), 500, 180, true);
+    // Attempt 1: json mode (valid JSON in 100% of local runs, so a retry is rare).
+    let params = GenerateParams::vision(num_predict, Some(num_ctx));
+    let resp1 = ollama_generate(model, prompt, Some(&prepared.path), &params);
+    log::debug!(
+        "vision primary {}x{} bytes={} ctx={} prefill={:.2}s decode={:.2}s tokens={}/{}",
+        prepared.width,
+        prepared.height,
+        prepared.prepared_bytes,
+        num_ctx,
+        resp1.timings.prefill_s,
+        resp1.timings.decode_s,
+        resp1.timings.prompt_tokens,
+        resp1.timings.eval_tokens,
+    );
     if resp1.ok {
         if let Some(v) = parse_json_response(&resp1.raw) {
             if v.get("media_type").and_then(|v| v.as_str()).is_some() {
@@ -369,9 +428,17 @@ fn classify_primary(model: &str, image_path: &Path, tmp_dir: &Path) -> Value {
         }
     }
 
-    // Attempt 2: primary prompt without json_mode
-    let prompt2 = format!("{PRIMARY_PROMPT} Return a single JSON object only.");
-    let resp2 = ollama_generate(model, &prompt2, Some(&effective_path), 500, 180, false);
+    // Attempt 2: compliance fallback without json mode, then regex salvage.
+    let params2 = GenerateParams {
+        json_mode: false,
+        ..GenerateParams::vision(num_predict.min(260), Some(num_ctx))
+    };
+    let resp2 = ollama_generate(
+        model,
+        PRIMARY_PROMPT_FALLBACK,
+        Some(&prepared.path),
+        &params2,
+    );
     if resp2.ok {
         if let Some(v) = parse_json_response(&resp2.raw) {
             if v.get("media_type").and_then(|v| v.as_str()).is_some() {
@@ -380,25 +447,7 @@ fn classify_primary(model: &str, image_path: &Path, tmp_dir: &Path) -> Value {
         }
     }
 
-    // Attempt 3: fallback prompt with json_mode
-    let resp3 = ollama_generate(
-        model,
-        PRIMARY_PROMPT_FALLBACK,
-        Some(&effective_path),
-        260,
-        180,
-        true,
-    );
-    if resp3.ok {
-        if let Some(v) = parse_json_response(&resp3.raw) {
-            if v.get("media_type").and_then(|v| v.as_str()).is_some() {
-                return v;
-            }
-        }
-    }
-
-    // Salvage from raw attempts
-    let combined = format!("{}\n{}\n{}", resp1.raw, resp2.raw, resp3.raw);
+    let combined = format!("{}\n{}", resp1.raw, resp2.raw);
     if let Some(v) = salvage_primary_from_raw(&combined) {
         return v;
     }
@@ -416,14 +465,65 @@ fn classify_primary(model: &str, image_path: &Path, tmp_dir: &Path) -> Value {
     })
 }
 
+/// Result of one real first-pass request, used to calibrate the pre-scan estimate.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProbeResult {
+    pub ok: bool,
+    pub wall_s: f64,
+    pub timings: crate::llm::OllamaTimings,
+}
+
+/// Run the production first-pass request once and report how long it took.
+///
+/// This is what makes the scan projection hardware-accurate: instead of a
+/// hardcoded throughput table, the estimator measures real images from the
+/// user's library with the exact prompt, resolution and context that the scan
+/// will use.
+pub fn probe_primary(model: &str, prepared: &PreparedImage, profile: PromptProfile) -> ProbeResult {
+    let prompt = primary_prompt(profile);
+    let num_predict = primary_num_predict(profile);
+    let num_ctx = num_ctx_for(prepared.width, prepared.height, prompt.len(), num_predict);
+
+    let started = std::time::Instant::now();
+    let resp = ollama_generate(
+        model,
+        prompt,
+        Some(&prepared.path),
+        &GenerateParams::vision(num_predict, Some(num_ctx)),
+    );
+    let wall_s = started.elapsed().as_secs_f64();
+    log::debug!(
+        "vision probe {}x{}: wall={:.2}s load={:.2}s total={:.2}s prefill={:.2}s decode={:.2}s",
+        prepared.width,
+        prepared.height,
+        wall_s,
+        resp.timings.load_s,
+        resp.timings.total_s,
+        resp.timings.prefill_s,
+        resp.timings.decode_s,
+    );
+    ProbeResult {
+        ok: resp.ok,
+        wall_s,
+        timings: resp.timings,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Stage 2a: Anime enrichment
 // ---------------------------------------------------------------------------
 
-fn classify_anime_details(model: &str, image_path: &Path, tmp_dir: &Path) -> Option<Value> {
-    let effective_path = first_frame_if_gif(image_path, tmp_dir);
+fn classify_anime_details(model: &str, prepared: &PreparedImage) -> Option<Value> {
+    const NUM_PREDICT: u32 = 500;
+    let num_ctx = num_ctx_for(
+        prepared.width,
+        prepared.height,
+        ANIME_PROMPT.len(),
+        NUM_PREDICT,
+    );
 
-    let resp = ollama_generate(model, ANIME_PROMPT, Some(&effective_path), 600, 180, true);
+    let params = GenerateParams::vision(NUM_PREDICT, Some(num_ctx));
+    let resp = ollama_generate(model, ANIME_PROMPT, Some(&prepared.path), &params);
     if resp.ok {
         if let Some(v) = parse_json_response(&resp.raw) {
             let conf = v.get("confidence").and_then(|c| c.as_f64()).unwrap_or(0.0);
@@ -439,8 +539,11 @@ fn classify_anime_details(model: &str, image_path: &Path, tmp_dir: &Path) -> Opt
     }
 
     // Retry without json_mode
-    let prompt2 = format!("{ANIME_PROMPT} Return a single JSON object only.");
-    let resp2 = ollama_generate(model, &prompt2, Some(&effective_path), 600, 180, false);
+    let params2 = GenerateParams {
+        json_mode: false,
+        ..GenerateParams::vision(NUM_PREDICT, Some(num_ctx))
+    };
+    let resp2 = ollama_generate(model, ANIME_PROMPT, Some(&prepared.path), &params2);
     if resp2.ok {
         if let Some(v) = parse_json_response(&resp2.raw) {
             return Some(v);
@@ -489,9 +592,22 @@ fn run_surya_ocr(image_path: &Path, surya_venv: &Path, surya_script: &Path) -> O
     }
 }
 
-fn run_llm_ocr(model: &str, image_path: &Path, tmp_dir: &Path) -> OcrResult {
-    let effective_path = first_frame_if_gif(image_path, tmp_dir);
-    let resp = ollama_generate(model, OCR_PROMPT, Some(&effective_path), 2000, 240, false);
+fn run_llm_ocr(model: &str, prepared: &PreparedImage) -> OcrResult {
+    const NUM_PREDICT: u32 = 1500;
+    let params = GenerateParams {
+        json_mode: false,
+        timeout_secs: 300,
+        ..GenerateParams::vision(
+            NUM_PREDICT,
+            Some(num_ctx_for(
+                prepared.width,
+                prepared.height,
+                OCR_PROMPT.len(),
+                NUM_PREDICT,
+            )),
+        )
+    };
+    let resp = ollama_generate(model, OCR_PROMPT, Some(&prepared.path), &params);
     if !resp.ok {
         return OcrResult::failed("vision_llm");
     }
@@ -527,16 +643,25 @@ impl OcrResult {
 
 fn run_ocr(
     model: &str,
-    image_path: &Path,
-    tmp_dir: &Path,
+    prepared: &PreparedImage,
+    ocr_engine: OcrEngine,
     surya_venv: &Path,
     surya_script: &Path,
 ) -> OcrResult {
-    let surya = run_surya_ocr(image_path, surya_venv, surya_script);
-    if surya.ok && !surya.text.is_empty() {
-        return surya;
+    match ocr_engine {
+        OcrEngine::Off => OcrResult::failed("disabled"),
+        OcrEngine::Llm => run_llm_ocr(model, prepared),
+        OcrEngine::Surya => {
+            // Surya gets the original file: downscaling destroys the fine text it
+            // exists to recover.
+            let surya = run_surya_ocr(&prepared.source, surya_venv, surya_script);
+            if surya.ok && !surya.text.is_empty() {
+                surya
+            } else {
+                run_llm_ocr(model, prepared)
+            }
+        }
     }
-    run_llm_ocr(model, image_path, tmp_dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -546,8 +671,15 @@ fn run_ocr(
 fn extract_document_fields(model: &str, ocr_text: &str) -> Value {
     let regex_fields = extract_receipt_regex(ocr_text);
 
-    let prompt = format!("{RECEIPT_PROMPT}{ocr_text}");
-    let resp = ollama_generate(model, &prompt, None, 600, 180, true);
+    // Only the head of the OCR text matters for field extraction, and a long
+    // receipt dump is pure prefill cost.
+    let prompt = format!("{RECEIPT_PROMPT}{}", truncate_chars(ocr_text, 1200));
+    const NUM_PREDICT: u32 = 400;
+    let params = GenerateParams::vision(
+        NUM_PREDICT,
+        Some(num_ctx_for(0, 0, prompt.len(), NUM_PREDICT)),
+    );
+    let resp = ollama_generate(model, &prompt, None, &params);
     let llm_fields = if resp.ok {
         parse_json_response(&resp.raw)
     } else {
@@ -652,9 +784,33 @@ pub fn classify_image(
     tmp_dir: &Path,
     surya_venv: &Path,
     surya_script: &Path,
+    vision: VisionSettings,
 ) -> ClassificationResult {
     log::info!("Classifying: {}", image_path.display());
-    let primary = classify_primary(model, image_path, tmp_dir);
+
+    // GIFs are classified from their first frame; everything else goes through
+    // `vision_prep`, which downscales and applies EXIF orientation once so every
+    // stage below reuses the same bytes instead of re-encoding per attempt.
+    let frame_source = first_frame_if_gif(image_path, tmp_dir);
+    let prepared = match vision_prep::prepare(&frame_source, vision.image_max_side, tmp_dir) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!(
+                "Cannot prepare {} for the vision model: {e}",
+                image_path.display()
+            );
+            return ClassificationResult {
+                media_type: "other".to_string(),
+                description: String::new(),
+                extracted_text: String::new(),
+                canonical_mentions: String::new(),
+                confidence: 0.0,
+                lang_hint: String::new(),
+            };
+        }
+    };
+
+    let primary = classify_primary(model, &prepared, vision.prompt_profile);
 
     let media_type = primary
         .get("media_type")
@@ -677,7 +833,7 @@ pub fn classify_image(
 
     // Anime enrichment
     if should_run_anime_enrichment(&primary) {
-        if let Some(anime) = classify_anime_details(model, image_path, tmp_dir) {
+        if let Some(anime) = classify_anime_details(model, &prepared) {
             if let Some(series) = anime.get("series").and_then(clean_nullable_str) {
                 full_description = format!("{full_description} [Series: {series}]");
             }
@@ -717,8 +873,14 @@ pub fn classify_image(
     canonical_mentions = all_mentions.join(", ");
 
     // Document enrichment
-    if should_run_document_enrichment(&primary) {
-        let ocr = run_ocr(model, image_path, tmp_dir, surya_venv, surya_script);
+    if should_run_document_enrichment(&primary, vision.ocr_engine) {
+        let ocr = run_ocr(
+            model,
+            &prepared,
+            vision.ocr_engine,
+            surya_venv,
+            surya_script,
+        );
         if ocr.ok && !ocr.text.is_empty() {
             extracted_text = ocr.text.clone();
 
@@ -774,6 +936,7 @@ pub fn classify_video(
     tmp_dir: &Path,
     _surya_venv: &Path,
     _surya_script: &Path,
+    vision: VisionSettings,
 ) -> ClassificationResult {
     log::info!("Classifying video: {}", video_path.display());
 
@@ -826,11 +989,30 @@ pub fn classify_video(
     // Step 3: Extract subtitle text
     let subtitle_text = crate::video::collect_subtitle_text(video_path, &video_tmp);
 
-    // Step 4: Classify keyframes with Ollama
-    let primary = if !keyframes.is_empty() {
-        // Use the best keyframe (first = least likely to be black/intro)
-        let best_frame = &keyframes[0];
-        let resp = ollama_generate(model, VIDEO_PROMPT, Some(best_frame), 500, 180, true);
+    // Step 4: Classify the best keyframe with Ollama.
+    //
+    // The keyframe is a video-sized PNG (ffmpeg output), so it gets the same
+    // downscale treatment as photos: it reuses `prepared_frame` for the anime
+    // enrichment pass below instead of re-reading the file.
+    let prepared_frame = keyframes.first().and_then(|frame| {
+        match vision_prep::prepare(frame, vision.image_max_side, &video_tmp) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                log::warn!("cannot prepare keyframe {}: {e}", frame.display());
+                None
+            }
+        }
+    });
+
+    let primary = if let Some(frame) = &prepared_frame {
+        const NUM_PREDICT: u32 = 400;
+        let num_ctx = num_ctx_for(frame.width, frame.height, VIDEO_PROMPT.len(), NUM_PREDICT);
+        let resp = ollama_generate(
+            model,
+            VIDEO_PROMPT,
+            Some(&frame.path),
+            &GenerateParams::vision(NUM_PREDICT, Some(num_ctx)),
+        );
         if resp.ok {
             parse_json_response(&resp.raw)
         } else {
@@ -892,8 +1074,8 @@ pub fn classify_video(
 
     // Anime enrichment on the best keyframe
     if is_anime {
-        if let Some(best_frame) = keyframes.first() {
-            if let Some(anime) = classify_anime_details(model, best_frame, &video_tmp) {
+        if let Some(best_frame) = &prepared_frame {
+            if let Some(anime) = classify_anime_details(model, best_frame) {
                 if let Some(series) = anime.get("series").and_then(clean_nullable_str) {
                     description = format!("{description} [Series: {series}]");
                 }
@@ -928,12 +1110,9 @@ pub fn classify_video(
     }
     let canonical_mentions = all_mentions.join(", ");
 
-    // Cap subtitle text for extracted_text field
-    let extracted_text = if subtitle_text.len() > 4000 {
-        subtitle_text[..4000].to_string()
-    } else {
-        subtitle_text
-    };
+    // Cap subtitle text for extracted_text field (char-safe: subtitles are often
+    // CJK, and byte slicing would panic mid-codepoint).
+    let extracted_text = truncate_chars(&subtitle_text, 4000).to_string();
 
     let lang_hint = detect_lang_hint(&extracted_text);
 
@@ -963,6 +1142,7 @@ pub fn classify_video(
 // PDF classification entry point
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 pub fn classify_pdf(
     pdf_path: &Path,
     model: &str,
@@ -971,6 +1151,7 @@ pub fn classify_pdf(
     surya_script: &Path,
     pdfium_lib: &Path,
     password: Option<&str>,
+    vision: VisionSettings,
 ) -> ClassificationResult {
     log::info!("Classifying PDF: {}", pdf_path.display());
 
@@ -1007,14 +1188,22 @@ pub fn classify_pdf(
     let _ = std::fs::create_dir_all(tmp_dir);
     let tmp_img_path = tmp_dir.join("_pdf_page.png");
 
-    let primary = match crate::pdf::render_page(pdf_path, page_idx, 200, pdfium_lib, password) {
+    // The rendered page is a PNG; `vision_prep` returns it untouched when it
+    // already fits, so this only costs a re-encode for large pages.
+    let prepared_page = match crate::pdf::render_page(pdf_path, page_idx, 200, pdfium_lib, password)
+    {
         Ok(img) => {
             if let Err(e) = img.save(&tmp_img_path) {
                 log::warn!("Failed to save PDF page for classification: {e}");
                 None
             } else {
-                let result = classify_primary(model, &tmp_img_path, tmp_dir);
-                Some(result)
+                match vision_prep::prepare(&tmp_img_path, vision.image_max_side, tmp_dir) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        log::warn!("Failed to prepare PDF page for classification: {e}");
+                        None
+                    }
+                }
             }
         }
         Err(e) => {
@@ -1022,6 +1211,10 @@ pub fn classify_pdf(
             None
         }
     };
+
+    let primary = prepared_page
+        .as_ref()
+        .map(|prepared| classify_primary(model, prepared, vision.prompt_profile));
 
     // Use vision model results as the base, fall back to generic PDF description
     let media_type = primary
@@ -1049,8 +1242,11 @@ pub fn classify_pdf(
     let mut canonical_mentions = String::new();
     if let Some(ref p) = primary {
         // Anime enrichment on the rendered page (same logic as classify_image)
-        if should_run_anime_enrichment(p) && tmp_img_path.exists() {
-            if let Some(anime) = classify_anime_details(model, &tmp_img_path, tmp_dir) {
+        if should_run_anime_enrichment(p) {
+            if let Some(anime) = prepared_page
+                .as_ref()
+                .and_then(|prepared| classify_anime_details(model, prepared))
+            {
                 if let Some(series) = anime.get("series").and_then(clean_nullable_str) {
                     description = format!("{description} [Series: {series}]");
                 }
@@ -1096,11 +1292,8 @@ pub fn classify_pdf(
     if !crate::pdf::is_scanned_pdf(&full_text, page_count) {
         // Text-rich PDF: use extracted text for LLM document field extraction
         extracted_text = full_text.clone();
-        let context = if full_text.len() > 2000 {
-            &full_text[..2000]
-        } else {
-            &full_text
-        };
+        // Char-safe: PDF text can be CJK and byte slicing panics mid-codepoint.
+        let context = truncate_chars(&full_text, 2000);
         let doc_fields = extract_document_fields(model, context);
         if let Some(kind) = doc_fields.get("document_kind").and_then(clean_nullable_str) {
             description = format!("{description} [Doc: {kind}]");
@@ -1111,8 +1304,8 @@ pub fn classify_pdf(
     } else {
         // Scanned PDF: run OCR on the already-rendered page
         extracted_text = String::new();
-        if tmp_img_path.exists() {
-            let ocr = run_ocr(model, &tmp_img_path, tmp_dir, surya_venv, surya_script);
+        if let Some(prepared) = prepared_page.as_ref() {
+            let ocr = run_ocr(model, prepared, vision.ocr_engine, surya_venv, surya_script);
             if ocr.ok && !ocr.text.is_empty() {
                 extracted_text = ocr.text.clone();
 
@@ -1254,19 +1447,122 @@ mod tests {
     #[test]
     fn should_run_document_for_doc_type() {
         let p = serde_json::json!({"media_type": "document", "contains_text": false, "is_document_like": false});
-        assert!(should_run_document_enrichment(&p));
+        assert!(should_run_document_enrichment(&p, OcrEngine::Llm));
     }
 
     #[test]
-    fn should_run_document_for_contains_text() {
-        let p = serde_json::json!({"media_type": "photo", "contains_text": true, "is_document_like": false});
-        assert!(should_run_document_enrichment(&p));
+    fn should_run_document_for_document_like() {
+        let p = serde_json::json!({"media_type": "photo", "contains_text": false, "is_document_like": true});
+        assert!(should_run_document_enrichment(&p, OcrEngine::Llm));
+    }
+
+    /// Burned-in subtitles used to trigger a full Surya OCR run (~8 s/image).
+    #[test]
+    fn should_not_run_document_for_anime_with_text() {
+        for media_type in ["anime", "manga", "artwork"] {
+            let p = serde_json::json!({"media_type": media_type, "contains_text": true, "is_document_like": false});
+            assert!(
+                !should_run_document_enrichment(&p, OcrEngine::Surya),
+                "{media_type} with text must not trigger OCR"
+            );
+        }
+    }
+
+    #[test]
+    fn should_not_run_document_when_ocr_is_off() {
+        let p = serde_json::json!({"media_type": "document", "contains_text": true, "is_document_like": true});
+        assert!(!should_run_document_enrichment(&p, OcrEngine::Off));
     }
 
     #[test]
     fn should_not_run_document_for_plain_photo() {
         let p = serde_json::json!({"media_type": "photo", "contains_text": false, "is_document_like": false});
-        assert!(!should_run_document_enrichment(&p));
+        assert!(!should_run_document_enrichment(&p, OcrEngine::Llm));
+    }
+
+    #[test]
+    fn primary_prompt_matches_profile() {
+        assert_eq!(
+            primary_prompt(PromptProfile::Concise),
+            PRIMARY_PROMPT_CONCISE
+        );
+        assert_eq!(
+            primary_prompt(PromptProfile::Detailed),
+            PRIMARY_PROMPT_DETAILED
+        );
+        assert!(
+            primary_num_predict(PromptProfile::Concise)
+                < primary_num_predict(PromptProfile::Detailed)
+        );
+        // The concise schema must still carry the fields the routing relies on.
+        let concise = primary_prompt(PromptProfile::Concise);
+        assert!(concise.contains("media_type"));
+        assert!(concise.contains("contains_text"));
+        assert!(concise.contains("description"));
+    }
+
+    #[test]
+    fn truncate_chars_is_codepoint_safe() {
+        let text = "日本語のテキストです";
+        let truncated = truncate_chars(text, 3);
+        assert_eq!(truncated, "日本語");
+        assert_eq!(truncate_chars(text, 100), text);
+    }
+
+    /// End-to-end smoke test of the real pipeline: prepare -> LLM -> parse.
+    ///
+    /// ```sh
+    /// FRANK_VISION_SMOKE_DIR=~/Imagens/album FRANK_VISION_SMOKE_MODEL=qwen2.5vl:3b \
+    ///   cargo test vision_pipeline_smoke -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "requires a running Ollama and a local image folder"]
+    fn vision_pipeline_smoke() {
+        let dir = std::env::var("FRANK_VISION_SMOKE_DIR")
+            .expect("set FRANK_VISION_SMOKE_DIR to a folder with images");
+        let model = std::env::var("FRANK_VISION_SMOKE_MODEL")
+            .unwrap_or_else(|_| "qwen2.5vl:3b".to_string());
+
+        let is_image = |p: &std::path::Path| {
+            p.extension()
+                .map(|e| {
+                    let ext = e.to_string_lossy().to_ascii_lowercase();
+                    matches!(ext.as_str(), "jpg" | "jpeg" | "png")
+                })
+                .unwrap_or(false)
+        };
+        let image = std::fs::read_dir(&dir)
+            .expect("read FRANK_VISION_SMOKE_DIR")
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| is_image(path))
+            .expect("no image found in FRANK_VISION_SMOKE_DIR");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let vision = crate::models::VisionSettings {
+            image_max_side: 1024,
+            prompt_profile: PromptProfile::Concise,
+            // Surya needs a provisioned venv; keep the smoke test self-contained.
+            ocr_engine: OcrEngine::Off,
+        };
+
+        let started = std::time::Instant::now();
+        let result = classify_image(&image, &model, tmp.path(), tmp.path(), tmp.path(), vision);
+        let elapsed = started.elapsed().as_secs_f64();
+
+        println!(
+            "{} -> media_type={:?} confidence={:.2} in {:.2}s\n  {}",
+            image.display(),
+            result.media_type,
+            result.confidence,
+            elapsed,
+            result.description
+        );
+        assert!(!result.media_type.is_empty());
+        assert!(
+            !result.description.is_empty(),
+            "concise profile must still produce a description"
+        );
     }
 
     #[test]

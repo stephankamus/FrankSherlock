@@ -132,7 +132,7 @@ pub fn save_user_config(config: &serde_json::Value) -> AppResult<()> {
 
 const SETTINGS_TEMPLATE: &str = r#"# Frank Sherlock runtime settings.
 #
-# Restart Frank Sherlock after changing this file.
+# Changes are picked up on the next scan; no restart needed.
 #
 # Ollama vision model override.
 # Leave empty to let the app choose from detected hardware.
@@ -149,11 +149,122 @@ const SETTINGS_TEMPLATE: &str = r#"# Frank Sherlock runtime settings.
 # When set, Frank Sherlock requires this exact model. If it is missing, first-run setup will
 # offer to download it through Ollama before scanning.
 model_override = ""
+
+# Longest side (pixels) of the image sent to the vision model.
+# 0 keeps the original file untouched.
+# Lower is faster: 1024 keeps small subjects legible, 768 is ~40% faster but starts to lose
+# small details. Ollama's image preprocessing (not the model itself) dominates the cost of
+# large photos, so this is the single most effective speed knob.
+image_max_side = 1024
+
+# Description style for the primary classification pass.
+# - concise   classifies + short description (max 12 words): ~30 output tokens
+# - detailed  adds anime series/character candidates: ~78 output tokens (slower)
+prompt_profile = "concise"
+
+# OCR engine used for screenshots/documents.
+# - off    never run OCR
+# - llm    reuse the vision model (fast, lower recall)
+# - surya  dedicated OCR model in a Python venv (better recall, much slower)
+ocr_engine = "llm"
 "#;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Default longest-side for images sent to the vision model.
+pub const DEFAULT_IMAGE_MAX_SIDE: u32 = 1024;
+/// Smallest accepted longest-side. Below this the model starts losing small subjects.
+pub const MIN_IMAGE_MAX_SIDE: u32 = 640;
+/// Largest accepted longest-side. Above this Ollama caps image tokens anyway.
+pub const MAX_IMAGE_MAX_SIDE: u32 = 2048;
+
+/// Description style for the primary classification pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptProfile {
+    /// `media_type` + `contains_text` + a description capped at 12 words.
+    Concise,
+    /// Adds `series_candidates` / `character_candidates` on the first pass.
+    Detailed,
+}
+
+impl PromptProfile {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PromptProfile::Concise => "concise",
+            PromptProfile::Detailed => "detailed",
+        }
+    }
+
+    /// Accepts the values exposed in `settings.toml` and by the UI.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "concise" | "short" => Some(PromptProfile::Concise),
+            "detailed" | "full" => Some(PromptProfile::Detailed),
+            _ => None,
+        }
+    }
+}
+
+/// Which engine runs OCR for screenshots and documents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OcrEngine {
+    Off,
+    Llm,
+    Surya,
+}
+
+impl OcrEngine {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OcrEngine::Off => "off",
+            OcrEngine::Llm => "llm",
+            OcrEngine::Surya => "surya",
+        }
+    }
+
+    /// Accepts the values exposed in `settings.toml` and by the UI.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "disabled" => Some(OcrEngine::Off),
+            "llm" | "vision" => Some(OcrEngine::Llm),
+            "surya" => Some(OcrEngine::Surya),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RuntimeSettings {
     pub model_override: Option<String>,
+    /// Longest side of the image handed to the model. `0` = original bytes.
+    pub image_max_side: u32,
+    pub prompt_profile: PromptProfile,
+    pub ocr_engine: OcrEngine,
+}
+
+impl Default for RuntimeSettings {
+    fn default() -> Self {
+        Self {
+            model_override: None,
+            image_max_side: DEFAULT_IMAGE_MAX_SIDE,
+            prompt_profile: PromptProfile::Concise,
+            ocr_engine: OcrEngine::Llm,
+        }
+    }
+}
+
+impl RuntimeSettings {
+    /// `0` is preserved (meaning "original bytes"); anything else is clamped to the
+    /// supported range so a hand-edited file cannot make classification absurdly slow
+    /// or degrade quality below what the prompts expect.
+    pub fn normalize_image_max_side(value: u32) -> u32 {
+        if value == 0 {
+            0
+        } else {
+            value.clamp(MIN_IMAGE_MAX_SIDE, MAX_IMAGE_MAX_SIDE)
+        }
+    }
 }
 
 fn runtime_settings_path() -> AppResult<PathBuf> {
@@ -184,7 +295,7 @@ pub fn load_runtime_settings() -> AppResult<RuntimeSettings> {
 }
 
 fn parse_runtime_settings(data: &str) -> AppResult<RuntimeSettings> {
-    let mut model_override = None;
+    let mut settings = RuntimeSettings::default();
 
     for raw_line in data.lines() {
         let line = raw_line.trim();
@@ -195,19 +306,121 @@ fn parse_runtime_settings(data: &str) -> AppResult<RuntimeSettings> {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        if key.trim() != "model_override" {
-            continue;
-        }
 
-        let parsed = parse_settings_string(value.trim())?;
-        let parsed = parsed.trim();
-        if !parsed.is_empty() {
-            validate_model_tag(parsed)?;
-            model_override = Some(parsed.to_string());
+        match key.trim() {
+            "model_override" => {
+                let parsed = parse_settings_string(value.trim())?;
+                let parsed = parsed.trim();
+                if !parsed.is_empty() {
+                    validate_model_tag(parsed)?;
+                    settings.model_override = Some(parsed.to_string());
+                }
+            }
+            "image_max_side" => {
+                let parsed = parse_settings_string(value.trim())?;
+                match parsed.trim().parse::<u32>() {
+                    Ok(v) => settings.image_max_side = RuntimeSettings::normalize_image_max_side(v),
+                    Err(_) => log::warn!(
+                        "settings.toml: ignoring image_max_side '{parsed}' (expected: 0, or {MIN_IMAGE_MAX_SIDE}..={MAX_IMAGE_MAX_SIDE})"
+                    ),
+                }
+            }
+            "prompt_profile" => {
+                let parsed = parse_settings_string(value.trim())?;
+                match PromptProfile::parse(&parsed) {
+                    Some(v) => settings.prompt_profile = v,
+                    None => log::warn!(
+                        "settings.toml: ignoring prompt_profile '{parsed}' (expected: concise | detailed)"
+                    ),
+                }
+            }
+            "ocr_engine" => {
+                let parsed = parse_settings_string(value.trim())?;
+                match OcrEngine::parse(&parsed) {
+                    Some(v) => settings.ocr_engine = v,
+                    None => log::warn!(
+                        "settings.toml: ignoring ocr_engine '{parsed}' (expected: off | llm | surya)"
+                    ),
+                }
+            }
+            _ => {}
         }
     }
 
-    Ok(RuntimeSettings { model_override })
+    Ok(settings)
+}
+
+/// Persist `settings` back to `settings.toml`, rewriting only the known keys so any
+/// hand-written comments and unknown keys survive.
+pub fn save_runtime_settings(settings: &RuntimeSettings) -> AppResult<()> {
+    let path = runtime_settings_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let existing = std::fs::read_to_string(&path).unwrap_or_else(|_| SETTINGS_TEMPLATE.to_string());
+    let known = [
+        "model_override",
+        "image_max_side",
+        "prompt_profile",
+        "ocr_engine",
+    ];
+
+    let model_line = match &settings.model_override {
+        Some(model) => {
+            validate_model_tag(model)?;
+            format!("model_override = {}", serde_json::json!(model))
+        }
+        None => "model_override = \"\"".to_string(),
+    };
+    let mut replacements = std::collections::HashMap::new();
+    replacements.insert("model_override", model_line);
+    replacements.insert(
+        "image_max_side",
+        format!("image_max_side = {}", settings.image_max_side),
+    );
+    replacements.insert(
+        "prompt_profile",
+        format!(
+            "prompt_profile = {}",
+            serde_json::json!(settings.prompt_profile.as_str())
+        ),
+    );
+    replacements.insert(
+        "ocr_engine",
+        format!(
+            "ocr_engine = {}",
+            serde_json::json!(settings.ocr_engine.as_str())
+        ),
+    );
+
+    let mut out = String::new();
+    let mut written: Vec<&str> = Vec::new();
+    for line in existing.lines() {
+        let trimmed = line.trim_start();
+        let key = trimmed.split('=').next().unwrap_or("").trim();
+        if let Some(replacement) = replacements.get(key) {
+            if !written.contains(&key) {
+                out.push_str(replacement);
+                out.push('\n');
+                written.push(key);
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    for key in known {
+        if !written.contains(&key) {
+            if let Some(replacement) = replacements.get(key) {
+                out.push_str(replacement);
+                out.push('\n');
+            }
+        }
+    }
+
+    std::fs::write(&path, out)?;
+    Ok(())
 }
 
 fn parse_settings_string(value: &str) -> AppResult<String> {
@@ -398,12 +611,95 @@ mod tests {
     #[test]
     fn parse_runtime_settings_empty_override_uses_automatic() {
         let settings = parse_runtime_settings(r#"model_override = """#).expect("settings");
-        assert_eq!(
-            settings,
-            RuntimeSettings {
-                model_override: None
-            }
-        );
+        assert_eq!(settings, RuntimeSettings::default());
+    }
+
+    #[test]
+    fn parse_runtime_settings_defaults_when_file_is_empty() {
+        let settings = parse_runtime_settings("").expect("settings");
+        assert_eq!(settings.model_override, None);
+        assert_eq!(settings.image_max_side, DEFAULT_IMAGE_MAX_SIDE);
+        assert_eq!(settings.prompt_profile, PromptProfile::Concise);
+        assert_eq!(settings.ocr_engine, OcrEngine::Llm);
+    }
+
+    #[test]
+    fn parse_runtime_settings_vision_knobs() {
+        let settings = parse_runtime_settings(
+            r#"
+            image_max_side = 768
+            prompt_profile = "detailed"
+            ocr_engine = "surya"
+            "#,
+        )
+        .expect("settings");
+        assert_eq!(settings.image_max_side, 768);
+        assert_eq!(settings.prompt_profile, PromptProfile::Detailed);
+        assert_eq!(settings.ocr_engine, OcrEngine::Surya);
+    }
+
+    #[test]
+    fn parse_runtime_settings_accepts_original_side() {
+        let settings = parse_runtime_settings("image_max_side = 0").expect("settings");
+        assert_eq!(settings.image_max_side, 0, "0 means original bytes");
+    }
+
+    #[test]
+    fn parse_runtime_settings_clamps_image_max_side() {
+        // Too small would break quality; too large would just be wasteful.
+        let small = parse_runtime_settings("image_max_side = 128").expect("settings");
+        assert_eq!(small.image_max_side, MIN_IMAGE_MAX_SIDE);
+        let large = parse_runtime_settings("image_max_side = 9999").expect("settings");
+        assert_eq!(large.image_max_side, MAX_IMAGE_MAX_SIDE);
+    }
+
+    #[test]
+    fn parse_runtime_settings_ignores_unknown_values() {
+        let settings = parse_runtime_settings(
+            r#"
+            image_max_side = not-a-number
+            prompt_profile = "verbose"
+            ocr_engine = "tesseract"
+            "#,
+        )
+        .expect("settings");
+        assert_eq!(settings.image_max_side, DEFAULT_IMAGE_MAX_SIDE);
+        assert_eq!(settings.prompt_profile, PromptProfile::Concise);
+        assert_eq!(settings.ocr_engine, OcrEngine::Llm);
+    }
+
+    #[test]
+    fn save_runtime_settings_round_trips_and_preserves_comments() {
+        let _guard = ENV_LOCK.lock().expect("lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Redirect the config dir so the real user file is never touched.
+        env::set_var("XDG_CONFIG_HOME", dir.path());
+
+        let settings = RuntimeSettings {
+            model_override: Some("qwen2.5vl:3b".to_string()),
+            image_max_side: 768,
+            prompt_profile: PromptProfile::Detailed,
+            ocr_engine: OcrEngine::Off,
+        };
+        save_runtime_settings(&settings).expect("save");
+
+        let path = runtime_settings_path().expect("path");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("# Frank Sherlock runtime settings."));
+        assert!(text.contains("model_override = \"qwen2.5vl:3b\""));
+        assert!(text.contains("image_max_side = 768"));
+        assert!(text.contains("prompt_profile = \"detailed\""));
+        assert!(text.contains("ocr_engine = \"off\""));
+
+        let loaded = parse_runtime_settings(&text).expect("parse");
+        assert_eq!(loaded, settings);
+
+        // Saving twice must not duplicate keys.
+        save_runtime_settings(&settings).expect("save again");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(text.matches("image_max_side =").count(), 1);
+
+        env::remove_var("XDG_CONFIG_HOME");
     }
 
     #[test]

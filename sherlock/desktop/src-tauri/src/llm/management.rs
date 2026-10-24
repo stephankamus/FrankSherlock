@@ -63,6 +63,57 @@ pub fn list_installed_models() -> Option<Vec<String>> {
     Some(models)
 }
 
+/// List installed models with their on-disk size in bytes (`/api/tags`).
+///
+/// Size is the weights blob, not the runtime footprint: KV cache and compute
+/// buffers add to it. Used only as a rough "will this fit?" hint in the model
+/// picker; the calibrated estimate reports the real numbers from `/api/ps`.
+pub fn list_installed_models_with_sizes() -> Option<Vec<(String, u64)>> {
+    let agent = http_agent();
+    let mut resp = agent.get(&format!("{OLLAMA_BASE}/api/tags")).call().ok()?;
+    let body: String = resp.body_mut().read_to_string().ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let models = parsed
+        .get("models")?
+        .as_array()?
+        .iter()
+        .filter_map(|m| {
+            let name = m
+                .get("name")
+                .or_else(|| m.get("model"))
+                .and_then(|v| v.as_str())?;
+            let size = m.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+            Some((name.to_string(), size))
+        })
+        .collect();
+    Some(models)
+}
+
+/// Runtime memory footprint reported by Ollama for a loaded model.
+///
+/// Returns `(total_bytes, vram_bytes)`. `total > vram` means part of the model
+/// spilled to system RAM, which collapses decode throughput.
+pub fn loaded_model_memory(model: &str) -> Option<(u64, u64)> {
+    let agent = http_agent();
+    let mut resp = agent.get(&format!("{OLLAMA_BASE}/api/ps")).call().ok()?;
+    let body: String = resp.body_mut().read_to_string().ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let models = parsed.get("models")?.as_array()?;
+    for m in models {
+        let name = m
+            .get("name")
+            .or_else(|| m.get("model"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if name == model {
+            let size = m.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+            let vram = m.get("size_vram").and_then(|v| v.as_u64()).unwrap_or(0);
+            return Some((size, vram));
+        }
+    }
+    None
+}
+
 /// List models currently loaded in Ollama via HTTP API (`/api/ps`).
 /// Returns (ollama_available, loaded_model_names).
 pub fn list_loaded_models() -> (bool, Vec<String>) {

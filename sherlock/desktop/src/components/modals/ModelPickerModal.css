@@ -1,0 +1,123 @@
+/* ── Vision settings / model picker modal ─────────────────── */
+.model-picker-modal {
+  width: min(620px, 100%);
+  max-height: 86vh;
+  overflow-y: auto;
+}
+
+.model-picker-subtitle {
+  margin: 0 0 12px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.model-picker-loading,
+.model-picker-empty {
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.model-picker-error {
+  margin: 0 0 10px;
+  color: var(--danger);
+  font-size: var(--font-size-sm);
+}
+
+.model-picker-section {
+  margin-bottom: 14px;
+}
+
+.model-picker-section h4 {
+  margin: 0 0 6px;
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.model-picker-options {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.model-picker-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.model-picker-option:hover {
+  background: var(--bg-hover);
+}
+
+.model-picker-option input {
+  margin-top: 3px;
+  accent-color: var(--accent);
+}
+
+.model-picker-option-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+}
+
+.model-picker-size {
+  color: var(--text-secondary);
+  font-weight: 400;
+}
+
+.model-picker-badge {
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text-secondary);
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.model-picker-badge.active {
+  color: var(--success);
+}
+
+.model-picker-hint {
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+}
+
+.model-picker-hint.warn {
+  color: var(--danger);
+}
+
+.model-picker-projection {
+  padding: 10px;
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-md);
+  background: var(--bg-base);
+}
+
+.model-picker-total {
+  margin: 0 0 4px;
+  font-size: var(--font-size-base);
+  color: var(--text-primary);
+}
+
+.model-picker-recalc {
+  margin-left: 8px;
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+}
+
+.model-picker-warn {
+  margin: 6px 0 0;
+  color: var(--danger);
+  font-size: 0.75rem;
+}

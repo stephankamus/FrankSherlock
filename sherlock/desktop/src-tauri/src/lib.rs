@@ -15,6 +15,8 @@ mod similarity;
 mod thumbnail;
 mod video;
 mod video_server;
+mod vision_estimate;
+mod vision_prep;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -823,6 +825,7 @@ async fn retry_protected_pdfs(
                     &scan_ctx.surya_script,
                     &scan_ctx.pdfium_lib_path,
                     Some(&pw),
+                    scan_ctx.vision_settings(),
                 );
 
                 // Generate thumbnail
@@ -899,6 +902,7 @@ async fn reclassify_pdf(
             &scan_ctx.surya_script,
             &scan_ctx.pdfium_lib_path,
             working_pw.as_deref(),
+            scan_ctx.vision_settings(),
         );
 
         let thumb_result = thumbnail::generate_pdf_thumbnail(
@@ -1658,10 +1662,30 @@ fn resolve_pdfium_lib(app_handle: &tauri::AppHandle) -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib")
 }
 
+/// Vision knobs from `settings.toml`, with sane defaults if the file is broken.
+fn vision_settings_from_config() -> models::VisionSettings {
+    let settings = config::load_runtime_settings().unwrap_or_default();
+    models::VisionSettings {
+        image_max_side: settings.image_max_side,
+        prompt_profile: settings.prompt_profile,
+        ocr_engine: settings.ocr_engine,
+    }
+}
+
+/// Identifies the hardware a calibration was measured on, so a GPU swap
+/// invalidates cached measurements.
+fn gpu_signature(gpu: &platform::gpu::GpuInfo) -> String {
+    format!(
+        "{:?}-{:?}-{}-{}",
+        gpu.vendor, gpu.vram_total_mib, gpu.unified_memory, gpu.system_ram_mib
+    )
+}
+
 fn build_scan_context(app_state: &AppState, app_handle: &tauri::AppHandle) -> models::ScanContext {
     let surya_script = resolve_surya_script(app_handle);
     let pdfium_lib_path = resolve_pdfium_lib(app_handle);
     let model_selection = select_model_for_app(app_state.gpu_info());
+    let vision = vision_settings_from_config();
     models::ScanContext {
         db_path: app_state.paths.db_file.clone(),
         thumbnails_dir: app_state.paths.thumbnails_dir.clone(),
@@ -1669,8 +1693,92 @@ fn build_scan_context(app_state: &AppState, app_handle: &tauri::AppHandle) -> mo
         surya_venv_dir: app_state.paths.surya_venv_dir.clone(),
         surya_script,
         model: model_selection.scan_model,
+        image_max_side: vision.image_max_side,
+        prompt_profile: vision.prompt_profile,
+        ocr_engine: vision.ocr_engine,
         pdfium_lib_path,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Vision settings + pre-scan estimate
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn get_vision_settings() -> Result<config::RuntimeSettings, String> {
+    config::load_runtime_settings().map_err(|e| e.to_string())
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VisionSettingsUpdate {
+    /// `None` or empty restores automatic model selection from the hardware.
+    model: Option<String>,
+    image_max_side: u32,
+    prompt_profile: String,
+    ocr_engine: String,
+}
+
+#[tauri::command]
+fn set_vision_settings(update: VisionSettingsUpdate) -> Result<config::RuntimeSettings, String> {
+    let mut settings = config::load_runtime_settings().unwrap_or_default();
+    settings.model_override = update
+        .model
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty());
+    settings.image_max_side =
+        config::RuntimeSettings::normalize_image_max_side(update.image_max_side);
+    settings.prompt_profile = config::PromptProfile::parse(&update.prompt_profile)
+        .ok_or_else(|| format!("invalid prompt_profile '{}'", update.prompt_profile))?;
+    settings.ocr_engine = config::OcrEngine::parse(&update.ocr_engine)
+        .ok_or_else(|| format!("invalid ocr_engine '{}'", update.ocr_engine))?;
+    config::save_runtime_settings(&settings).map_err(|e| e.to_string())?;
+    Ok(settings)
+}
+
+/// Models installed in Ollama, annotated with what this machine can hold.
+#[tauri::command]
+fn list_vision_models(
+    state: State<'_, AppState>,
+) -> Result<Vec<vision_estimate::VisionModelOption>, String> {
+    let gpu = state.gpu_info();
+    let selection = select_model_for_app(gpu);
+    Ok(vision_estimate::list_models(
+        gpu,
+        &selection.required_model,
+        &selection.scan_model,
+    ))
+}
+
+/// Projection of the classification phase for `root_path` with the current settings.
+///
+/// The first call per (root, model, settings, GPU) calibrates by running real
+/// requests on a few images; later calls are instant (cached).
+#[tauri::command]
+async fn estimate_vision_scan(
+    root_path: String,
+    state: State<'_, AppState>,
+) -> Result<vision_estimate::VisionEstimate, String> {
+    let root = config::expand_and_canonicalize(&root_path).map_err(|e| e.to_string())?;
+    let selection = select_model_for_app(state.gpu_info());
+    let vision = vision_settings_from_config();
+    let tmp_dir = state.paths.tmp_dir.clone();
+    let db_path = state.paths.db_file.clone();
+    let signature = gpu_signature(state.gpu_info());
+
+    tauri::async_runtime::spawn_blocking(move || {
+        vision_estimate::estimate(
+            &root,
+            &selection.scan_model,
+            vision,
+            &tmp_dir,
+            &signature,
+            Some(&db_path),
+        )
+    })
+    .await
+    .map_err(|e| AppError::Join(e.to_string()).to_string())?
+    .map_err(|e| e.to_string())
 }
 
 fn spawn_scan_worker_if_needed(
@@ -1871,6 +1979,10 @@ pub fn run() {
             get_scan_job,
             list_active_scans,
             get_runtime_status,
+            get_vision_settings,
+            set_vision_settings,
+            list_vision_models,
+            estimate_vision_scan,
             cancel_scan,
             remove_root,
             list_roots,

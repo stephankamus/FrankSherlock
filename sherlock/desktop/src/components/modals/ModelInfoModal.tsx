@@ -8,6 +8,8 @@ type Props = {
   runtime: RuntimeStatus;
   setup: SetupStatus | null;
   onClose: () => void;
+  /** Opens the vision configuration modal (model, resolution, projection). */
+  onConfigureVision?: () => void;
 };
 
 function vendorLabel(vendor: string): string {
@@ -19,7 +21,7 @@ function vendorLabel(vendor: string): string {
   }
 }
 
-export default function ModelInfoModal({ runtime, setup, onClose }: Props) {
+export default function ModelInfoModal({ runtime, setup, onClose, onConfigureVision }: Props) {
   return (
     <ModalOverlay onBackdropClick={onClose}>
       <div className="modal-base model-info-modal" onClick={(e) => e.stopPropagation()}>
@@ -95,6 +97,9 @@ export default function ModelInfoModal({ runtime, setup, onClose }: Props) {
         </div>
 
         <div className="modal-actions">
+          {onConfigureVision && (
+            <button type="button" onClick={onConfigureVision}>Classification settings</button>
+          )}
           <button type="button" onClick={onClose}>Close</button>
         </div>
       </div>

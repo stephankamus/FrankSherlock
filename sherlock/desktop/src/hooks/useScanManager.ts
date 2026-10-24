@@ -45,6 +45,12 @@ const PAGE_SIZE = 80;
 const MAX_ITEMS = 400;
 
 type ScanManagerCallbacks = {
+  /**
+   * Runs before a *classification* scan starts (never for metadata-only
+   * refreshes). Resolve `false` to abort. Used for the vision settings modal,
+   * which is also where the time projection is shown.
+   */
+  beforeScan?: (rootPath: string) => Promise<boolean>;
   setSetup: (s: SetupStatus) => void;
   setRuntime: (r: RuntimeStatus) => void;
   setDbStats: (d: DbStats) => void;
@@ -178,6 +184,7 @@ export function useScanManager(cb: ScanManagerCallbacks) {
     try {
       const selected = await open({ directory: true, multiple: false, title: "Select folder to scan" });
       if (!selected) return;
+      if (cb.beforeScan && !(await cb.beforeScan(selected as string))) return;
       setCompletedJobs([]);
       const job = await startScan(selected as string);
       setTrackedJobIds((prev) => [...prev, job.id]);
@@ -197,6 +204,7 @@ export function useScanManager(cb: ScanManagerCallbacks) {
       return;
     }
     try {
+      if (cb.beforeScan && !(await cb.beforeScan(root.rootPath))) return;
       setCompletedJobs([]);
       const job = await startScan(root.rootPath);
       setTrackedJobIds((prev) => [...prev, job.id]);
@@ -239,6 +247,7 @@ export function useScanManager(cb: ScanManagerCallbacks) {
   async function onResumeScan(scan: ScanJobStatus, readOnly: boolean) {
     if (readOnly) return;
     try {
+      if (cb.beforeScan && !(await cb.beforeScan(scan.rootPath))) return;
       const job = await startScan(scan.rootPath);
       setTrackedJobIds((prev) => [...prev, job.id]);
       setCompletedJobs([]);
@@ -255,6 +264,7 @@ export function useScanManager(cb: ScanManagerCallbacks) {
     const newIds: number[] = [];
     for (const scan of activeScans.filter((s) => s.status === "interrupted")) {
       try {
+        if (cb.beforeScan && !(await cb.beforeScan(scan.rootPath))) continue;
         const job = await startScan(scan.rootPath);
         newIds.push(job.id);
         lastProcessedRef.current = 0;

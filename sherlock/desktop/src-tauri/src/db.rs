@@ -1125,6 +1125,68 @@ fn refresh_fts(conn: &Connection, file_id: i64) -> AppResult<()> {
 // Root management
 // ---------------------------------------------------------------------------
 
+/// Rows needed by the pre-scan vision estimate.
+///
+/// Returns `(filename, abs_path, size_bytes)` for files that still need
+/// classification under `root_path`. Reading the index avoids walking the whole
+/// root: on an SMB share with 50k+ files the walk alone takes minutes, and the
+/// estimator runs every time the settings dialog opens.
+///
+/// Returns `Ok(None)` when the path is not indexed, so the caller can fall back
+/// to a filesystem walk.
+pub fn vision_estimate_rows(
+    db_path: &Path,
+    root_path: &str,
+) -> AppResult<Option<Vec<(String, String, i64)>>> {
+    let conn = open_conn(db_path)?;
+
+    let exact: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM roots WHERE root_path = ?1",
+            [root_path],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let root_id = match exact {
+        Some(id) => Some(id),
+        None => {
+            // Fall back to the longest root that contains the requested path
+            // (child roots can be addressed through their parent's prefix).
+            let mut best: Option<(usize, i64)> = None;
+            let mut stmt = conn.prepare("SELECT id, root_path FROM roots")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for (id, path) in rows.flatten() {
+                let trimmed = path.trim_end_matches('/');
+                let matches = root_path == trimmed || root_path.starts_with(&format!("{trimmed}/"));
+                if matches && best.map(|(len, _)| trimmed.len() > len).unwrap_or(true) {
+                    best = Some((trimmed.len(), id));
+                }
+            }
+            best.map(|(_, id)| id)
+        }
+    };
+
+    let Some(root_id) = root_id else {
+        return Ok(None);
+    };
+
+    let mut stmt = conn.prepare(
+        "SELECT filename, abs_path, size_bytes FROM files
+         WHERE root_id = ?1 AND deleted_at IS NULL AND confidence = 0",
+    )?;
+    let rows = stmt.query_map([root_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    Ok(Some(rows.flatten().collect()))
+}
+
 pub fn list_root_paths(db_path: &Path) -> AppResult<Vec<(i64, String)>> {
     let conn = open_conn(db_path)?;
     let mut stmt = conn.prepare("SELECT id, root_path FROM roots")?;

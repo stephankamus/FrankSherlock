@@ -17,6 +17,35 @@ describe("StatusBar", () => {
     expect(screen.getByText(/2048\/8192 MiB/)).toBeInTheDocument();
   });
 
+  it("falls back to the configured model while nothing is loaded", () => {
+    render(
+      <StatusBar
+        runtime={{ os: "linux", vramUsedMib: 11414, vramTotalMib: 12288, ollamaAvailable: true, loadedModels: [], currentModel: null, gpuVendor: "nvidia", unifiedMemory: false, systemRamMib: 32768 }}
+        isScanning={false}
+        runningScansCount={0}
+        selectedCount={0}
+        faceProgress={null}
+        configuredModel="qwen2.5vl:3b"
+      />
+    );
+    expect(screen.getByText(/Model: qwen2\.5vl:3b \(idle\)/)).toBeInTheDocument();
+  });
+
+  it("prefers the model reported by Ollama over the configured one", () => {
+    render(
+      <StatusBar
+        runtime={{ os: "linux", vramUsedMib: 11414, vramTotalMib: 12288, ollamaAvailable: true, loadedModels: ["qwen2.5vl:3b"], currentModel: "qwen2.5vl:3b", gpuVendor: "nvidia", unifiedMemory: false, systemRamMib: 32768 }}
+        isScanning={false}
+        runningScansCount={0}
+        selectedCount={0}
+        faceProgress={null}
+        configuredModel="qwen2.5vl:7b"
+      />
+    );
+    expect(screen.getByText(/Model: qwen2\.5vl:3b/)).toBeInTheDocument();
+    expect(screen.queryByText(/\(idle\)/)).toBeNull();
+  });
+
   it("shows n/a when VRAM is not available", () => {
     render(
       <StatusBar

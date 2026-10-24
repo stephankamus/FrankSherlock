@@ -53,11 +53,32 @@ Frank Sherlock creates this commented runtime settings file on first startup:
 - macOS: `~/Library/Application Support/frank_sherlock/settings.toml`
 - Windows: `%APPDATA%\frank_sherlock\settings.toml`
 
-By default the app chooses a vision model from detected hardware. To force a smaller or alternate model, edit the file and restart the app:
+By default the app chooses a vision model from detected hardware. To force a smaller or alternate model, edit the file (changes apply on the next scan):
 
 ```toml
 model_override = "qwen2.5vl:3b"
 ```
+
+The same file also controls how images are sent to the model:
+
+```toml
+# Longest side in pixels; 0 sends the original file untouched.
+# Lower is much faster because Ollama's image preprocessing (not the model)
+# dominates the cost of large photos. 1024 keeps small subjects and text legible.
+image_max_side = 1024
+
+# "concise" (default) or "detailed" (adds anime series/character candidates).
+prompt_profile = "concise"
+
+# OCR for screenshots/documents: "off", "llm" (default, fast) or "surya"
+# (better recall, but spawns a Python process per image).
+ocr_engine = "llm"
+```
+
+All of these are also editable from the app: open the model & hardware status bar, click
+"Classification settings". The same dialog shows the model list with what fits in the
+current GPU, and — right before a scan starts — a time projection for that folder measured
+on your own machine (a few real images are classified to calibrate it; the result is cached).
 
 When `model_override` is set, setup requires that exact Ollama model. If it is missing, the first-run setup dialog offers to download it with Ollama before scans can start. The first classification request loads the model on demand, and the app unloads Ollama models after scans finish.
 

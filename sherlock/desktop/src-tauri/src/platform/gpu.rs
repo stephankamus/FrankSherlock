@@ -74,9 +74,31 @@ pub fn detect_gpu_memory() -> GpuInfo {
     }
 }
 
-/// Spawn nvidia-smi with a timeout to prevent hangs on broken drivers.
+/// Live VRAM usage, for status displays.
+///
+/// `detect_gpu_memory()` is cached at startup (it drives model selection), so a
+/// model loaded minutes later would never show up in the status bar. This runs
+/// a cheap `nvidia-smi` query on demand instead.
+pub fn current_vram_used_mib(vendor: GpuVendor) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = vendor;
+        None
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        // rocm-smi is too heavy for a poll; only NVIDIA is queried live.
+        if vendor != GpuVendor::Nvidia {
+            return None;
+        }
+        let text = nvidia_smi_memory_output()?;
+        parse_nvidia_smi_output(&text).0
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
-fn detect_nvidia_gpu(system_ram_mib: u64) -> Option<GpuInfo> {
+fn nvidia_smi_memory_output() -> Option<String> {
     let mut child = silent_command("nvidia-smi")
         .args([
             "--query-gpu=memory.used,memory.total",
@@ -87,7 +109,6 @@ fn detect_nvidia_gpu(system_ram_mib: u64) -> Option<GpuInfo> {
         .spawn()
         .ok()?;
 
-    // Wait up to 5 seconds for nvidia-smi to complete
     let timeout = std::time::Duration::from_secs(5);
     let start = std::time::Instant::now();
     loop {
@@ -103,8 +124,13 @@ fn detect_nvidia_gpu(system_ram_mib: u64) -> Option<GpuInfo> {
         }
     }
 
-    let stdout = child.stdout.take()?;
-    let text = std::io::read_to_string(stdout).ok()?;
+    std::io::read_to_string(child.stdout.take()?).ok()
+}
+
+/// Spawn nvidia-smi with a timeout to prevent hangs on broken drivers.
+#[cfg(not(target_os = "macos"))]
+fn detect_nvidia_gpu(system_ram_mib: u64) -> Option<GpuInfo> {
+    let text = nvidia_smi_memory_output()?;
     let (used, total) = parse_nvidia_smi_output(&text);
     if used.is_none() && total.is_none() {
         return None;

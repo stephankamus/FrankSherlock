@@ -338,3 +338,42 @@ export type ReclusterProgress = {
   processed: number;
   result: ClusterResult | null;
 };
+
+/* ── Vision configuration ───────────────────────────────────────── */
+
+export type VisionPromptProfile = "concise" | "detailed";
+export type VisionOcrEngine = "off" | "llm" | "surya";
+
+/** Mirrors `config::RuntimeSettings` in the Rust backend. */
+export type VisionSettings = {
+  modelOverride: string | null;
+  /** Longest side sent to the model. 0 keeps the original bytes. */
+  imageMaxSide: number;
+  promptProfile: VisionPromptProfile;
+  ocrEngine: VisionOcrEngine;
+};
+
+export type VisionModelOption = {
+  name: string;
+  sizeBytes: number;
+  recommended: boolean;
+  active: boolean;
+  /** null when the model is not loaded and only a rough comparison is possible. */
+  fitsVram: boolean | null;
+  loadedBytes: number | null;
+  loadedVramBytes: number | null;
+  note: string;
+};
+
+export type VisionEstimate = {
+  counts: { images: number; videos: number; pdfs: number };
+  perImageS: number;
+  totalS: number;
+  /** "calibrated" measured here, "cached" reused, "rough" fallback. */
+  source: "calibrated" | "cached" | "rough";
+  samples: number;
+  breakdown: { gapS: number; prefillS: number; decodeS: number };
+  /** Model bytes that spilled to system RAM while measuring (0 = fully on GPU). */
+  spillBytes: number;
+  modelMissing: boolean;
+};
