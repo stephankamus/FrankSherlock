@@ -105,7 +105,15 @@ cd sherlock/desktop
 npm run tauri:build
 ```
 
-Output lands in `sherlock/desktop/src-tauri/target/release/bundle/`.
+On Ubuntu, build only the formats you can produce locally and disable updater signing:
+
+```bash
+PATH="$HOME/.cargo/bin:$PATH" npm run tauri:build -- \
+  --bundles deb,appimage \
+  --config '{"bundle":{"createUpdaterArtifacts":false}}'
+```
+
+Output lands in `sherlock/desktop/src-tauri/target/release/bundle/`. For installation, package contents, verification and troubleshooting, see [`build-and-install-linux.md`](build-and-install-linux.md).
 
 ## 7. Testing against a scratch database
 

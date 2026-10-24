@@ -77,7 +77,7 @@ See [docs/network-shares-linux.md](docs/network-shares-linux.md) for systemd aut
 
 ## Building from source
 
-For a full Ubuntu walkthrough (Rust, system libraries, Node, Ollama), see [docs/dev-setup-linux.md](docs/dev-setup-linux.md).
+For a full Ubuntu walkthrough (Rust, system libraries, Node, Ollama), see [docs/dev-setup-linux.md](docs/dev-setup-linux.md). To produce an installable `.deb` or AppImage, see [docs/build-and-install-linux.md](docs/build-and-install-linux.md).
 
 ```bash
 # 1. Download native libraries for your platform
