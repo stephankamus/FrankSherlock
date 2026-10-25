@@ -50,14 +50,13 @@ const PRIMARY_PROMPT_CONCISE: &str = concat!(
     "3) Favor precision over guesswork.",
 );
 
-const PRIMARY_PROMPT_FALLBACK: &str = concat!(
-    "Return ONLY valid compact JSON with schema: ",
-    r#"{"media_type":"screenshot|anime|manga|photo|document|artwork|other","#,
-    r#""contains_text":true,"#,
-    r#""description":"max 12 words","#,
-    r#""confidence":0.0}"#,
-    " No markdown. No extra keys.",
-);
+// The old `PRIMARY_PROMPT_FALLBACK` lived here: a second wording of the same schema
+// used as the retry. It turned out to be the *cause* of the failure it was meant to
+// recover from — on low-contrast photos (construction sites, concrete) that wording
+// drives qwen2.5-VL into a repetition loop and Ollama 0.40 aborts the request with
+// `prediction aborted, token repeat limit reached` (500). The same images answer fine
+// with the normal prompt and no grammar, so the retry now keeps the prompt and only
+// changes the sampling mode.
 
 fn primary_prompt(profile: PromptProfile) -> &'static str {
     match profile {
@@ -282,6 +281,20 @@ pub fn should_run_document_enrichment(primary: &Value, ocr_engine: OcrEngine) ->
 }
 
 /// Char-boundary-safe truncation for prompt payloads.
+/// A result that carries nothing usable: the vision request failed.
+///
+/// [`classify_image_prepared`] cannot return an error (its callers work per file and
+/// have nowhere to put one), so a failed request yields an empty description with
+/// zero confidence. Writing that over a row that already had a good description is
+/// data loss — measured once: 107 of 191 rows lost their description when Ollama
+/// started answering 500.
+pub fn is_empty_result(result: &ClassificationResult) -> bool {
+    result.description.trim().is_empty()
+        && result.extracted_text.trim().is_empty()
+        && result.canonical_mentions.trim().is_empty()
+        && result.confidence <= 0.0
+}
+
 fn truncate_chars(text: &str, max_chars: usize) -> &str {
     match text.char_indices().nth(max_chars) {
         Some((idx, _)) => &text[..idx],
@@ -426,30 +439,153 @@ fn classify_primary(model: &str, prepared: &PreparedImage, profile: PromptProfil
                 return v;
             }
         }
+        // A 200 with an unusable body is a different failure from a 500, and it was
+        // completely silent: the row ended up as `other` with no description and
+        // nothing in the log explained why (107 of 191 files in one run).
+        log::warn!(
+            "primary (json) returned unparseable output for {}: {}",
+            prepared.path.display(),
+            truncate_chars(&resp1.raw, 200)
+        );
+    } else {
+        log::warn!(
+            "primary (json) failed for {}: {}",
+            prepared.path.display(),
+            truncate_chars(&resp1.raw, 300)
+        );
     }
 
-    // Attempt 2: compliance fallback without json mode, then regex salvage.
+    // Attempt 2: the **same** prompt, just without the JSON grammar.
+    //
+    // Keeping the prompt matters. The old retry also swapped the wording, and that
+    // wording is what makes qwen2.5-VL loop on flat images — Ollama answers 500
+    // `prediction aborted, token repeat limit reached` (measured on 107 photos of a
+    // construction site: 107 of 107 failed). With this prompt and no grammar the
+    // same 107 answer correctly, so the retry only changes the sampling mode.
     let params2 = GenerateParams {
         json_mode: false,
         ..GenerateParams::vision(num_predict.min(260), Some(num_ctx))
     };
-    let resp2 = ollama_generate(
-        model,
-        PRIMARY_PROMPT_FALLBACK,
-        Some(&prepared.path),
-        &params2,
-    );
+    let resp2 = ollama_generate(model, prompt, Some(&prepared.path), &params2);
     if resp2.ok {
         if let Some(v) = parse_json_response(&resp2.raw) {
             if v.get("media_type").and_then(|v| v.as_str()).is_some() {
                 return v;
             }
         }
+        log::warn!(
+            "primary (fallback) returned unparseable output for {}: {}",
+            prepared.path.display(),
+            truncate_chars(&resp2.raw, 200)
+        );
+    } else {
+        log::warn!(
+            "primary (fallback) failed for {}: {}",
+            prepared.path.display(),
+            truncate_chars(&resp2.raw, 300)
+        );
     }
 
-    let combined = format!("{}\n{}", resp1.raw, resp2.raw);
+    // Attempt 3: same prompt, no grammar, and a little entropy.
+    //
+    // The repetition loop that kills attempts 1 and 2 is not deterministic — the same
+    // image answered fine minutes later — so one more sample with temperature is the
+    // cheap way out. `num_predict` grows a little because a free-form answer is longer
+    // than the JSON.
+    let params3 = GenerateParams {
+        json_mode: false,
+        temperature: 0.3,
+        ..GenerateParams::vision(num_predict.max(260), Some(num_ctx))
+    };
+    let resp3 = ollama_generate(model, prompt, Some(&prepared.path), &params3);
+    if resp3.ok {
+        if let Some(v) = parse_json_response(&resp3.raw) {
+            if v.get("media_type").and_then(|v| v.as_str()).is_some() {
+                log::info!(
+                    "primary recovered on the third attempt for {}",
+                    prepared.path.display()
+                );
+                return v;
+            }
+        }
+        log::warn!(
+            "primary (third attempt) returned unparseable output for {}: {}",
+            prepared.path.display(),
+            truncate_chars(&resp3.raw, 200)
+        );
+    } else {
+        log::warn!(
+            "primary (third attempt) failed for {}: {}",
+            prepared.path.display(),
+            truncate_chars(&resp3.raw, 300)
+        );
+    }
+
+    // Attempt 4: the **original** file. Every attempt so far sent a re-encoded 768 px
+    // JPEG; if all three loop on that, give the bytes the camera wrote a chance. Only
+    // when the prepared image is a temp copy (a passthrough already *is* the original).
+    let mut resp4_raw = String::new();
+    if prepared.source != prepared.path {
+        let params4 = GenerateParams {
+            json_mode: false,
+            temperature: 0.3,
+            ..GenerateParams::vision(num_predict.max(260), Some(num_ctx))
+        };
+        let resp4 = ollama_generate(model, prompt, Some(&prepared.source), &params4);
+        if resp4.ok {
+            if let Some(v) = parse_json_response(&resp4.raw) {
+                if v.get("media_type").and_then(|v| v.as_str()).is_some() {
+                    log::info!(
+                        "primary recovered from the original file for {}",
+                        prepared.source.display()
+                    );
+                    return v;
+                }
+            }
+            log::warn!(
+                "primary (original file) returned unparseable output for {}: {}",
+                prepared.source.display(),
+                truncate_chars(&resp4.raw, 200)
+            );
+        } else {
+            log::warn!(
+                "primary (original file) failed for {}: {}",
+                prepared.source.display(),
+                truncate_chars(&resp4.raw, 300)
+            );
+        }
+        resp4_raw = resp4.raw;
+    }
+
+    let combined = format!("{}\n{}\n{}\n{}", resp1.raw, resp2.raw, resp3.raw, resp4_raw);
     if let Some(v) = salvage_primary_from_raw(&combined) {
         return v;
+    }
+    // Nothing worked: keep the exact image we sent (it is deleted by `Drop`, and
+    // without it there is no way to reproduce the failure outside the app).
+    let keep = prepared.path.with_file_name(format!(
+        "keep_{}",
+        prepared
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "image.jpg".to_string())
+    ));
+    match std::fs::copy(&prepared.path, &keep) {
+        Ok(bytes) => log::error!(
+            "primary gave up on {} ({}x{}, {} B, kept at {})",
+            prepared.source.display(),
+            prepared.width,
+            prepared.height,
+            bytes,
+            keep.display()
+        ),
+        Err(err) => log::error!(
+            "primary gave up on {} ({}x{}, and the prepared image could not be kept: {err})",
+            prepared.source.display(),
+            prepared.width,
+            prepared.height
+        ),
     }
 
     // Safe default
@@ -791,19 +927,16 @@ pub fn classify_image(
     surya_script: &Path,
     vision: VisionSettings,
 ) -> ClassificationResult {
-    log::info!("Classifying: {}", image_path.display());
-
     // GIFs are classified from their first frame; everything else goes through
     // `vision_prep`, which downscales and applies EXIF orientation once so every
     // stage below reuses the same bytes instead of re-encoding per attempt.
     let frame_source = first_frame_if_gif(image_path, tmp_dir);
-    let prepared =
-        match vision_prep::prepare_with(
-            &frame_source,
-            vision.image_max_side,
-            tmp_dir,
-            vision.image_filter,
-        ) {
+    let prepared = match vision_prep::prepare_with(
+        &frame_source,
+        vision.image_max_side,
+        tmp_dir,
+        vision.image_filter,
+    ) {
         Ok(p) => p,
         Err(e) => {
             log::warn!(
@@ -821,7 +954,33 @@ pub fn classify_image(
         }
     };
 
-    let primary = classify_primary(model, &prepared, vision.prompt_profile);
+    classify_image_prepared(
+        image_path,
+        &prepared,
+        model,
+        surya_venv,
+        surya_script,
+        vision,
+    )
+}
+
+/// Classify an image whose model-ready JPEG already exists.
+///
+/// The pipeline producer pays for the decode and the downscale once, so the
+/// consumer must not repeat either (`plans/pipeline-cpu-gpu-overlap.md`,
+/// Phase 2). Everything below operates on `prepared` only — the original file is
+/// never touched again except for OCR engines that need full resolution.
+pub fn classify_image_prepared(
+    image_path: &Path,
+    prepared: &PreparedImage,
+    model: &str,
+    surya_venv: &Path,
+    surya_script: &Path,
+    vision: VisionSettings,
+) -> ClassificationResult {
+    log::info!("Classifying: {}", image_path.display());
+
+    let primary = classify_primary(model, prepared, vision.prompt_profile);
 
     let media_type = primary
         .get("media_type")
@@ -844,7 +1003,7 @@ pub fn classify_image(
 
     // Anime enrichment
     if should_run_anime_enrichment(&primary) {
-        if let Some(anime) = classify_anime_details(model, &prepared) {
+        if let Some(anime) = classify_anime_details(model, prepared) {
             if let Some(series) = anime.get("series").and_then(clean_nullable_str) {
                 full_description = format!("{full_description} [Series: {series}]");
             }
@@ -885,13 +1044,7 @@ pub fn classify_image(
 
     // Document enrichment
     if should_run_document_enrichment(&primary, vision.ocr_engine) {
-        let ocr = run_ocr(
-            model,
-            &prepared,
-            vision.ocr_engine,
-            surya_venv,
-            surya_script,
-        );
+        let ocr = run_ocr(model, prepared, vision.ocr_engine, surya_venv, surya_script);
         if ocr.ok && !ocr.text.is_empty() {
             extracted_text = ocr.text.clone();
 
@@ -1420,6 +1573,30 @@ mod tests {
         let raw = r#"{"media_type":"photo","confidence":0.3"#;
         let v = salvage_primary_from_raw(raw).unwrap();
         assert_eq!(v["media_type"], "photo");
+    }
+
+    /// A failed request must never reach the database: it would blank a description
+    /// that is already there (measured: 107 of 191 rows lost theirs in one run).
+    #[test]
+    fn empty_results_are_detected_so_they_never_overwrite_a_row() {
+        let failed = crate::models::ClassificationResult {
+            media_type: "other".to_string(),
+            description: String::new(),
+            extracted_text: String::new(),
+            canonical_mentions: String::new(),
+            confidence: 0.0,
+            lang_hint: String::new(),
+        };
+        assert!(is_empty_result(&failed));
+
+        let described = crate::models::ClassificationResult {
+            description: "a cat on a sofa".to_string(),
+            ..failed
+        };
+        assert!(
+            !is_empty_result(&described),
+            "a description with confidence 0 is still a result"
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   Album,
+  BacklogProgress,
   ClusterResult,
   CompactResult,
   DbStats,
@@ -15,6 +16,7 @@ import type {
   PersonInfo,
   ProtectedPdfInfo,
   PurgeResult,
+  ReclassifyResult,
   ReclusterProgress,
   RenameFileResult,
   RetryProtectedPdfsResult,
@@ -65,6 +67,22 @@ export async function startScan(
 /** Indexed state of a root, for the startup prompt. `null` when not indexed. */
 export async function pendingScanSummary(rootPath: string): Promise<PendingScanInfo | null> {
   return invoke<PendingScanInfo | null>("pending_scan_summary", { rootPath });
+}
+
+/**
+ * Blank the classification of every file of a root.
+ *
+ * `dropThumbnails` also forgets the cached thumbnails (pointer and file), which is
+ * what reproduces the state of a folder that was never scanned — the starting
+ * point where the backlog's producer has real CPU work to overlap with the GPU.
+ * Removing and re-adding the folder does **not** reset anything when it lives
+ * inside another indexed root: the rows are handed to the parent and adopted back.
+ */
+export async function resetRootClassifications(
+  rootId: number,
+  dropThumbnails = false,
+): Promise<ReclassifyResult> {
+  return invoke<ReclassifyResult>("reset_root_classifications", { rootId, dropThumbnails });
 }
 
 export async function setStartupScan(value: StartupScanSetting): Promise<VisionSettings> {
@@ -169,6 +187,11 @@ export async function getThumbRepairStatus(): Promise<ThumbRepairProgress | null
 
 export async function cancelThumbRepair(): Promise<boolean> {
   return invoke<boolean>("cancel_thumb_repair");
+}
+
+/** Live counters of the backlog pass (`startScan(root, "backlog")`). */
+export async function getBacklogStatus(): Promise<BacklogProgress | null> {
+  return invoke<BacklogProgress | null>("backlog_status");
 }
 
 export async function listSubdirectories(rootId: number, parentPrefix: string): Promise<SubdirEntry[]> {

@@ -66,7 +66,7 @@ export type ScanJobStatus = {
   updatedAt: number;
   startedAt: number;
   completedAt?: number | null;
-  phase: "discovering" | "thumbnailing" | "classifying" | "processing" | "cleanup";
+  phase: "discovering" | "thumbnailing" | "classifying" | "processing" | "cleanup" | "backlog";
   discoveredFiles: number;
 };
 
@@ -140,6 +140,13 @@ export type AppPaths = {
   baseDir: string;
   dbFile: string;
   cacheDir: string;
+};
+
+export type ReclassifyResult = {
+  /** Rows whose classification was blanked. */
+  files: number;
+  /** Thumbnail files deleted from the cache (0 unless asked for). */
+  thumbnails: number;
 };
 
 export type PurgeResult = {
@@ -312,6 +319,32 @@ export type ThumbRepairProgress = {
   error: string | null;
 };
 
+// ── Backlog pipeline ────────────────────────────────────────────────
+
+/**
+ * Live counters of the `backlog` scan mode. The two numbers the user cares
+ * about are independent: a row can need a thumbnail, a classification, or both.
+ */
+export type BacklogProgress = {
+  jobId: number;
+  rootId: number;
+  /** Rows the pass has to work on; 0 while the index is still being read. */
+  total: number;
+  /** Rows consumed (thumbnail fixed and/or classification stored). */
+  processed: number;
+  thumbnailed: number;
+  /** Rows that actually need a thumbnail — not the same as `total`. */
+  thumbsTotal: number;
+  classified: number;
+  /** Rows that actually need a classification. */
+  classifyTotal: number;
+  deduped: number;
+  failed: number;
+  startedAt: number;
+  phase: "counting" | "running" | "done" | "cancelled" | "failed";
+  error: string | null;
+};
+
 // ── Face detection ──────────────────────────────────────────────────
 
 export type FaceDetectProgress = {
@@ -359,7 +392,7 @@ export type VisionPromptProfile = "concise" | "detailed";
 export type VisionOcrEngine = "off" | "llm" | "surya";
 
 /** What a scan job is allowed to do. */
-export type ScanMode = "full" | "refresh" | "classify_only";
+export type ScanMode = "full" | "refresh" | "classify_only" | "backlog";
 
 /** Startup behaviour for an already-indexed folder. */
 export type StartupScanSetting = "ask" | "classify_only" | "full" | "none";

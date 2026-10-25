@@ -38,16 +38,20 @@ pub fn compute_dhash(img: &image::DynamicImage) -> u64 {
 /// `imageops::thumbnail` is a box filter specialized for large downscales: on a
 /// 12-40 MP photo it is several times faster than `resize(.., Lanczos3)` and the
 /// difference is invisible at 300 px. Images that already fit are returned as-is.
-fn downscale(img: image::DynamicImage, max_dim: u32) -> image::DynamicImage {
+///
+/// Takes the image by reference because the pipeline decodes once and feeds both
+/// the thumbnail and the vision preparation from the same buffer; cloning a
+/// 12-40 MP image just to shrink it would give the saving straight back.
+fn downscale(img: &image::DynamicImage, max_dim: u32) -> image::DynamicImage {
     let (w, h) = (img.width(), img.height());
     if w <= max_dim && h <= max_dim {
-        return img;
+        return img.clone();
     }
     let max_dim = max_dim.max(1);
     let max_side = w.max(h).max(1);
     let new_w = ((w as f64 * max_dim as f64 / max_side as f64).round() as u32).max(1);
     let new_h = ((h as f64 * max_dim as f64 / max_side as f64).round() as u32).max(1);
-    image::DynamicImage::ImageRgba8(image::imageops::thumbnail(&img, new_w, new_h))
+    image::DynamicImage::ImageRgba8(image::imageops::thumbnail(img, new_w, new_h))
 }
 
 /// Downscale to an exact target size (PDF pages are already small).
@@ -126,6 +130,108 @@ pub fn reuse_thumbnail(
     })
 }
 
+/// A decoded image plus the perceptual hash computed from it.
+///
+/// Decoding is the expensive half of both the thumbnail and the vision
+/// preparation, and a scan used to pay for it twice per file. This is the shared
+/// artefact that removes the second decode
+/// (`plans/pipeline-cpu-gpu-overlap.md`, Phase 1).
+pub struct DecodedSource {
+    /// The image with EXIF orientation already applied.
+    pub image: image::DynamicImage,
+    pub dhash: u64,
+    /// Orientation read from the file (`1` = upright). Kept because
+    /// `vision_prep::prepare_from_decoded` needs it to decide whether the
+    /// original bytes can be uploaded untouched — Ollama ignores EXIF, so a
+    /// rotated JPEG must be re-encoded even when it already fits.
+    #[allow(dead_code)] // consumed by the pipeline producer (Phase 2)
+    pub orientation: u16,
+}
+
+/// Decode `source`, apply EXIF orientation and compute the dHash — once.
+pub fn decode_source(source_path: &Path) -> Option<DecodedSource> {
+    let effective_path = first_frame_if_gif(source_path);
+
+    let decode_started = Instant::now();
+    let img = match image::open(&effective_path) {
+        Ok(img) => img,
+        Err(e) => {
+            log::warn!(
+                "Failed to open image for thumbnail {}: {e}",
+                source_path.display()
+            );
+            return None;
+        }
+    };
+
+    // Apply EXIF orientation so thumbnails and vision input match the display
+    let orientation = crate::exif::extract_orientation(source_path);
+    let img = crate::exif::apply_orientation(img, orientation);
+    let decode_ms = decode_started.elapsed().as_millis();
+
+    let dhash_started = Instant::now();
+    let dhash = compute_dhash(&img);
+    log::debug!(
+        "decode_source {}: {}x{} decode={decode_ms}ms dhash={}ms",
+        source_path.display(),
+        img.width(),
+        img.height(),
+        dhash_started.elapsed().as_millis()
+    );
+
+    Some(DecodedSource {
+        image: img,
+        dhash,
+        orientation,
+    })
+}
+
+/// Encode the 300 px preview from an already decoded image.
+///
+/// Always writes. Reusing a cached file is the caller's decision, because only
+/// the caller knows whether the source changed.
+pub fn thumbnail_from_decoded(
+    decoded: &DecodedSource,
+    thumb_dir: &Path,
+    rel_path: &str,
+) -> Option<ThumbnailResult> {
+    let thumb_path = thumb_path_in(thumb_dir, rel_path);
+
+    if let Some(parent) = thumb_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            log::warn!("Failed to create thumbnail dir {}: {e}", parent.display());
+            return None;
+        }
+    }
+
+    let encode_started = Instant::now();
+    // Images that already fit are kept as-is (just re-encoded as JPEG).
+    let resized = downscale(&decoded.image, 300);
+
+    let rgb = resized.to_rgb8();
+    let mut buf = std::io::Cursor::new(Vec::new());
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 80);
+    if let Err(e) = rgb.write_with_encoder(encoder) {
+        log::warn!("Failed to encode thumbnail: {e}");
+        return None;
+    }
+
+    if let Err(e) = std::fs::write(&thumb_path, buf.into_inner()) {
+        log::warn!("Failed to write thumbnail {}: {e}", thumb_path.display());
+        return None;
+    }
+    log::debug!(
+        "thumbnail {}: resize+encode={}ms",
+        thumb_path.display(),
+        encode_started.elapsed().as_millis()
+    );
+
+    Some(ThumbnailResult {
+        path: thumb_path.display().to_string(),
+        dhash: Some(decoded.dhash),
+    })
+}
+
 /// Generate a thumbnail for the given source image.
 ///
 /// Returns a `ThumbnailResult` with the path and optional dHash, or `None`
@@ -152,66 +258,8 @@ pub fn generate_thumbnail(
         });
     }
 
-    // Ensure parent directory exists
-    if let Some(parent) = thumb_path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            log::warn!("Failed to create thumbnail dir {}: {e}", parent.display());
-            return None;
-        }
-    }
-
-    let effective_path = first_frame_if_gif(source_path);
-
-    let decode_started = Instant::now();
-    let img = match image::open(&effective_path) {
-        Ok(img) => img,
-        Err(e) => {
-            log::warn!(
-                "Failed to open image for thumbnail {}: {e}",
-                source_path.display()
-            );
-            return None;
-        }
-    };
-
-    // Apply EXIF orientation so thumbnails match the preview display
-    let orientation = crate::exif::extract_orientation(source_path);
-    let img = crate::exif::apply_orientation(img, orientation);
-    let decode_ms = decode_started.elapsed().as_millis();
-
-    let dhash_started = Instant::now();
-    let dhash = compute_dhash(&img);
-    let dhash_ms = dhash_started.elapsed().as_millis();
-
-    // Images that already fit are kept as-is (just re-encoded as JPEG).
-    let resized = downscale(img, 300);
-
-    let rgb = resized.to_rgb8();
-    let mut buf = std::io::Cursor::new(Vec::new());
-    let encode_started = Instant::now();
-    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 80);
-    if let Err(e) = rgb.write_with_encoder(encoder) {
-        log::warn!("Failed to encode thumbnail: {e}");
-        return None;
-    }
-    // Phase 0 of `plans/pipeline-cpu-gpu-overlap.md`: `vision_prep::prepare`
-    // decodes this same file again a moment later in a scan. These numbers are
-    // the thumbnail half of the duplicate cost.
-    log::debug!(
-        "thumbnail {}: decode={decode_ms}ms dhash={dhash_ms}ms encode={}ms",
-        source_path.display(),
-        encode_started.elapsed().as_millis()
-    );
-
-    if let Err(e) = std::fs::write(&thumb_path, buf.into_inner()) {
-        log::warn!("Failed to write thumbnail {}: {e}", thumb_path.display());
-        return None;
-    }
-
-    Some(ThumbnailResult {
-        path: thumb_path.display().to_string(),
-        dhash: Some(dhash),
-    })
+    let decoded = decode_source(source_path)?;
+    thumbnail_from_decoded(&decoded, thumb_dir, rel_path)
 }
 
 /// Generate a thumbnail for a PDF: up to 2 content pages side-by-side, 300px max dimension.
@@ -302,7 +350,7 @@ pub fn generate_pdf_thumbnail(
     };
 
     // Scale composite so longest side is 300px
-    let final_img = downscale(composite, 300);
+    let final_img = downscale(&composite, 300);
 
     let dhash = compute_dhash(&final_img);
 
@@ -385,7 +433,7 @@ pub fn generate_video_thumbnail(
 
     let dhash = compute_dhash(&img);
 
-    let resized = downscale(img, 300);
+    let resized = downscale(&img, 300);
 
     let rgb = resized.to_rgb8();
     let mut buf = std::io::Cursor::new(Vec::new());
@@ -436,6 +484,28 @@ mod tests {
         let dynamic = image::DynamicImage::ImageRgb8(img);
         dynamic.save(&path).expect("save test image");
         path
+    }
+
+    /// Splitting the decode must not change the output: same dHash, same JPEG.
+    #[test]
+    fn thumbnail_from_decoded_matches_generate_thumbnail() {
+        let src_dir = tempfile::tempdir().expect("srcdir");
+        let first = tempfile::tempdir().expect("cache-a");
+        let second = tempfile::tempdir().expect("cache-b");
+        let source = create_test_image(src_dir.path(), "photo.png", 900, 600);
+
+        let generated = generate_thumbnail(&source, first.path(), "photo.png", true)
+            .expect("generate_thumbnail");
+        let decoded = decode_source(&source).expect("decode_source");
+        let shared = thumbnail_from_decoded(&decoded, second.path(), "photo.png")
+            .expect("thumbnail_from_decoded");
+
+        assert_eq!(shared.dhash, generated.dhash);
+        assert_eq!(
+            std::fs::read(&shared.path).expect("shared bytes"),
+            std::fs::read(&generated.path).expect("generated bytes"),
+            "same pixels must encode to the same JPEG"
+        );
     }
 
     /// Manual benchmark over real files: `BENCH_PHOTOS=<paths, one per line>`.
@@ -519,10 +589,9 @@ mod tests {
             .open(&source)
             .expect("open source");
         handle
-            .set_times(
-                std::fs::FileTimes::new()
-                    .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(86_400 * 365 * 11)),
-            )
+            .set_times(std::fs::FileTimes::new().set_modified(
+                std::time::SystemTime::now() + std::time::Duration::from_secs(86_400 * 365 * 11),
+            ))
             .expect("set mtime");
         drop(handle);
 
@@ -539,7 +608,10 @@ mod tests {
 
         let r3 = generate_thumbnail(&source, thumb_dir.path(), "future.png", true);
         assert!(r3.is_some());
-        assert!(r3.as_ref().unwrap().dhash.is_some(), "force must regenerate");
+        assert!(
+            r3.as_ref().unwrap().dhash.is_some(),
+            "force must regenerate"
+        );
     }
 
     #[test]
@@ -578,9 +650,13 @@ mod tests {
             .expect("first thumbnail");
         let dhash = first.dhash;
 
-        let reused =
-            reuse_thumbnail(Path::new(&first.path), dhash, thumb_dir.path(), "b/copy.png")
-                .expect("reused thumbnail");
+        let reused = reuse_thumbnail(
+            Path::new(&first.path),
+            dhash,
+            thumb_dir.path(),
+            "b/copy.png",
+        )
+        .expect("reused thumbnail");
         assert_eq!(reused.dhash, dhash);
         assert!(Path::new(&reused.path).exists());
         let shared_ino = std::fs::metadata(&first.path).expect("meta shared").ino();

@@ -217,7 +217,9 @@ pub struct UnclassifiedFile {
 #[serde(rename_all = "camelCase")]
 pub struct PendingScanInfo {
     pub root_id: i64,
-    /// Indexed files under this root that still have `confidence = 0`.
+    /// Indexed files under this root with no description yet (not classified).
+    ///
+    /// Deliberately not `confidence = 0`: that is a value the model returns.
     pub unclassified: u64,
     /// Unix seconds of the last completed scan, if any.
     pub last_scan_at: Option<i64>,
@@ -441,6 +443,16 @@ pub struct RootInfo {
     pub last_error: Option<String>,
 }
 
+/// What a "Reclassify" pass actually cleared.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReclassifyResult {
+    /// Rows whose vision result was blanked.
+    pub files: u64,
+    /// Thumbnail files deleted from the cache (0 unless asked for).
+    pub thumbnails: u64,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompactResult {
@@ -570,6 +582,43 @@ pub struct ThumbRepairProgress {
     pub started_at: i64,
     /// `"scanning"` while collecting dead pointers, `"repairing"` while
     /// regenerating, then `"done"`, `"cancelled"` or `"failed"`.
+    pub phase: String,
+    pub error: Option<String>,
+}
+
+/// Live progress of the backlog pipeline (`ScanMode::Backlog`).
+///
+/// Kept in memory and polled by the sidebar, like `ThumbRepairProgress`: the scan
+/// job row only carries `processed_files`, and writing two extra counters to
+/// SQLite on every file would add a write per classification.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BacklogProgress {
+    pub job_id: i64,
+    pub root_id: i64,
+    /// Rows the pass has to work on. `0` while the index is still being read.
+    pub total: u64,
+    /// Rows consumed (thumbnail fixed and/or classification stored).
+    pub processed: u64,
+    /// Thumbnails written by the producer.
+    pub thumbnailed: u64,
+    /// Rows that actually need a thumbnail. Not the same as `total`: a row can be
+    /// in the backlog only because it was never classified, and using `total` as
+    /// the denominator made the thumbnail percentage look stuck near zero after a
+    /// `Repair Thumbnails` run. Grows if the producer finds a dead pointer.
+    pub thumbs_total: u64,
+    /// Rows classified by the consumer, including those that inherited a
+    /// classification from a near-duplicate.
+    pub classified: u64,
+    /// Rows that need a classification. Also narrower than `total`.
+    pub classify_total: u64,
+    /// Of those, how many were inherited instead of paying a vision request.
+    pub deduped: u64,
+    pub failed: u64,
+    /// Unix seconds when the pass started, for rate and ETA.
+    pub started_at: i64,
+    /// `counting` while listing the backlog, `running`, then `done`,
+    /// `cancelled` or `failed`.
     pub phase: String,
     pub error: Option<String>,
 }

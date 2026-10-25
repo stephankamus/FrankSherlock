@@ -63,6 +63,8 @@ struct AppState {
     recluster_progress: Arc<Mutex<Option<models::ReclusterProgress>>>,
     thumb_repair_progress: Arc<Mutex<Option<models::ThumbRepairProgress>>>,
     thumb_repair_cancel: Arc<AtomicBool>,
+    /// Live counters of the backlog pipeline, polled by the sidebar.
+    backlog_progress: Arc<Mutex<Option<models::BacklogProgress>>>,
 }
 
 impl AppState {
@@ -342,6 +344,40 @@ fn start_scan(
         .map_err(|e| e.to_string())?;
     // If this root is a child of an existing parent root, adopt files from parent
     let _ = db::adopt_child_files(&state.paths.db_file, job.root_id, &job.root_path);
+
+    // Any other action ends the backlog story: leaving a finished record behind kept
+    // the sidebar panel (and its Stop button) on screen until the app restarted.
+    if mode != scan::ScanMode::Backlog {
+        let mut progress = state
+            .backlog_progress
+            .lock()
+            .expect("backlog mutex poisoned");
+        *progress = None;
+    }
+
+    // The backlog needs its own live record: the job row only carries one
+    // counter, and the sidebar shows thumbnails and classifications side by side.
+    if mode == scan::ScanMode::Backlog {
+        let mut progress = state
+            .backlog_progress
+            .lock()
+            .expect("backlog mutex poisoned");
+        *progress = Some(models::BacklogProgress {
+            job_id: job.id,
+            root_id: job.root_id,
+            total: 0,
+            processed: 0,
+            thumbnailed: 0,
+            thumbs_total: 0,
+            classified: 0,
+            classify_total: 0,
+            deduped: 0,
+            failed: 0,
+            started_at: unix_now_secs(),
+            phase: "counting".to_string(),
+            error: None,
+        });
+    }
     let app_state = state.inner().clone();
     spawn_scan_worker_if_needed(app_state, &app_handle, job.id, mode);
     db::get_scan_job(&state.paths.db_file, job.id)
@@ -426,6 +462,27 @@ fn remove_root(root_id: i64, state: State<'_, AppState>) -> Result<PurgeResult, 
         });
     }
     db::purge_root(&state.paths.db_file, root_id).map_err(|e| e.to_string())
+}
+
+/// Blank the classification of every file of a root so the next pass redoes it.
+///
+/// The rows stay put: thumbnails, dHash, faces and album links are untouched, so
+/// nothing is re-read from the share and no thumbnail is rebuilt. Reclassifying
+/// through "remove + add" does not work for a folder inside another indexed root
+/// (the rows are handed to the parent and adopted back), hence this command.
+#[tauri::command]
+fn reset_root_classifications(
+    root_id: i64,
+    drop_thumbnails: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<models::ReclassifyResult, String> {
+    require_writable(state.inner())?;
+    db::reset_root_classifications(
+        &state.paths.db_file,
+        root_id,
+        drop_thumbnails.unwrap_or(false),
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -514,14 +571,19 @@ async fn repair_thumbnails(
         });
     }
 
-    app_state.thumb_repair_cancel.store(false, Ordering::Relaxed);
+    app_state
+        .thumb_repair_cancel
+        .store(false, Ordering::Relaxed);
     let ctx = build_scan_context(&app_state, &app_handle);
     let progress_arc = app_state.thumb_repair_progress.clone();
     let cancel = app_state.thumb_repair_cancel.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
-        let outcome =
-            scan::repair_missing_thumbnails(&ctx, root_id, &cancel, |processed, total, done, failed| {
+        let outcome = scan::repair_missing_thumbnails(
+            &ctx,
+            root_id,
+            &cancel,
+            |processed, total, done, failed| {
                 let mut guard = progress_arc.lock().expect("thumb repair mutex poisoned");
                 if let Some(p) = guard.as_mut() {
                     p.phase = "repairing".to_string();
@@ -530,7 +592,8 @@ async fn repair_thumbnails(
                     p.repaired = done;
                     p.failed = failed;
                 }
-            });
+            },
+        );
 
         let mut guard = progress_arc.lock().expect("thumb repair mutex poisoned");
         match outcome {
@@ -582,6 +645,19 @@ fn thumb_repair_status(
 fn cancel_thumb_repair(state: State<'_, AppState>) -> Result<bool, String> {
     state.thumb_repair_cancel.store(true, Ordering::Relaxed);
     Ok(true)
+}
+
+/// Live counters of the backlog pass (`ScanMode::Backlog`), polled by the sidebar.
+///
+/// Cancelling uses the normal `cancel_scan(job_id)`; the record carries the job
+/// id so the UI does not need to correlate it with the scan list.
+#[tauri::command]
+fn backlog_status(state: State<'_, AppState>) -> Result<Option<models::BacklogProgress>, String> {
+    Ok(state
+        .backlog_progress
+        .lock()
+        .expect("backlog mutex poisoned")
+        .clone())
 }
 
 /// Reclaim disk space with `VACUUM` after deletions or a root purge.
@@ -986,8 +1062,7 @@ async fn retry_protected_pdfs(
                 );
 
                 // Generate thumbnail (root-scoped cache directory)
-                let thumb_dir =
-                    thumbnails_dir.join(thumbnail::root_key(&pdf.root_path));
+                let thumb_dir = thumbnails_dir.join(thumbnail::root_key(&pdf.root_path));
                 let thumb_result = thumbnail::generate_pdf_thumbnail(
                     abs,
                     &thumb_dir,
@@ -1980,10 +2055,35 @@ fn spawn_scan_worker_if_needed(
     let jobs = app_state.running_scan_jobs.clone();
     let cancel_flags = app_state.cancel_flags.clone();
     let app_state_for_task = app_state.clone();
+
+    // Backlog counters are reported live, once per file: the sidebar needs the
+    // thumbnail and classification numbers separately, and writing them to
+    // SQLite per file would add a write per vision request. Other modes ignore
+    // the callback entirely.
+    let progress_arc = app_state.backlog_progress.clone();
+    let on_tick = move |tick: scan::BacklogTick| {
+        let mut guard = progress_arc.lock().expect("backlog mutex poisoned");
+        if let Some(progress) = guard.as_mut() {
+            if progress.job_id != job_id {
+                return;
+            }
+            progress.total = tick.total;
+            progress.processed = tick.processed;
+            progress.thumbnailed = tick.thumbnailed;
+            progress.thumbs_total = tick.thumbs_total;
+            progress.classified = tick.classified;
+            progress.classify_total = tick.classify_total;
+            progress.deduped = tick.deduped;
+            progress.failed = tick.failed;
+            progress.phase = "running".to_string();
+        }
+    };
+
     tauri::async_runtime::spawn(async move {
         let flag = cancel_flag;
+        let cancel_watch = flag.clone();
         let result = tauri::async_runtime::spawn_blocking(move || {
-            scan::run_scan_job(&scan_ctx, job_id, Some(&flag), mode)
+            scan::run_scan_job_with_progress(&scan_ctx, job_id, Some(&flag), mode, &on_tick)
         })
         .await
         .map_err(|e| AppError::Join(e.to_string()))
@@ -1995,6 +2095,25 @@ fn spawn_scan_worker_if_needed(
                 job_id,
                 &format!("scan failed: {err}"),
             );
+        }
+
+        if mode == scan::ScanMode::Backlog {
+            let mut guard = app_state_for_task
+                .backlog_progress
+                .lock()
+                .expect("backlog mutex poisoned");
+            if let Some(progress) = guard.as_mut() {
+                if progress.job_id == job_id {
+                    progress.phase = if cancel_watch.load(Ordering::Relaxed) {
+                        "cancelled".to_string()
+                    } else if let Err(err) = &result {
+                        progress.error = Some(err.to_string());
+                        "failed".to_string()
+                    } else {
+                        "done".to_string()
+                    };
+                }
+            }
         }
 
         // Remove from tracking before checking if all jobs finished
@@ -2133,12 +2252,20 @@ pub fn run() {
         recluster_progress: Arc::new(Mutex::new(None)),
         thumb_repair_progress: Arc::new(Mutex::new(None)),
         thumb_repair_cancel: Arc::new(AtomicBool::new(false)),
+        backlog_progress: Arc::new(Mutex::new(None)),
     };
 
     tauri::Builder::default()
         .plugin(
             tauri_plugin_log::Builder::default()
                 .level(log::LevelFilter::Info)
+                // The plugin's defaults are 40 KB and `KeepOne`: past 40 KB the file
+                // is **deleted**, so a scan that logs one line per file erases its
+                // own evidence while it runs (we kept reading tails of 20 lines out
+                // of 191 and lost the warnings that explain the crashes). Keep a few
+                // rotated files instead, which is what the diagnosis needs.
+                .max_file_size(16_u128 * 1024 * 1024)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(3))
                 .build(),
         )
         .plugin(tauri_plugin_dialog::init())
@@ -2174,6 +2301,7 @@ pub fn run() {
             estimate_vision_scan,
             cancel_scan,
             remove_root,
+            reset_root_classifications,
             list_roots,
             probe_roots,
             relink_root,
@@ -2181,6 +2309,7 @@ pub fn run() {
             repair_thumbnails,
             thumb_repair_status,
             cancel_thumb_repair,
+            backlog_status,
             list_subdirectories,
             load_user_config,
             save_user_config,

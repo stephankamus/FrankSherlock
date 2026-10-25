@@ -20,6 +20,22 @@
   font-size: var(--font-size-sm);
 }
 
+/* Checkbox row inside a confirm dialog */
+.modal-checkbox {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0 0 10px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+}
+
+.modal-checkbox input {
+  margin-top: 2px;
+  accent-color: var(--accent-primary);
+}
+
 /* Action button row */
 .modal-actions {
   display: flex;

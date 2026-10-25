@@ -13,6 +13,7 @@ use crate::config::canonical_root_path;
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::platform::fs::probe_dir;
+use crate::vision_prep;
 use std::path::PathBuf;
 
 use crate::models::{
@@ -21,6 +22,14 @@ use crate::models::{
 use crate::platform::paths::normalize_rel_path;
 use crate::thumbnail;
 use crate::video;
+
+/// How many failures in a row mean "this is not the files, it is Ollama".
+///
+/// Shared by the sequential classification phase and the backlog pipeline. Measured
+/// once: the server was unreachable and 107 files × 3 attempts were spent in 25 s
+/// while the job still reported "completed" — the user only found out by counting the
+/// rows without a description afterwards.
+const MAX_CONSECUTIVE_FAILURES: u32 = 25;
 
 const SUPPORTED_EXTS: [&str; 20] = [
     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif", ".pdf", ".mp4", ".mkv",
@@ -80,6 +89,10 @@ pub enum ScanMode {
     /// critically — no cleanup: without a discovery pass, every row would look
     /// "missing" and be soft-deleted.
     ClassifyOnly,
+    /// Fill the backlog in one pipeline pass: every row still missing a thumbnail
+    /// or a classification. No discovery, no cleanup; the backlog is re-derived
+    /// from the index on every run, so an interrupted pass resumes by itself.
+    Backlog,
 }
 
 impl ScanMode {
@@ -88,6 +101,7 @@ impl ScanMode {
             "" | "full" => Some(ScanMode::Full),
             "refresh" => Some(ScanMode::Refresh),
             "classify_only" | "classify-only" | "classify" => Some(ScanMode::ClassifyOnly),
+            "backlog" | "process_backlog" | "process-backlog" => Some(ScanMode::Backlog),
             _ => None,
         }
     }
@@ -97,6 +111,7 @@ impl ScanMode {
             ScanMode::Full => "full",
             ScanMode::Refresh => "refresh",
             ScanMode::ClassifyOnly => "classify_only",
+            ScanMode::Backlog => "backlog",
         }
     }
 
@@ -120,21 +135,40 @@ pub fn start_or_resume_scan_job(db_path: &Path, root_path: &str) -> AppResult<Sc
     db::create_or_resume_scan_job(db_path, &canonical_root.display().to_string())
 }
 
-pub fn run_scan_job(
+/// Run a scan job, reporting the backlog counters as it goes.
+///
+/// Only `ScanMode::Backlog` uses the callback (once when the backlog size is
+/// known, then once per file); the other modes ignore it. It exists so the
+/// sidebar can show thumbnails and classifications separately without writing to
+/// SQLite per file.
+pub fn run_scan_job_with_progress(
     ctx: &ScanContext,
     job_id: i64,
     cancel_flag: Option<&AtomicBool>,
     mode: ScanMode,
+    on_backlog_tick: &(dyn Fn(BacklogTick) + Sync),
 ) -> AppResult<ScanSummary> {
-    run_scan_job_internal(ctx, job_id, None, cancel_flag, mode)
+    run_scan_job_impl(ctx, job_id, None, cancel_flag, mode, on_backlog_tick)
 }
 
+#[cfg(test)]
 fn run_scan_job_internal(
     ctx: &ScanContext,
     job_id: i64,
     max_files_for_test: Option<usize>,
     cancel_flag: Option<&AtomicBool>,
     mode: ScanMode,
+) -> AppResult<ScanSummary> {
+    run_scan_job_impl(ctx, job_id, max_files_for_test, cancel_flag, mode, &|_| {})
+}
+
+fn run_scan_job_impl(
+    ctx: &ScanContext,
+    job_id: i64,
+    max_files_for_test: Option<usize>,
+    cancel_flag: Option<&AtomicBool>,
+    mode: ScanMode,
+    on_backlog_tick: &(dyn Fn(BacklogTick) + Sync),
 ) -> AppResult<ScanSummary> {
     let started = Instant::now();
     let db_path = &ctx.db_path;
@@ -166,6 +200,9 @@ fn run_scan_job_internal(
     // opening the app.
     if mode == ScanMode::ClassifyOnly {
         return run_classify_only(ctx, &job, job_id, cancel_flag, started);
+    }
+    if mode == ScanMode::Backlog {
+        return run_backlog_pipeline(ctx, &job, job_id, cancel_flag, started, on_backlog_tick);
     }
 
     log::info!(
@@ -437,6 +474,14 @@ fn run_scan_job_internal(
                         thumb_result.dhash.map(|h| h as i64),
                     )?;
                 }
+                // Same reason as in the loop below: a healed row is not in the
+                // unchanged flush, so it has to carry the marker itself.
+                db::touch_file_scan_markers_batch(
+                    db_path,
+                    job.root_id,
+                    &[probe.rel_path.as_str()],
+                    job.scan_marker,
+                )?;
                 healed += 1;
             }
         }
@@ -543,6 +588,18 @@ fn run_scan_job_internal(
                             thumb_result.dhash.map(|h| h as i64),
                         )?;
                     }
+                    // Stamp the marker here: these rows are **excluded** from the
+                    // unchanged flush above (they are in `heal`), and
+                    // `update_file_thumb_and_dhash` does not touch `scan_marker`. Without
+                    // this, phase 4 sees the old marker and soft-deletes every healed row
+                    // *and* purges its thumbnail — a `full` after a reclassify that
+                    // dropped thumbnails wiped the whole folder.
+                    db::touch_file_scan_markers_batch(
+                        db_path,
+                        job.root_id,
+                        &[probe.rel_path.as_str()],
+                        job.scan_marker,
+                    )?;
                     healed += 1;
                 }
                 FileStatus::Modified => {
@@ -766,6 +823,8 @@ fn run_scan_job_internal(
     if !unclassified.is_empty() {
         let classify_total = unclassified.len() as u64;
         let mut classify_processed: u64 = 0;
+        let mut classify_failed: u64 = 0;
+        let mut consecutive_failures: u32 = 0;
 
         // For resume: if we were already in classifying phase, skip already-classified files.
         // list_unclassified_files only returns confidence=0, so already-classified are excluded.
@@ -808,6 +867,7 @@ fn run_scan_job_internal(
         }
 
         for file in &unclassified {
+            let failed_before = classify_failed;
             if let Some(flag) = cancel_flag {
                 if flag.load(Ordering::Relaxed) {
                     db::cancel_scan_job(db_path, job_id)?;
@@ -839,14 +899,39 @@ fn run_scan_job_internal(
                 Some(representative) => {
                     if db::copy_classification(db_path, file.id, representative).is_ok() {
                         deduped += 1;
-                    } else {
-                        classify_and_update(ctx, file.id, &file.abs_path);
+                    } else if !classify_and_update(ctx, file.id, &file.abs_path) {
+                        classify_failed += 1;
                     }
                 }
                 None => {
-                    classify_and_update(ctx, file.id, &file.abs_path);
-                    dedupe.remember(file);
+                    // Only a successful classification may seed the dedupe index:
+                    // otherwise a failed row becomes the representative another
+                    // photo copies its (empty) classification from.
+                    if classify_and_update(ctx, file.id, &file.abs_path) {
+                        dedupe.remember(file);
+                    } else {
+                        classify_failed += 1;
+                    }
                 }
+            }
+
+            // Fail fast when nothing is getting through: Ollama stopped, or its runner
+            // is wedged for good. Measured once: 107 files × 3 attempts in 25 s with the
+            // server unreachable, and the job still reported "completed" — the user only
+            // found out by counting rows afterwards.
+            if classify_failed > failed_before {
+                consecutive_failures += 1;
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                    let message = format!(
+                        "classification aborted after {MAX_CONSECUTIVE_FAILURES} consecutive \
+                         failures: Ollama is unreachable or its runner keeps failing"
+                    );
+                    log::error!("Scan job {job_id}: {message}");
+                    db::fail_scan_job(db_path, job_id, &message)?;
+                    return Err(AppError::Config(message));
+                }
+            } else {
+                consecutive_failures = 0;
             }
 
             classify_processed += 1;
@@ -865,11 +950,19 @@ fn run_scan_job_internal(
             )?;
         }
 
+        if classify_failed > 0 {
+            log::warn!(
+                "Scan job {}: {classify_failed} of {classify_total} file(s) could not be classified; \
+                 their rows were left as they were",
+                job_id
+            );
+        }
         log::info!(
-            "Scan job {}: classification complete ({} files, {} deduped)",
+            "Scan job {}: classification complete ({} files, {} deduped, {} failed)",
             job_id,
             classify_total,
-            deduped
+            deduped,
+            classify_failed
         );
     }
 
@@ -960,6 +1053,7 @@ fn run_classify_only(
 
     let mut processed: u64 = 0;
     let mut deduped: u64 = 0;
+    let mut classify_failed: u64 = 0;
     let mut last_cursor: Option<String> = None;
 
     let mut dedupe = DedupeIndex::seed(db_path, job.root_id, ctx.dedupe_dhash_distance)?;
@@ -988,13 +1082,16 @@ fn run_classify_only(
             Some(representative) => {
                 if db::copy_classification(db_path, file.id, representative).is_ok() {
                     deduped += 1;
-                } else {
-                    classify_and_update(ctx, file.id, &file.abs_path);
+                } else if !classify_and_update(ctx, file.id, &file.abs_path) {
+                    classify_failed += 1;
                 }
             }
             None => {
-                classify_and_update(ctx, file.id, &file.abs_path);
-                dedupe.remember(file);
+                if classify_and_update(ctx, file.id, &file.abs_path) {
+                    dedupe.remember(file);
+                } else {
+                    classify_failed += 1;
+                }
             }
         }
         processed += 1;
@@ -1013,6 +1110,14 @@ fn run_classify_only(
         )?;
     }
 
+    if classify_failed > 0 {
+        log::warn!(
+            "Scan job {}: {classify_failed} of {total} file(s) could not be classified; \
+             their rows were left as they were",
+            job_id
+        );
+    }
+
     let summary = ScanSummary {
         root_id: job.root_id,
         root_path: root_path.display().to_string(),
@@ -1028,6 +1133,457 @@ fn run_classify_only(
     };
     db::touch_root_scan(db_path, job.root_id)?;
     db::complete_scan_job_by_id(db_path, job_id, &summary, last_cursor.as_deref())?;
+    Ok(summary)
+}
+
+// ---------------------------------------------------------------------------
+// Backlog pipeline (Phase 2 of plans/pipeline-cpu-gpu-overlap.md)
+// ---------------------------------------------------------------------------
+
+/// Progress snapshot handed to the UI by the backlog pipeline.
+///
+/// Separate from `BacklogCounters` (which the producer writes) because this is a
+/// copy the caller can move into its own state without holding a lock.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BacklogTick {
+    pub total: u64,
+    pub processed: u64,
+    pub thumbnailed: u64,
+    /// Rows that need a thumbnail (see `BacklogProgress::thumbs_total`).
+    pub thumbs_total: u64,
+    pub classified: u64,
+    /// Rows that need a classification.
+    pub classify_total: u64,
+    pub deduped: u64,
+    pub failed: u64,
+}
+
+/// One file handed from the producer to the consumer.
+struct BacklogItem {
+    row: db::BacklogRow,
+    /// Ready-to-upload JPEG. `None` for video/PDF (legacy path) and for rows that
+    /// only needed a thumbnail.
+    prepared: Option<vision_prep::PreparedImage>,
+    /// Perceptual hash of the decoded image, for the near-duplicate index.
+    dhash: Option<u64>,
+    /// Video/PDF keep the legacy classification path: their frames or pages come
+    /// from ffmpeg/pdfium, which this iteration does not share.
+    legacy: bool,
+    /// The producer could not decode or prepare this file.
+    failed: bool,
+}
+
+/// Counters written by the producer and read by the summary.
+#[derive(Default)]
+struct BacklogCounters {
+    thumbnailed: AtomicU64,
+    /// Rows the producer found without a usable thumbnail, including dead
+    /// pointers that only a `stat` can reveal.
+    thumbs_needed: AtomicU64,
+    failed: AtomicU64,
+}
+
+/// Producer half of the pipeline: decode once, thumbnail, prepare for the model.
+///
+/// Runs on its own thread. Because the consumer is a single GPU request at a
+/// time, one producer is enough: it costs ~600 ms per file against the ~2 s the
+/// consumer takes (measured in `_bench_vision/RESULTS.md` §7).
+fn produce_backlog_items(
+    tx: std::sync::mpsc::SyncSender<BacklogItem>,
+    ctx: &ScanContext,
+    root_id: i64,
+    thumb_dir: &Path,
+    rows: &[db::BacklogRow],
+    cancel: Option<&AtomicBool>,
+    counters: &BacklogCounters,
+) {
+    for row in rows {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            break;
+        }
+
+        let legacy = matches!(row.media_type.as_str(), "video" | "pdf");
+        if legacy {
+            let item = BacklogItem {
+                row: row.clone(),
+                prepared: None,
+                dhash: None,
+                legacy: true,
+                failed: false,
+            };
+            if tx.send(item).is_err() {
+                break;
+            }
+            continue;
+        }
+
+        let abs = Path::new(&row.abs_path);
+        let Some(decoded) = thumbnail::decode_source(abs) else {
+            counters.failed.fetch_add(1, Ordering::Relaxed);
+            let item = BacklogItem {
+                row: row.clone(),
+                prepared: None,
+                dhash: None,
+                legacy: false,
+                failed: true,
+            };
+            if tx.send(item).is_err() {
+                break;
+            }
+            continue;
+        };
+
+        // The index only knows whether a pointer exists. A pointer to a file that
+        // is gone is the common case after the cache bug, so verify before
+        // skipping — one `stat` on a file we just opened.
+        let thumb_missing = match row.thumb_path.as_deref() {
+            Some(path) => !Path::new(path).exists(),
+            None => true,
+        };
+        if thumb_missing {
+            counters.thumbs_needed.fetch_add(1, Ordering::Relaxed);
+            match thumbnail::thumbnail_from_decoded(&decoded, thumb_dir, &row.rel_path) {
+                Some(tr) => {
+                    let stored = db::update_file_thumb_and_dhash(
+                        &ctx.db_path,
+                        root_id,
+                        &row.rel_path,
+                        &tr.path,
+                        tr.dhash.map(|h| h as i64),
+                    );
+                    match stored {
+                        Ok(_) => {
+                            counters.thumbnailed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "Backlog: could not record thumbnail for {}: {e}",
+                                row.rel_path
+                            );
+                            counters.failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                None => {
+                    log::warn!("Backlog: thumbnail generation failed for {}", row.rel_path);
+                    counters.failed.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let dhash = decoded.dhash;
+        let prepared = if row.needs_classification {
+            match vision_prep::prepare_from_decoded(
+                abs,
+                row.size_bytes.max(0) as u64,
+                decoded.orientation,
+                &decoded.image,
+                ctx.image_max_side,
+                &ctx.tmp_dir,
+                ctx.image_filter,
+            ) {
+                Ok(prepared) => Some(prepared),
+                Err(e) => {
+                    log::warn!(
+                        "Backlog: cannot prepare {} for the model: {e}",
+                        row.rel_path
+                    );
+                    counters.failed.fetch_add(1, Ordering::Relaxed);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let failed = row.needs_classification && prepared.is_none();
+        // Release the decoded buffer before blocking on the queue: one image in
+        // flight per producer, not one per queued item.
+        drop(decoded);
+
+        let item = BacklogItem {
+            row: row.clone(),
+            prepared,
+            dhash: Some(dhash),
+            legacy: false,
+            failed,
+        };
+        if tx.send(item).is_err() {
+            break;
+        }
+    }
+}
+
+/// Classify `file_id` from an already prepared image and persist the result.
+fn classify_prepared_and_update(
+    ctx: &ScanContext,
+    file_id: i64,
+    abs_path: &str,
+    prepared: &vision_prep::PreparedImage,
+) -> bool {
+    let classification = classify::classify_image_prepared(
+        Path::new(abs_path),
+        prepared,
+        &ctx.model,
+        &ctx.surya_venv_dir,
+        &ctx.surya_script,
+        ctx.vision_settings(),
+    );
+    if classify::is_empty_result(&classification) {
+        log::warn!("Classifying {abs_path} produced nothing usable; row left untouched");
+        return false;
+    }
+    match db::update_file_classification(
+        &ctx.db_path,
+        file_id,
+        &classification.media_type,
+        &classification.description,
+        &classification.extracted_text,
+        &classification.canonical_mentions,
+        classification.confidence,
+        &classification.lang_hint,
+    ) {
+        Ok(_) => true,
+        Err(e) => {
+            log::error!("Failed to update classification for file {file_id}: {e}");
+            false
+        }
+    }
+}
+
+/// One pass over everything that still needs work.
+///
+/// The producer decodes each still image once and hands the consumer a
+/// model-ready JPEG; the consumer (this thread, the only one talking to Ollama)
+/// does the near-duplicate lookup and the vision request. The queue is bounded,
+/// so a slow GPU throttles the producer instead of filling the disk with
+/// prepared JPEGs or the RAM with decoded bitmaps.
+///
+/// Resume is implicit: the backlog is re-derived from the index on every run, so
+/// an interrupted or cancelled pass simply picks up what is still pending. That
+/// is why no cursor is written.
+fn run_backlog_pipeline(
+    ctx: &ScanContext,
+    job: &ScanJobState,
+    job_id: i64,
+    cancel_flag: Option<&AtomicBool>,
+    started: Instant,
+    on_tick: &(dyn Fn(BacklogTick) + Sync),
+) -> AppResult<ScanSummary> {
+    let db_path = &ctx.db_path;
+    let root_path = canonical_root_path(&job.root_path)?;
+    let thumb_dir = ctx.thumb_dir_for(&thumbnail::root_key(&job.root_path));
+    let rows = db::list_backlog_rows(db_path, job.root_id)?;
+    let total = rows.len() as u64;
+
+    log::info!(
+        "Scan job {job_id}: backlog pass for {} ({total} file(s) need work)",
+        root_path.display()
+    );
+    // Two stage-specific denominators: most rows need only one of the two, and
+    // dividing by `total` made the thumbnail share look stuck near zero after a
+    // `Repair Thumbnails` run had already filled the cache.
+    let classify_total = rows.iter().filter(|row| row.needs_classification).count() as u64;
+    let thumbless = rows.iter().filter(|row| row.thumb_path.is_none()).count() as u64;
+    on_tick(BacklogTick {
+        total,
+        thumbs_total: thumbless,
+        classify_total,
+        ..BacklogTick::default()
+    });
+
+    db::checkpoint_scan_job(
+        db_path,
+        job_id,
+        "backlog",
+        total,
+        0,
+        None,
+        job.added,
+        job.modified,
+        job.moved,
+        job.unchanged,
+    )?;
+
+    let cancelled = || cancel_flag.is_some_and(|flag| flag.load(Ordering::Relaxed));
+    let mut dedupe = DedupeIndex::seed(db_path, job.root_id, ctx.dedupe_dhash_distance)?;
+    let counters = BacklogCounters::default();
+    let mut processed: u64 = 0;
+    let mut classified: u64 = 0;
+    let mut deduped: u64 = 0;
+    // A systemic failure — Ollama down, or the model runner dying on every
+    // request — would otherwise grind through thousands of files producing
+    // nothing. One bad file does not look like this; 25 in a row does.
+    let mut consecutive_failures: u32 = 0;
+    let mut aborted_by_breaker = false;
+
+    // Four is enough to keep the consumer busy while bounding the prepared JPEGs
+    // on disk to a handful.
+    const QUEUE_DEPTH: usize = 4;
+    let (tx, rx) = std::sync::mpsc::sync_channel::<BacklogItem>(QUEUE_DEPTH);
+
+    let rows_ref: &[db::BacklogRow] = &rows;
+    let thumb_dir_ref: &Path = &thumb_dir;
+    let counters_ref = &counters;
+    let root_id = job.root_id;
+    let ctx_ref = ctx;
+
+    std::thread::scope(|scope| -> AppResult<()> {
+        let producer = scope.spawn(move || {
+            produce_backlog_items(
+                tx,
+                ctx_ref,
+                root_id,
+                thumb_dir_ref,
+                rows_ref,
+                cancel_flag,
+                counters_ref,
+            );
+        });
+
+        for item in rx.iter() {
+            if cancelled() {
+                break;
+            }
+
+            let item_ok = if item.legacy {
+                classify_and_update(ctx, item.row.id, &item.row.abs_path);
+                classified += 1;
+                true
+            } else if item.failed {
+                // The producer already counted it.
+                false
+            } else if let Some(prepared) = item.prepared.as_ref() {
+                let representative = item
+                    .dhash
+                    .and_then(|dhash| dedupe.representative_for_hash(dhash));
+                match representative {
+                    Some(representative) => {
+                        if db::copy_classification(db_path, item.row.id, representative).is_ok() {
+                            deduped += 1;
+                            true
+                        } else if classify_prepared_and_update(
+                            ctx,
+                            item.row.id,
+                            &item.row.abs_path,
+                            prepared,
+                        ) {
+                            classified += 1;
+                            true
+                        } else {
+                            counters.failed.fetch_add(1, Ordering::Relaxed);
+                            false
+                        }
+                    }
+                    None => {
+                        if classify_prepared_and_update(
+                            ctx,
+                            item.row.id,
+                            &item.row.abs_path,
+                            prepared,
+                        ) {
+                            classified += 1;
+                            if let Some(dhash) = item.dhash {
+                                dedupe.insert(dhash, item.row.id);
+                            }
+                            true
+                        } else {
+                            counters.failed.fetch_add(1, Ordering::Relaxed);
+                            false
+                        }
+                    }
+                }
+            } else {
+                // Thumbnail-only row: nothing left that can fail here.
+                true
+            };
+
+            if item_ok {
+                consecutive_failures = 0;
+            } else {
+                consecutive_failures += 1;
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                    log::error!(
+                        "Backlog: {consecutive_failures} consecutive failures; aborting. \
+                         Ollama is either down or its runner keeps crashing (VRAM)."
+                    );
+                    aborted_by_breaker = true;
+                    break;
+                }
+            }
+
+            processed += 1;
+            let thumbs_needed = counters.thumbs_needed.load(Ordering::Relaxed);
+            on_tick(BacklogTick {
+                total,
+                processed,
+                thumbnailed: counters.thumbnailed.load(Ordering::Relaxed),
+                // A dead pointer discovered by the producer widens the denominator.
+                thumbs_total: thumbless.max(thumbs_needed),
+                classified,
+                classify_total,
+                deduped,
+                failed: counters.failed.load(Ordering::Relaxed),
+            });
+            if processed % 25 == 0 {
+                db::checkpoint_scan_job(
+                    db_path,
+                    job_id,
+                    "backlog",
+                    total,
+                    processed,
+                    None,
+                    job.added,
+                    job.modified,
+                    job.moved,
+                    job.unchanged,
+                )?;
+            }
+        }
+
+        // Closing the receiver unblocks a producer parked on `send`; without it a
+        // cancel would deadlock the join below.
+        drop(rx);
+        if producer.join().is_err() {
+            log::error!("Backlog: producer thread panicked");
+        }
+        Ok(())
+    })?;
+
+    if aborted_by_breaker {
+        let message = format!(
+            "backlog aborted after {MAX_CONSECUTIVE_FAILURES} consecutive failures: \
+             Ollama is down or its model runner keeps crashing (usually VRAM exhaustion)"
+        );
+        db::fail_scan_job(db_path, job_id, &message)?;
+        return Err(AppError::Config(message));
+    }
+
+    let failed = counters.failed.load(Ordering::Relaxed);
+    let summary = ScanSummary {
+        root_id: job.root_id,
+        root_path: root_path.display().to_string(),
+        scanned: processed,
+        added: job.added,
+        modified: job.modified,
+        moved: job.moved,
+        unchanged: job.unchanged,
+        deleted: 0,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        healed: counters.thumbnailed.load(Ordering::Relaxed),
+        deduped,
+    };
+
+    db::touch_root_scan(db_path, job.root_id)?;
+    if cancelled() {
+        db::cancel_scan_job(db_path, job_id)?;
+    } else {
+        db::complete_scan_job_by_id(db_path, job_id, &summary, None)?;
+    }
+    log::info!(
+        "Backlog: {processed} processed, {classified} classified ({deduped} deduped), \
+         {} thumbnailed, {failed} failed",
+        summary.healed
+    );
     Ok(summary)
 }
 
@@ -1081,10 +1637,8 @@ impl ThumbCaches {
                 .entry(hash)
                 .or_insert_with(|| thumb.to_path_buf());
         }
-        self.by_fingerprint.insert(
-            fingerprint.to_string(),
-            (thumb.to_path_buf(), dhash),
-        );
+        self.by_fingerprint
+            .insert(fingerprint.to_string(), (thumb.to_path_buf(), dhash));
     }
 }
 
@@ -1131,6 +1685,22 @@ impl DedupeIndex {
         if let Some(dhash) = Self::eligible(file) {
             self.index.insert(dhash, file.id);
         }
+    }
+
+    /// Representative for a raw dHash.
+    ///
+    /// The backlog pipeline has no `UnclassifiedFile`: it knows the hash and
+    /// whether the row is a still image from the file itself, not from a
+    /// pre-classification `media_type`.
+    fn representative_for_hash(&self, dhash: u64) -> Option<i64> {
+        if self.is_disabled() {
+            return None;
+        }
+        self.index.find_near(dhash, self.threshold)
+    }
+
+    fn insert(&mut self, dhash: u64, file_id: i64) {
+        self.index.insert(dhash, file_id);
     }
 }
 
@@ -1208,13 +1778,9 @@ fn thumbnail_only(
     let dhash = tr.dhash;
     let thumb_path = match dhash {
         Some(hash) => {
-            let linked = caches
-                .by_dhash
-                .get(&hash)
-                .cloned()
-                .and_then(|shared| {
-                    thumbnail::reuse_thumbnail(&shared, Some(hash), thumb_dir, &probe.rel_path)
-                });
+            let linked = caches.by_dhash.get(&hash).cloned().and_then(|shared| {
+                thumbnail::reuse_thumbnail(&shared, Some(hash), thumb_dir, &probe.rel_path)
+            });
             match linked {
                 Some(linked) => Some(linked.path),
                 None => {
@@ -1298,7 +1864,11 @@ fn probe_to_minimal_record(
 }
 
 /// Classify a single file via LLM and update the DB record.
-fn classify_and_update(ctx: &ScanContext, file_id: i64, abs_path: &str) {
+///
+/// Returns `false` when the request failed: the row is then left exactly as it was.
+/// Writing the empty fallback over a good description is data loss, and it makes the
+/// file look "pending" again with no evidence of why.
+fn classify_and_update(ctx: &ScanContext, file_id: i64, abs_path: &str) -> bool {
     let abs = Path::new(abs_path);
     let is_pdf = is_pdf_file(abs);
     let is_vid = is_video(abs);
@@ -1343,7 +1913,11 @@ fn classify_and_update(ctx: &ScanContext, file_id: i64, abs_path: &str) {
         )
     };
 
-    if let Err(e) = db::update_file_classification(
+    if classify::is_empty_result(&classification) {
+        log::warn!("Classifying {abs_path} produced nothing usable; row left untouched");
+        return false;
+    }
+    match db::update_file_classification(
         &ctx.db_path,
         file_id,
         &classification.media_type,
@@ -1353,11 +1927,15 @@ fn classify_and_update(ctx: &ScanContext, file_id: i64, abs_path: &str) {
         classification.confidence,
         &classification.lang_hint,
     ) {
-        log::error!(
-            "Failed to update classification for file {}: {}",
-            file_id,
-            e
-        );
+        Ok(_) => true,
+        Err(e) => {
+            log::error!(
+                "Failed to update classification for file {}: {}",
+                file_id,
+                e
+            );
+            false
+        }
     }
 }
 
@@ -1931,6 +2509,133 @@ mod tests {
         );
     }
 
+    /// The producer half of the backlog pipeline, without Ollama: one decode
+    /// fills the missing thumbnail and queues a model-ready JPEG for the row.
+    #[test]
+    fn backlog_producer_thumbnails_and_queues_a_prepared_image() {
+        let (ctx, root_id, root_path, _dirs) = backlog_fixture();
+        let rows = db::list_backlog_rows(&ctx.db_path, root_id).expect("backlog");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].needs_classification);
+
+        let counters = BacklogCounters::default();
+        let thumb_dir = ctx.thumb_dir_for(&thumbnail::root_key(&root_path));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<BacklogItem>(4);
+
+        produce_backlog_items(tx, &ctx, root_id, &thumb_dir, &rows, None, &counters);
+
+        let item = rx.try_recv().expect("one item for one row");
+        assert!(!item.failed);
+        assert!(
+            item.prepared.is_some(),
+            "an unclassified row must arrive prepared for the model"
+        );
+        assert!(item.dhash.is_some());
+        assert!(rx.try_recv().is_err(), "one row, one item");
+
+        let thumb_path = thumbnail::thumb_path_for(
+            &ctx.thumbnails_dir,
+            &thumbnail::root_key(&root_path),
+            "a.png",
+        );
+        assert!(thumb_path.exists(), "the missing thumbnail must be built");
+        assert_eq!(counters.thumbnailed.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.failed.load(Ordering::Relaxed), 0);
+
+        // The producer only fixes the thumbnail; the row stays pending until the
+        // consumer records a classification.
+        let remaining = db::list_backlog_rows(&ctx.db_path, root_id).expect("backlog");
+        assert_eq!(remaining.len(), 1, "still unclassified");
+        assert!(
+            remaining[0].thumb_path.is_some(),
+            "the thumbnail pointer must be recorded"
+        );
+    }
+
+    /// Cancelling must stop before decoding anything, and must not leave a
+    /// thumbnail behind.
+    #[test]
+    fn backlog_producer_honours_cancellation() {
+        let (ctx, root_id, root_path, _dirs) = backlog_fixture();
+        let rows = db::list_backlog_rows(&ctx.db_path, root_id).expect("backlog");
+
+        let counters = BacklogCounters::default();
+        let thumb_dir = ctx.thumb_dir_for(&thumbnail::root_key(&root_path));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<BacklogItem>(4);
+        let cancel = AtomicBool::new(true);
+
+        produce_backlog_items(
+            tx,
+            &ctx,
+            root_id,
+            &thumb_dir,
+            &rows,
+            Some(&cancel),
+            &counters,
+        );
+
+        assert!(
+            rx.try_recv().is_err(),
+            "cancelled producer must send nothing"
+        );
+        assert_eq!(counters.thumbnailed.load(Ordering::Relaxed), 0);
+        let thumb_path = thumbnail::thumb_path_for(
+            &ctx.thumbnails_dir,
+            &thumbnail::root_key(&root_path),
+            "a.png",
+        );
+        assert!(!thumb_path.exists(), "cancelled producer must not write");
+    }
+
+    /// The pipeline dedupes by raw hash, because it has no `UnclassifiedFile` —
+    /// and a threshold of 0 must keep it out of the way.
+    #[test]
+    fn backlog_dedupe_matches_by_hash() {
+        let mut disabled = DedupeIndex {
+            threshold: 0,
+            index: crate::similarity::DhashIndex::new(),
+        };
+        disabled.insert(0b1010, 1);
+        assert_eq!(disabled.representative_for_hash(0b1010), None);
+
+        let mut index = DedupeIndex {
+            threshold: 6,
+            index: crate::similarity::DhashIndex::new(),
+        };
+        index.insert(0b1010, 7);
+        assert_eq!(index.representative_for_hash(0b1010), Some(7));
+        assert_eq!(index.representative_for_hash(0b1011), Some(7));
+        assert_eq!(index.representative_for_hash(u64::MAX), None);
+    }
+
+    /// A root with one still image that is neither thumbnailed nor classified.
+    ///
+    /// The three `TempDir` guards are returned so the caller keeps them alive for
+    /// the duration of the test.
+    fn backlog_fixture() -> (ScanContext, i64, String, [tempfile::TempDir; 3]) {
+        let root_dir = tempfile::tempdir().expect("root");
+        let db_dir = tempfile::tempdir().expect("dbdir");
+        let cache_dir = tempfile::tempdir().expect("cache");
+        let db_path = db_dir.path().join("index.sqlite");
+        db::init_database(&db_path).expect("init");
+        let root_path = root_dir.path().to_str().expect("path").to_string();
+        let root_id = db::upsert_root(&db_path, &root_path).expect("root");
+        let ctx = scan_context_with_cache(&db_path, cache_dir.path());
+
+        let image = root_dir.path().join("a.png");
+        write_real_image(&image);
+        let probe = probe_for("a.png", &image.display().to_string(), "fp-a");
+        let no_thumb = ThumbnailOnlyResult {
+            thumb_path: None,
+            location_text: String::new(),
+            dhash: None,
+        };
+        let record = probe_to_minimal_record(root_id, 1, &probe, "fp-a", &no_thumb);
+        db::upsert_file_record(&db_path, &record).expect("insert");
+
+        (ctx, root_id, root_path, [root_dir, db_dir, cache_dir])
+    }
+
     /// Only still images are folded; a video sharing the hash would be a guess.
     #[test]
     fn dedupe_index_only_matches_photos() {
@@ -2347,6 +3052,66 @@ mod tests {
         assert!(!filenames.contains(&"spacer.gif"));
         assert!(!filenames.contains(&"favicon.png"));
         assert_eq!(probes.probes.len(), 2);
+    }
+
+    /// A scan of unchanged rows whose thumbnails are gone must **not** delete them.
+    ///
+    /// That state is what "Reclassify" with the thumbnail option produces: rows keep
+    /// their identity, `thumb_path` becomes NULL and the files are removed. Those rows
+    /// are excluded from the unchanged marker flush (they are in `heal`), and the heal
+    /// path used to touch only `thumb_path` — so the end-of-scan cleanup compared an old
+    /// `scan_marker`, soft-deleted *every* row and purged the thumbnails again. The
+    /// sidebar then showed the root with "0 files" and a second rescan was needed.
+    #[test]
+    fn healed_rows_survive_the_end_of_scan_cleanup() {
+        let root_dir = tempfile::tempdir().expect("tempdir");
+        let db_dir = tempfile::tempdir().expect("dbdir");
+        let cache_dir = tempfile::tempdir().expect("cache");
+        let db_path = db_dir.path().join("index.sqlite");
+        db::init_database(&db_path).expect("init");
+
+        // Big and noisy enough to pass the "tiny image" filter that discovery applies.
+        let img = image::RgbImage::from_fn(1024, 768, |x, y| {
+            let seed = x.wrapping_mul(31_337) ^ y.wrapping_mul(97);
+            image::Rgb([
+                (seed % 251) as u8,
+                (seed / 7 % 241) as u8,
+                (seed / 13 % 239) as u8,
+            ])
+        });
+        image::DynamicImage::ImageRgb8(img)
+            .save(root_dir.path().join("a.jpg"))
+            .expect("save image");
+        let root = root_dir.path().to_str().expect("str").to_string();
+
+        let ctx = scan_context_with_cache(&db_path, cache_dir.path());
+        let first = start_or_resume_scan_job(&db_path, &root).expect("job");
+        run_scan_job_internal(&ctx, first.id, None, None, ScanMode::Refresh).expect("first scan");
+        let root_id = first.root_id;
+
+        let before = db::load_existing_files(&db_path, root_id).expect("rows");
+        assert_eq!(before.len(), 1);
+        assert!(before[0].thumb_path.is_some(), "first scan must thumbnail");
+
+        // Reclassify with the thumbnail option: the row stays live, the pointer goes.
+        db::reset_root_classifications(&db_path, root_id, true).expect("reclassify");
+        let mid = db::load_existing_files(&db_path, root_id).expect("rows");
+        assert_eq!(mid.len(), 1, "the row must stay indexed by the reclassify");
+        assert!(
+            mid[0].thumb_path.is_none(),
+            "the reclassify must drop the thumbnail pointer"
+        );
+
+        let second = start_or_resume_scan_job(&db_path, &root).expect("second job");
+        run_scan_job_internal(&ctx, second.id, None, None, ScanMode::Refresh)
+            .expect("second scan must not delete the healed row");
+
+        let after = db::load_existing_files(&db_path, root_id).expect("rows");
+        assert_eq!(after.len(), 1, "the healed row must survive the cleanup");
+        assert!(
+            after[0].thumb_path.is_some(),
+            "the heal must have rebuilt the thumbnail"
+        );
     }
 
     #[test]

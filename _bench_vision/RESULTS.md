@@ -222,6 +222,22 @@ Pendente: `BENCH_QUALITY=1` (exige `BENCH_MODEL`) imprime as respostas dos dois 
 a lado — rodar em uma pasta de screenshots/texto fino antes de confiar no `auto` como padrão
 para documentos.
 
+### 7.2 Fase 1 — um decode, dois artefatos (6 arquivos, sem modelo)
+
+| Caminho | ms/arquivo |
+|---|---|
+| `generate_thumbnail` + `prepare` (2 decodes, hoje) | 1061,9 |
+| `decode_source` + `thumbnail_from_decoded` + `prepare_from_decoded` | **578,0** |
+| diferença | **−483,9 (−46 %)** |
+
+O caminho compartilhado elimina um read, um decode, um `extract_orientation` (que abre o
+arquivo de novo) e um `stat` por arquivo.
+
+Ressalva de medição: esta rodada saiu ~1,5× mais lenta que a das 02:58 na mesma pasta
+(`thumb` 427 vs 280; `prepare box` 635 vs 384; load average 4). A causa é variabilidade do
+NAS/SMB, não do código — por isso só o **delta dentro da mesma rodada** é confiável, e o
+efeito no total fica entre −10 % e −16 % do custo por arquivo de §7.
+
 Primeira rodada (3 arquivos, 0,24 MB cada, JPEG de WhatsApp):
 
 - `image::open` = 30,6 ms ≈ `read + decode` (95 %) — o `BufReader` do `image` **não** é um

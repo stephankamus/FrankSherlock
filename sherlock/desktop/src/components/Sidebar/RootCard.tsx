@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import type { FaceDetectProgress, RootInfo, ScanJobStatus } from "../../types";
+import type { BacklogProgress, FaceDetectProgress, RootInfo, ScanJobStatus } from "../../types";
 import { computeEta } from "../../utils/scanEta";
 
 type RootCardProps = {
@@ -8,6 +8,8 @@ type RootCardProps = {
   scan: ScanJobStatus | undefined;
   readOnly: boolean;
   faceProgress?: FaceDetectProgress;
+  /** Live backlog counters for this root, when the backlog pass is running. */
+  backlogProgress?: BacklogProgress;
   onSelect: () => void;
   onDelete: () => void;
   onRescan: () => void;
@@ -15,12 +17,14 @@ type RootCardProps = {
   onCopyPath: () => void;
   onRelink?: () => void;
   onDetectFaces?: () => void;
+  /** Clear the classification of this folder so it can be sent to the model again. */
+  onReclassify?: () => void;
   onCancelScan?: () => void;
   onResumeScan?: () => void;
   onCancelFaceDetect?: () => void;
 };
 
-export default function RootCard({ root, isSelected, scan, readOnly, faceProgress, onSelect, onDelete, onRescan, onRefresh, onCopyPath, onRelink, onDetectFaces, onCancelScan, onResumeScan, onCancelFaceDetect }: RootCardProps) {
+export default function RootCard({ root, isSelected, scan, readOnly, faceProgress, backlogProgress, onSelect, onDelete, onRescan, onRefresh, onCopyPath, onRelink, onDetectFaces, onReclassify, onCancelScan, onResumeScan, onCancelFaceDetect }: RootCardProps) {
   const [showMenu, setShowMenu] = useState(false);
   const [menuPos, setMenuPos] = useState({ x: 0, y: 0 });
   const menuRef = useRef<HTMLDivElement>(null);
@@ -162,6 +166,30 @@ export default function RootCard({ root, isSelected, scan, readOnly, faceProgres
           )}
         </div>
       )}
+      {backlogProgress && (
+        <div className="root-card-scan">
+          <progress
+            value={
+              backlogProgress.total > 0
+                ? Math.min(100, (backlogProgress.processed / backlogProgress.total) * 100)
+                : 0
+            }
+            max={100}
+          />
+          <span>
+            Backlog {backlogProgress.processed.toLocaleString()}/
+            {backlogProgress.total.toLocaleString()}
+          </span>
+          <div className="root-card-scan-stats">
+            {backlogProgress.thumbnailed.toLocaleString()} thumbnail(s),{" "}
+            {backlogProgress.classified.toLocaleString()} classified
+            {backlogProgress.failed > 0 ? `, ${backlogProgress.failed} failed` : ""}
+          </div>
+          {!readOnly && onCancelScan && (
+            <button type="button" className="root-card-scan-btn" onClick={(e) => { e.stopPropagation(); onCancelScan(); }}>Stop</button>
+          )}
+        </div>
+      )}
       {scan?.status === "interrupted" && (
         <div className="root-card-scan root-card-scan-interrupted">
           <span>Scan interrupted</span>
@@ -206,6 +234,9 @@ export default function RootCard({ root, isSelected, scan, readOnly, faceProgres
           <button role="menuitem" onClick={(e) => { e.stopPropagation(); onRescan(); setShowMenu(false); }}>Rescan</button>
           {onDetectFaces && (
             <button role="menuitem" onClick={(e) => { e.stopPropagation(); onDetectFaces(); setShowMenu(false); }}>Detect Faces</button>
+          )}
+          {onReclassify && (
+            <button role="menuitem" onClick={(e) => { e.stopPropagation(); onReclassify(); setShowMenu(false); }}>Reclassify</button>
           )}
           <button role="menuitem" className="danger" onClick={(e) => { e.stopPropagation(); onDelete(); setShowMenu(false); }}>Remove</button>
         </div>

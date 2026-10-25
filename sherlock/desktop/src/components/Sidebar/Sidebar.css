@@ -79,6 +79,26 @@
   color: var(--text-secondary);
 }
 
+/* Live counters of the backlog pass: thumbnails and classifications are
+   independent, so they are stacked rather than merged into one percentage. */
+.sidebar-backlog {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 2px 8px 4px;
+  padding: 4px 0;
+  border-left: 2px solid var(--accent);
+  background: var(--bg-hover);
+  border-radius: var(--radius-sm);
+}
+
+.sidebar-backlog .sidebar-item {
+  display: flex;
+  justify-content: space-between;
+  padding: 2px 8px;
+  font-variant-numeric: tabular-nums;
+}
+
 .sidebar-action-btn {
   display: block;
   width: calc(100% - 16px);

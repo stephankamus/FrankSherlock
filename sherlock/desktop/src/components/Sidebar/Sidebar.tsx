@@ -1,4 +1,4 @@
-import type { Album, DbStats, FaceDetectProgress, RootInfo, ScanJobStatus, SmartFolder, ThumbRepairProgress, UpdateInfo } from "../../types";
+import type { Album, BacklogProgress, DbStats, FaceDetectProgress, RootInfo, ScanJobStatus, SmartFolder, ThumbRepairProgress, UpdateInfo } from "../../types";
 import { formatBytes } from "../../utils/format";
 import { useDragReorder } from "../../hooks/useDragReorder";
 import { formatEta } from "../../utils/scanEta";
@@ -29,12 +29,19 @@ type SidebarProps = {
   onRefreshRoot: (root: RootInfo) => void;
   onCopyRootPath: (root: RootInfo) => void;
   onRelinkRoot?: (root: RootInfo) => void;
+  /** Drop the classification of a root so its files can be classified again. */
+  onReclassifyRoot?: (root: RootInfo) => void;
   onCompactDatabase?: () => void;
   compacting?: boolean;
   /** Live progress of the "Repair Thumbnails" tool. */
   thumbRepair?: ThumbRepairProgress | null;
   onRepairThumbnails?: (rootId?: number | null) => void;
   onCancelThumbRepair?: () => void;
+  /** Classify pending files and fill missing thumbnails in one pipeline pass. */
+  onProcessBacklog?: (rootId?: number | null) => void;
+  /** Live counters of that pass: thumbnails and classifications are separate. */
+  backlog?: BacklogProgress | null;
+  onCancelBacklog?: () => void;
   onDetectFaces: (root: RootInfo) => void;
   onCancelFaceDetect: () => void;
   onCancelScan: (scan: ScanJobStatus) => void;
@@ -62,8 +69,9 @@ export default function Sidebar({
   setupReady, albums, smartFolders, activeAlbumName, activeSmartFolderId,
   selectedSubdir, faceProgress, onSelectSubdir,
   onSelectRoot, onDeleteRoot, onRescanRoot, onRefreshRoot, onCopyRootPath, onPickAndScan,
-  onRelinkRoot, onCompactDatabase, compacting,
-  thumbRepair, onRepairThumbnails, onCancelThumbRepair,
+  onRelinkRoot, onReclassifyRoot, onCompactDatabase, compacting,
+  thumbRepair, onRepairThumbnails, onCancelThumbRepair, onProcessBacklog,
+  backlog, onCancelBacklog,
   onDetectFaces, onCancelFaceDetect,
   onCancelScan, onResumeScan,
   onSelectAlbum, onDeleteAlbum, onSelectSmartFolder, onDeleteSmartFolder,
@@ -82,6 +90,17 @@ export default function Sidebar({
 
   const repairing =
     thumbRepair != null && (thumbRepair.phase === "scanning" || thumbRepair.phase === "repairing");
+
+  const backlogRunning =
+    backlog != null && (backlog.phase === "counting" || backlog.phase === "running");
+  /**
+   * `(12%)` against the rows that actually need that stage.
+   *
+   * Dividing by the whole backlog made the thumbnail share look stuck near 0%
+   * whenever the cache was already healthy and only classification was pending.
+   */
+  const backlogPct = (value: number, total: number) =>
+    total > 0 ? ` (${Math.min(100, Math.floor((value / total) * 100))}%)` : "";
 
   // Throughput matters here: repairing a whole library over SMB runs for hours, and
   // a bare counter makes the wait look infinite.
@@ -128,6 +147,11 @@ export default function Sidebar({
                   scan={scan}
                   readOnly={readOnly}
                   faceProgress={faceProgress?.rootId === root.id ? faceProgress : undefined}
+                  // Only while it is actually running: a finished record kept the
+                  // panel (and its Stop button) on the card forever.
+                  backlogProgress={
+                    backlog?.rootId === root.id && backlogRunning ? backlog : undefined
+                  }
                   onSelect={() => onSelectRoot(selectedRootId === root.id ? null : root.id)}
                   onDelete={() => onDeleteRoot(root)}
                   onRescan={() => onRescanRoot(root)}
@@ -135,6 +159,9 @@ export default function Sidebar({
                   onCopyPath={() => onCopyRootPath(root)}
                   onRelink={!readOnly && onRelinkRoot ? () => onRelinkRoot(root) : undefined}
                   onDetectFaces={!readOnly ? () => onDetectFaces(root) : undefined}
+                  onReclassify={
+                    !readOnly && onReclassifyRoot ? () => onReclassifyRoot(root) : undefined
+                  }
                   onCancelScan={scan?.status === "running" ? () => onCancelScan(scan) : undefined}
                   onResumeScan={scan?.status === "interrupted" ? () => onResumeScan(scan) : undefined}
                   onCancelFaceDetect={faceProgress?.rootId === root.id ? onCancelFaceDetect : undefined}
@@ -194,7 +221,7 @@ export default function Sidebar({
         )}
       </div>
 
-      {(onFindDuplicates || onOpenPdfPasswords || onOpenFaces || onCheckUpdates || onRepairThumbnails) && (
+      {(onFindDuplicates || onOpenPdfPasswords || onOpenFaces || onCheckUpdates || onRepairThumbnails || onProcessBacklog) && (
         <div className="sidebar-tools-fixed">
           <div className="sidebar-section"><span>Tools</span></div>
           <div className="sidebar-tool-list">
@@ -241,6 +268,62 @@ export default function Sidebar({
                     ? "Checking thumbnails…"
                     : `Repairing ${thumbRepair.processed}/${thumbRepair.total}${repairProgress}…`
                   : "Repair Thumbnails"}
+              </button>
+            )}
+            {onProcessBacklog && (
+              <button
+                type="button"
+                className="sidebar-tool-btn"
+                onClick={() => onProcessBacklog(selectedRootId)}
+                disabled={!setupReady || backlogRunning}
+                title="Classify pending files and fill missing thumbnails in one pass"
+              >
+                {backlogRunning
+                  ? backlog?.phase === "counting"
+                    ? "Counting backlog…"
+                    : "Processing backlog…"
+                  : "Process Backlog"}
+              </button>
+            )}
+            {backlogRunning && backlog && (
+              <div className="sidebar-backlog">
+                <div className="sidebar-item">
+                  Thumbnails:
+                  <span>
+                    {backlog.thumbsTotal === 0 && backlog.thumbnailed === 0
+                      ? "none missing"
+                      : `${backlog.thumbnailed.toLocaleString()} / ${backlog.thumbsTotal.toLocaleString()}${backlogPct(backlog.thumbnailed, backlog.thumbsTotal)}`}
+                  </span>
+                </div>
+                <div className="sidebar-item">
+                  Classified:
+                  <span>
+                    {backlog.classified.toLocaleString()} /{" "}
+                    {backlog.classifyTotal.toLocaleString()}
+                    {backlogPct(backlog.classified, backlog.classifyTotal)}
+                  </span>
+                </div>
+                <div className="sidebar-item sidebar-item-muted">
+                  {backlog.phase === "counting"
+                    ? "Reading the index…"
+                    : `${backlog.processed.toLocaleString()} / ${backlog.total.toLocaleString()} files`}
+                </div>
+                {backlog.failed > 0 && (
+                  <div className="sidebar-item sidebar-item-muted">
+                    Failed:
+                    <span>{backlog.failed.toLocaleString()}</span>
+                  </div>
+                )}
+              </div>
+            )}
+            {backlogRunning && onCancelBacklog && (
+              <button
+                type="button"
+                className="sidebar-tool-btn"
+                onClick={onCancelBacklog}
+                title="Stop the backlog pass"
+              >
+                Stop Backlog
               </button>
             )}
             {repairing && onCancelThumbRepair && (

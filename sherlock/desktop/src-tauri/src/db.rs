@@ -677,18 +677,34 @@ pub fn checkpoint_scan_job(
     Ok(())
 }
 
+/// SQL predicate for "this row still needs a vision pass".
+///
+/// `confidence` cannot be that marker: it is a number the **model** returns, and
+/// the prompt template literally shows `"confidence":0.0`, so qwen2.5-VL answers
+/// 0.0 for a perfectly good description often enough to matter. Measured on a
+/// 191-file folder: every file was classified (273 requests, 8 min) yet 112 rows
+/// ended with `confidence = 0`, so they stayed "pending" and were re-sent to the
+/// GPU on every later pass — forever.
+///
+/// The description is written by every successful classification
+/// ([`update_file_classification`]) and blanked by the placeholder record used for
+/// new and modified files, so it is the honest marker. Rows classified by older
+/// versions keep their description and are correctly treated as done.
+pub const PENDING_CLASSIFICATION_SQL: &str = "(description IS NULL OR description = '')";
+
 pub fn list_unclassified_files(
     db_path: &Path,
     root_id: i64,
     scan_marker: i64,
 ) -> AppResult<Vec<crate::models::UnclassifiedFile>> {
     let conn = open_conn(db_path)?;
-    let mut stmt = conn.prepare(
+    let sql = format!(
         "SELECT id, rel_path, abs_path, media_type, dhash FROM files
-         WHERE root_id = ?1 AND scan_marker = ?2 AND confidence = 0.0
+         WHERE root_id = ?1 AND scan_marker = ?2 AND {PENDING_CLASSIFICATION_SQL}
            AND deleted_at IS NULL
-         ORDER BY rel_path",
-    )?;
+         ORDER BY rel_path"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![root_id, scan_marker], |row| {
         Ok(crate::models::UnclassifiedFile {
             id: row.get(0)?,
@@ -715,11 +731,12 @@ pub fn list_unclassified_files_any_marker(
     root_id: i64,
 ) -> AppResult<Vec<crate::models::UnclassifiedFile>> {
     let conn = open_conn(db_path)?;
-    let mut stmt = conn.prepare(
+    let sql = format!(
         "SELECT id, rel_path, abs_path, media_type, dhash FROM files
-         WHERE root_id = ?1 AND confidence = 0.0 AND deleted_at IS NULL
-         ORDER BY rel_path",
-    )?;
+         WHERE root_id = ?1 AND {PENDING_CLASSIFICATION_SQL} AND deleted_at IS NULL
+         ORDER BY rel_path"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([root_id], |row| {
         Ok(crate::models::UnclassifiedFile {
             id: row.get(0)?,
@@ -787,8 +804,10 @@ pub fn pending_scan_info(
         .ok()
         .flatten();
     let unclassified: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM files
-         WHERE root_id = ?1 AND confidence = 0.0 AND deleted_at IS NULL",
+        &format!(
+            "SELECT COUNT(*) FROM files
+             WHERE root_id = ?1 AND {PENDING_CLASSIFICATION_SQL} AND deleted_at IS NULL"
+        ),
         [root_id],
         |row| row.get(0),
     )?;
@@ -1098,6 +1117,61 @@ pub fn list_thumb_repair_rows(
     Ok(out)
 }
 
+/// A row the backlog pass still has to work on: no classification yet, or no
+/// thumbnail pointer at all.
+#[derive(Debug, Clone)]
+pub struct BacklogRow {
+    pub id: i64,
+    pub rel_path: String,
+    pub abs_path: String,
+    pub size_bytes: i64,
+    /// Placeholder type inferred from the extension (`photo`, `video`, `pdf`, ...).
+    /// Video and PDF rows keep the legacy classification path.
+    pub media_type: String,
+    /// True when the row has no description yet — see
+    /// [`PENDING_CLASSIFICATION_SQL`] for why `confidence` is not the marker.
+    pub needs_classification: bool,
+    /// Pointer recorded in the index. A pointer whose file is gone is **not**
+    /// detected here: that needs a `stat` per row, which the pipeline does anyway
+    /// for the files it touches, and `repair_thumbnails` covers the rows it does
+    /// not.
+    pub thumb_path: Option<String>,
+}
+
+/// Rows of `root_id` that still need a classification or have no thumbnail at all.
+///
+/// Pure SQL: no filesystem access, so this is cheap even on a 53k-row index. The
+/// existence of a recorded thumbnail is verified by the pipeline producer, which
+/// is about to read the file anyway.
+pub fn list_backlog_rows(db_path: &Path, root_id: i64) -> AppResult<Vec<BacklogRow>> {
+    let conn = open_conn(db_path)?;
+    let sql = format!(
+        "SELECT id, rel_path, abs_path, size_bytes, media_type,
+                {PENDING_CLASSIFICATION_SQL} AS pending, thumb_path
+         FROM files
+         WHERE deleted_at IS NULL AND root_id = ?1
+           AND ({PENDING_CLASSIFICATION_SQL} OR thumb_path IS NULL)
+         ORDER BY rel_path"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![root_id], |row| {
+        Ok(BacklogRow {
+            id: row.get(0)?,
+            rel_path: row.get(1)?,
+            abs_path: row.get(2)?,
+            size_bytes: row.get(3)?,
+            media_type: row.get(4)?,
+            needs_classification: row.get::<_, i64>(5)? != 0,
+            thumb_path: row.get(6)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 /// `(fingerprint, dhash, thumb_path)` of rows that claim to have a thumbnail.
 ///
 /// The caller drops entries whose file is gone; they are the seed of the
@@ -1131,10 +1205,12 @@ pub fn list_thumb_cache_seed(
 /// earlier run costs no vision request at all.
 pub fn list_classified_dhashes(db_path: &Path, root_id: i64) -> AppResult<Vec<(i64, i64)>> {
     let conn = open_conn(db_path)?;
-    let mut stmt = conn.prepare(
+    let sql = format!(
         "SELECT id, dhash FROM files
-         WHERE root_id = ?1 AND deleted_at IS NULL AND confidence > 0 AND dhash IS NOT NULL",
-    )?;
+         WHERE root_id = ?1 AND deleted_at IS NULL
+           AND NOT {PENDING_CLASSIFICATION_SQL} AND dhash IS NOT NULL"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![root_id], |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
     })?;
@@ -1145,7 +1221,11 @@ pub fn list_classified_dhashes(db_path: &Path, root_id: i64) -> AppResult<Vec<(i
     Ok(out)
 }
 
-pub fn update_file_thumb_path_by_id_conn(conn: &Connection, file_id: i64, thumb_path: &str) -> AppResult<()> {
+pub fn update_file_thumb_path_by_id_conn(
+    conn: &Connection,
+    file_id: i64,
+    thumb_path: &str,
+) -> AppResult<()> {
     conn.execute(
         "UPDATE files SET thumb_path = ?1, updated_at = ?2 WHERE id = ?3",
         params![thumb_path, now_epoch_secs(), file_id],
@@ -1204,7 +1284,8 @@ pub fn migrate_thumbnail_layout(
     for (root_id, root_path) in roots {
         let key = crate::thumbnail::root_key(&root_path);
         let file_rows: Vec<(i64, String, Option<String>)> = {
-            let mut stmt = tx.prepare("SELECT id, rel_path, thumb_path FROM files WHERE root_id = ?1")?;
+            let mut stmt =
+                tx.prepare("SELECT id, rel_path, thumb_path FROM files WHERE root_id = ?1")?;
             let rows = stmt.query_map(params![root_id], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
@@ -1504,10 +1585,10 @@ pub fn vision_estimate_rows(
         return Ok(None);
     };
 
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT filename, abs_path, size_bytes FROM files
-         WHERE root_id = ?1 AND deleted_at IS NULL AND confidence = 0",
-    )?;
+         WHERE root_id = ?1 AND deleted_at IS NULL AND {PENDING_CLASSIFICATION_SQL}"
+    ))?;
     let rows = stmt.query_map([root_id], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -1700,6 +1781,106 @@ pub fn purge_root(db_path: &Path, root_id: i64) -> AppResult<PurgeResult> {
         files_removed: files_removed as u64,
         jobs_removed: jobs_removed as u64,
         thumbs_cleaned,
+    })
+}
+
+/// Drop the vision result of every file of a root, keeping everything else.
+///
+/// This is what the "Reclassify" action does, and it is the only way to make a
+/// folder pending again without removing it: removing a root that lives inside
+/// another indexed root only hands its rows to the parent, and adding it back
+/// adopts them — classification included.
+///
+/// The rows keep their id, `rel_path`, `thumb_path`, `dhash`, faces and album
+/// links, so no thumbnail is regenerated and the files are not read from the
+/// share again; only the classification columns are blanked, which is what makes
+/// [`PENDING_CLASSIFICATION_SQL`] true again. The FTS entry is rebuilt from the
+/// (now empty) row so search stops returning a description that no longer exists.
+///
+/// Returns how many rows were reset.
+/// `drop_thumbnails` also forgets every thumbnail of the root — pointer and file.
+///
+/// Needed to reproduce the state a fresh folder has (no thumbnail, no
+/// classification), which is what makes the backlog's producer do the
+/// decode/thumbnail work while the GPU classifies. Without it, arm A and arm B of
+/// the A/B would not start from the same place.
+pub fn reset_root_classifications(
+    db_path: &Path,
+    root_id: i64,
+    drop_thumbnails: bool,
+) -> AppResult<crate::models::ReclassifyResult> {
+    let conn = open_conn(db_path)?;
+    let tx = conn.unchecked_transaction()?;
+    let now = now_epoch_secs();
+
+    let ids: Vec<i64> = {
+        let mut stmt = tx.prepare(&format!(
+            "SELECT id FROM files
+             WHERE root_id = ?1 AND deleted_at IS NULL AND NOT {PENDING_CLASSIFICATION_SQL}"
+        ))?;
+        let rows = stmt.query_map(params![root_id], |row| row.get::<_, i64>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    // Every row with a pointer, classified or not: the goal is the empty state.
+    let thumb_paths: Vec<String> = if drop_thumbnails {
+        let mut stmt = tx.prepare(
+            "SELECT thumb_path FROM files
+             WHERE root_id = ?1 AND deleted_at IS NULL AND thumb_path IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![root_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
+
+    if ids.is_empty() && thumb_paths.is_empty() {
+        return Ok(crate::models::ReclassifyResult {
+            files: 0,
+            thumbnails: 0,
+        });
+    }
+
+    if !ids.is_empty() {
+        tx.execute(
+            &format!(
+                "UPDATE files
+                 SET description = '', extracted_text = '', canonical_mentions = '',
+                     confidence = 0, lang_hint = '', updated_at = ?2
+                 WHERE root_id = ?1 AND deleted_at IS NULL AND NOT {PENDING_CLASSIFICATION_SQL}"
+            ),
+            params![root_id, now],
+        )?;
+        for id in &ids {
+            refresh_fts(&tx, *id)?;
+        }
+    }
+    if !thumb_paths.is_empty() {
+        tx.execute(
+            "UPDATE files
+             SET thumb_path = NULL, updated_at = ?2
+             WHERE root_id = ?1 AND deleted_at IS NULL AND thumb_path IS NOT NULL",
+            params![root_id, now],
+        )?;
+    }
+    tx.commit()?;
+
+    // Best-effort, outside the transaction: a missing file is not an error.
+    let mut thumbnails = 0u64;
+    for path in &thumb_paths {
+        if std::fs::remove_file(path).is_ok() {
+            thumbnails += 1;
+        }
+    }
+
+    log::info!(
+        "reset_root_classifications: root {} lost {} classification(s) and {} thumbnail(s)",
+        root_id,
+        ids.len(),
+        thumbnails
+    );
+    Ok(crate::models::ReclassifyResult {
+        files: ids.len() as u64,
+        thumbnails,
     })
 }
 
@@ -6131,6 +6312,97 @@ mod tests {
         // Normal purge works
         let purge = purge_root(&db_path, root_id).expect("purge");
         assert_eq!(purge.files_removed, 1);
+    }
+
+    #[test]
+    fn reset_root_classifications_makes_rows_pending_and_keeps_the_thumbnail() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/reset").expect("root");
+        let a = upsert_file_record(&db_path, &sample_record(root_id, "a.jpg", "fp-a")).expect("a");
+        upsert_file_record(&db_path, &sample_record(root_id, "b.jpg", "fp-b")).expect("b");
+
+        // `sample_record` carries a description, so nothing is pending yet.
+        assert!(list_unclassified_files_any_marker(&db_path, root_id)
+            .expect("pending")
+            .is_empty());
+
+        let conn = open_conn(&db_path).expect("conn");
+        update_file_thumb_path_by_id_conn(&conn, a, "/tmp/thumbs/a.jpg").expect("thumb");
+        drop(conn);
+
+        let outcome = reset_root_classifications(&db_path, root_id, false).expect("reset");
+        assert_eq!(outcome.files, 2);
+        assert_eq!(
+            outcome.thumbnails, 0,
+            "thumbnails are kept unless asked for"
+        );
+
+        assert_eq!(
+            list_unclassified_files_any_marker(&db_path, root_id)
+                .expect("pending")
+                .len(),
+            2
+        );
+        let conn = open_conn(&db_path).expect("conn");
+        let (description, confidence, thumb_path): (String, f64, Option<String>) = conn
+            .query_row(
+                "SELECT description, confidence, thumb_path FROM files WHERE id = ?1",
+                [a],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("row");
+        assert!(description.is_empty(), "classification must be blanked");
+        assert_eq!(confidence, 0.0);
+        assert_eq!(
+            thumb_path.as_deref(),
+            Some("/tmp/thumbs/a.jpg"),
+            "the thumbnail pointer must survive a reclassify"
+        );
+
+        // Nothing left to clear on a second call.
+        let again = reset_root_classifications(&db_path, root_id, false).expect("reset");
+        assert_eq!(again.files, 0);
+    }
+
+    #[test]
+    fn reset_root_classifications_can_also_drop_the_thumbnails() {
+        let (dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/reset-thumbs").expect("root");
+        let a = upsert_file_record(&db_path, &sample_record(root_id, "a.jpg", "fp-a")).expect("a");
+        upsert_file_record(&db_path, &sample_record(root_id, "b.jpg", "fp-b")).expect("b");
+
+        let thumbs = dir.path().join("thumbs");
+        std::fs::create_dir_all(&thumbs).expect("thumbs dir");
+        let mut paths = Vec::new();
+        for (id, name) in [(a, "a.jpg"), (a + 1, "b.jpg")] {
+            let path = thumbs.join(name);
+            std::fs::write(&path, b"thumb").expect("thumb file");
+            let conn = open_conn(&db_path).expect("conn");
+            update_file_thumb_path_by_id_conn(&conn, id, path.to_str().expect("path"))
+                .expect("pointer");
+            paths.push(path);
+        }
+
+        let outcome = reset_root_classifications(&db_path, root_id, true).expect("reset");
+        assert_eq!(outcome.files, 2);
+        assert_eq!(outcome.thumbnails, 2);
+        assert!(
+            paths.iter().all(|p| !p.exists()),
+            "the cached files must be gone"
+        );
+
+        // No pointer left, so the next scan regenerates both thumbnails.
+        let conn = open_conn(&db_path).expect("conn");
+        let with_thumb: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE root_id = ?1 AND thumb_path IS NOT NULL",
+                [root_id],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(with_thumb, 0);
     }
 
     #[test]

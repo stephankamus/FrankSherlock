@@ -101,7 +101,29 @@ fn is_text_like(source: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Prepare `source` for the vision model.
+fn is_jpeg(path: &Path) -> bool {
+    path.extension()
+        .map(|ext| {
+            let ext = ext.to_string_lossy().to_ascii_lowercase();
+            ext == "jpg" || ext == "jpeg"
+        })
+        .unwrap_or(false)
+}
+
+/// A request that will upload the original file untouched.
+fn passthrough(source: &Path, original_bytes: u64, width: u32, height: u32) -> PreparedImage {
+    PreparedImage {
+        path: source.to_path_buf(),
+        source: source.to_path_buf(),
+        width,
+        height,
+        original_bytes,
+        prepared_bytes: original_bytes,
+        temp: false,
+    }
+}
+
+/// Prepare `source` for the vision model, reading and decoding it here.
 ///
 /// Fast paths (no re-encode, no temp file):
 /// - `max_side == 0` (user asked for originals)
@@ -117,60 +139,78 @@ pub fn prepare_with(
     let (src_w, src_h) = image_dimensions(source)?;
 
     if max_side == 0 {
-        return Ok(PreparedImage {
-            path: source.to_path_buf(),
-            source: source.to_path_buf(),
-            width: src_w,
-            height: src_h,
-            original_bytes,
-            prepared_bytes: original_bytes,
-            temp: false,
-        });
+        return Ok(passthrough(source, original_bytes, src_w, src_h));
     }
 
     let orientation = crate::exif::extract_orientation(source);
-    let is_jpeg = source
-        .extension()
-        .map(|e| {
-            let e = e.to_string_lossy().to_ascii_lowercase();
-            e == "jpg" || e == "jpeg"
-        })
-        .unwrap_or(false);
     let needs_resize = src_w.max(src_h) > max_side;
     let needs_rotation = orientation != 1;
 
-    if is_jpeg && !needs_resize && !needs_rotation {
-        return Ok(PreparedImage {
-            path: source.to_path_buf(),
-            source: source.to_path_buf(),
-            width: src_w,
-            height: src_h,
-            original_bytes,
-            prepared_bytes: original_bytes,
-            temp: false,
-        });
+    if is_jpeg(source) && !needs_resize && !needs_rotation {
+        return Ok(passthrough(source, original_bytes, src_w, src_h));
     }
 
     let decode_started = Instant::now();
     let decoded = image::open(source)
         .map_err(|e| AppError::Config(format!("cannot decode {}: {e}", source.display())))?;
     let decoded = crate::exif::apply_orientation(decoded, orientation);
-    let decode_ms = decode_started.elapsed().as_millis();
+    log::debug!(
+        "vision_prep {}: decode={}ms (exif orientation {orientation})",
+        source.display(),
+        decode_started.elapsed().as_millis()
+    );
+
+    prepare_from_decoded(
+        source,
+        original_bytes,
+        orientation,
+        &decoded,
+        max_side,
+        tmp_dir,
+        filter,
+    )
+}
+
+/// Prepare `source` when the image is **already decoded**.
+///
+/// This is the entry point of the CPU/GPU pipeline: the thumbnail pass has
+/// already paid for the decode and the EXIF rotation, so reading and decoding the
+/// file a second time is pure waste (`plans/pipeline-cpu-gpu-overlap.md`,
+/// Phase 1). `decoded` must have orientation already applied; `orientation` is
+/// the value read from the file, still needed because Ollama ignores EXIF and a
+/// rotated JPEG therefore cannot travel untouched.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_from_decoded(
+    source: &Path,
+    original_bytes: u64,
+    orientation: u16,
+    decoded: &image::DynamicImage,
+    max_side: u32,
+    tmp_dir: &Path,
+    filter: ImageFilter,
+) -> AppResult<PreparedImage> {
+    let max_side = RuntimeSettings::normalize_image_max_side(max_side);
+    let (w, h) = (decoded.width(), decoded.height());
+
+    // A JPEG that already fits and is upright travels untouched: re-encoding it
+    // would only add a generation loss.
+    if max_side == 0 || (is_jpeg(source) && w.max(h) <= max_side && orientation == 1) {
+        return Ok(passthrough(source, original_bytes, w, h));
+    }
 
     let box_filter = prefers_box(source, filter);
-    let (w, h) = (decoded.width(), decoded.height());
     let resize_started = Instant::now();
     let resized = if w.max(h) > max_side {
         let scale = max_side as f64 / w.max(h) as f64;
         let new_w = ((w as f64 * scale).round() as u32).max(1);
         let new_h = ((h as f64 * scale).round() as u32).max(1);
         if box_filter {
-            image::DynamicImage::ImageRgba8(image::imageops::thumbnail(&decoded, new_w, new_h))
+            image::DynamicImage::ImageRgba8(image::imageops::thumbnail(decoded, new_w, new_h))
         } else {
             decoded.resize(new_w, new_h, image::imageops::FilterType::Lanczos3)
         }
     } else {
-        decoded
+        decoded.clone()
     };
     let resize_ms = resize_started.elapsed().as_millis();
 
@@ -184,11 +224,10 @@ pub fn prepare_with(
         .map_err(|e| AppError::Config(format!("cannot encode {}: {e}", out_path.display())))?;
     let encode_ms = encode_started.elapsed().as_millis();
 
-    // Phase 0 of `plans/pipeline-cpu-gpu-overlap.md`: this decode repeats the one
-    // `thumbnail::generate_thumbnail` already did for the same file, and a scan
-    // runs both. The split is what tells us how much a shared decode would save.
+    // Phase 0 of `plans/pipeline-cpu-gpu-overlap.md`: `prepare_with` used to do a
+    // second full decode here, and a scan runs the thumbnail just before it.
     log::debug!(
-        "vision_prep {}: {w}x{h} -> {out_w}x{out_h} filter={} decode={decode_ms}ms resize={resize_ms}ms encode={encode_ms}ms",
+        "vision_prep {}: {w}x{h} -> {out_w}x{out_h} filter={} resize={resize_ms}ms encode={encode_ms}ms",
         source.display(),
         if box_filter { "box" } else { "lanczos3" }
     );
@@ -208,12 +247,7 @@ pub fn prepare_with(
 /// Stable temp path for a (source, max_side, kernel) tuple so repeated calls
 /// inside one scan reuse the same file instead of spraying the temp directory,
 /// and two kernels never resolve to the same file.
-fn tmp_path(
-    source: &Path,
-    max_side: u32,
-    tmp_dir: &Path,
-    box_filter: bool,
-) -> AppResult<PathBuf> {
+fn tmp_path(source: &Path, max_side: u32, tmp_dir: &Path, box_filter: bool) -> AppResult<PathBuf> {
     let meta = std::fs::metadata(source)
         .map_err(|e| AppError::Config(format!("cannot stat {}: {e}", source.display())))?;
     let mtime = meta
@@ -334,19 +368,18 @@ mod tests {
     fn box_and_lanczos_agree_on_size_but_not_on_path() {
         let dir = tempfile::tempdir().expect("tempdir");
         let src = dir.path().join("big.png");
-        RgbImage::from_fn(2000, 1500, |x, y| Rgb([(x % 256) as u8, (y % 256) as u8, 90]))
-            .save(&src)
-            .expect("save png");
+        RgbImage::from_fn(2000, 1500, |x, y| {
+            Rgb([(x % 256) as u8, (y % 256) as u8, 90])
+        })
+        .save(&src)
+        .expect("save png");
         let tmp = dir.path().join("tmp");
 
         let boxed = prepare_with(&src, 1024, &tmp, ImageFilter::Box).expect("box");
         let lanczos = prepare_with(&src, 1024, &tmp, ImageFilter::Lanczos).expect("lanczos");
 
         assert_eq!((boxed.width, boxed.height), (1024, 768));
-        assert_eq!(
-            (boxed.width, boxed.height),
-            (lanczos.width, lanczos.height)
-        );
+        assert_eq!((boxed.width, boxed.height), (lanczos.width, lanczos.height));
         assert_ne!(
             boxed.path, lanczos.path,
             "kernels must not resolve to the same temp file"
@@ -364,6 +397,53 @@ mod tests {
         let path_a = a.path.clone();
         let b = prepare(&src, 1024, &tmp).expect("prepare");
         assert_eq!(path_a, b.path);
+    }
+
+    /// Feeding a decoded image must give exactly what reading the file gives.
+    #[test]
+    fn prepare_from_decoded_matches_prepare_with() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("big.png");
+        RgbImage::from_fn(1600, 1200, |x, y| {
+            Rgb([(x % 256) as u8, (y % 256) as u8, 40])
+        })
+        .save(&src)
+        .expect("save png");
+        let tmp = dir.path().join("tmp");
+        let bytes = std::fs::metadata(&src).expect("metadata").len();
+
+        let read_path = prepare_with(&src, 1024, &tmp, ImageFilter::Auto).expect("prepare_with");
+        let expected = (read_path.width, read_path.height, read_path.prepared_bytes);
+
+        let decoded = image::open(&src).expect("open");
+        let decoded = crate::exif::apply_orientation(decoded, 1);
+        let shared = prepare_from_decoded(&src, bytes, 1, &decoded, 1024, &tmp, ImageFilter::Auto)
+            .expect("prepare_from_decoded");
+
+        assert_eq!(
+            (shared.width, shared.height, shared.prepared_bytes),
+            expected,
+            "the shared decode must produce the same JPEG as the reading path"
+        );
+    }
+
+    /// An upright JPEG that already fits is uploaded untouched — no re-encode.
+    #[test]
+    fn prepare_from_decoded_passes_through_a_fitting_jpeg() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("small.jpg");
+        write_jpeg(&src, 800, 600);
+        let tmp = dir.path().join("tmp");
+        let bytes = std::fs::metadata(&src).expect("metadata").len();
+
+        let decoded = image::open(&src).expect("open");
+        let prepared =
+            prepare_from_decoded(&src, bytes, 1, &decoded, 1024, &tmp, ImageFilter::Auto)
+                .expect("prepare");
+
+        assert!(!prepared.is_temp());
+        assert_eq!(prepared.path, src);
+        assert_eq!((prepared.width, prepared.height), (800, 600));
     }
 
     #[test]

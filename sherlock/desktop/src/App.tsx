@@ -4,8 +4,8 @@ import { open } from "@tauri-apps/plugin-dialog";
 import {
   cancelScan, compactDatabase, copyFilesToClipboard, deleteFiles, ensureDatabase,
   getCliFolderPath, getFileMetadata, getFileProperties, getVisionSettings, listRoots,
-  pendingScanSummary, relinkRoot, removeRoot, renameFile, reorderRoots, startScan,
-  updateFileMetadata,
+  pendingScanSummary, relinkRoot, removeRoot, renameFile, reorderRoots,
+  resetRootClassifications, startScan, updateFileMetadata,
 } from "./api";
 import type {
   DbStats,
@@ -37,6 +37,7 @@ import StartupScanModal from "./components/modals/StartupScanModal";
 import ScanSummaryModal from "./components/modals/ScanSummaryModal";
 import PreviewModal from "./components/modals/PreviewModal";
 import ConfirmDeleteModal from "./components/modals/ConfirmDeleteModal";
+import ConfirmReclassifyModal from "./components/modals/ConfirmReclassifyModal";
 import ConfirmFileDeleteModal from "./components/modals/ConfirmFileDeleteModal";
 import RenameModal from "./components/modals/RenameModal";
 import HelpModal from "./components/modals/HelpModal";
@@ -59,6 +60,7 @@ import { useAppInit } from "./hooks/useAppInit";
 import { useAutoUpdate } from "./hooks/useAutoUpdate";
 import { useFaceDetection } from "./hooks/useFaceDetection";
 import { useThumbRepair } from "./hooks/useThumbRepair";
+import { useBacklog } from "./hooks/useBacklog";
 import { useAlbumManager } from "./hooks/useAlbumManager";
 import { useSmartFolderManager } from "./hooks/useSmartFolderManager";
 import { useDuplicatesManager } from "./hooks/useDuplicatesManager";
@@ -81,6 +83,7 @@ export default function App() {
   const [readOnly, setReadOnly] = useState(false);
   const [showResumeModal, setShowResumeModal] = useState(false);
   const [confirmDeleteRoot, setConfirmDeleteRoot] = useState<RootInfo | null>(null);
+  const [confirmReclassifyRoot, setConfirmReclassifyRoot] = useState<RootInfo | null>(null);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
@@ -135,6 +138,17 @@ export default function App() {
     onNotice: setNotice,
     onError: setError,
     // Thumbnail size is shown in the sidebar footer, so refresh it when a run ends.
+    onFinished: () => {
+      ensureDatabase()
+        .then((stats) => setDbStats(stats))
+        .catch(() => {});
+    },
+  });
+  const backlog = useBacklog({
+    pollMs: POLL_MS,
+    onNotice: setNotice,
+    onError: setError,
+    // The pass writes thumbnails, so the sidebar footer size changes too.
     onFinished: () => {
       ensureDatabase()
         .then((stats) => setDbStats(stats))
@@ -408,6 +422,45 @@ export default function App() {
       if (selectedRootId === root.id) setSelectedRootId(null);
       setNotice(`Removed "${root.rootName}": ${result.filesRemoved} files purged.`);
       await scanManager.refreshRoots();
+      const stats = await ensureDatabase();
+      setDbStats(stats);
+      await runSearch(0, false);
+    } catch (err) {
+      setError(errorMessage(err));
+    }
+  }
+
+  /**
+   * Forget the classification of every file of a root, keeping thumbnails, dHash,
+   * faces and albums, so the next pass can send everything to the model again.
+   *
+   * Removing and re-adding the folder is not equivalent: a folder inside another
+   * indexed root hands its rows to the parent and adopts them back, classification
+   * included — which is why a rescan only finds a handful of files.
+   */
+  async function onReclassifyRoot(root: RootInfo, dropThumbnails: boolean) {
+    if (readOnly) return;
+    setConfirmReclassifyRoot(null);
+    try {
+      const runningForRoot = scanManager.activeScans.filter(
+        (s) => s.rootId === root.id && s.status === "running",
+      );
+      for (const scan of runningForRoot) {
+        await cancelScan(scan.id);
+      }
+      if (runningForRoot.length > 0) {
+        await new Promise((r) => setTimeout(r, 300));
+      }
+      const result = await resetRootClassifications(root.id, dropThumbnails);
+      const thumbs =
+        result.thumbnails > 0
+          ? ` and ${result.thumbnails.toLocaleString()} thumbnail(s)`
+          : "";
+      setNotice(
+        result.files > 0 || result.thumbnails > 0
+          ? `Cleared ${result.files.toLocaleString()} classification(s)${thumbs} in "${root.rootName}". Run "Process Backlog" to redo them.`
+          : `Nothing to reclassify in "${root.rootName}".`,
+      );
       const stats = await ensureDatabase();
       setDbStats(stats);
       await runSearch(0, false);
@@ -754,6 +807,16 @@ export default function App() {
           }}
         />
       )}
+      {confirmReclassifyRoot && (
+        <ConfirmReclassifyModal
+          root={confirmReclassifyRoot}
+          isScanning={scanManager.activeScans.some(
+            (s) => s.rootId === confirmReclassifyRoot.id && s.status === "running",
+          )}
+          onCancel={() => setConfirmReclassifyRoot(null)}
+          onConfirm={onReclassifyRoot}
+        />
+      )}
       {confirmDeleteRoot && (
         <ConfirmDeleteModal
           root={confirmDeleteRoot}
@@ -872,6 +935,7 @@ export default function App() {
             faces.setFacesMode(false);
           }}
           onDeleteRoot={(root) => setConfirmDeleteRoot(root)}
+          onReclassifyRoot={(root) => setConfirmReclassifyRoot(root)}
           onRescanRoot={(root) => scanManager.onRescanRoot(root, setup, readOnly)}
           onRefreshRoot={(root) => scanManager.onRefreshRoot(root, readOnly)}
           onCopyRootPath={(root) => {
@@ -884,6 +948,20 @@ export default function App() {
           thumbRepair={thumbRepair.thumbRepair}
           onRepairThumbnails={readOnly ? undefined : thumbRepair.onRepairThumbnails}
           onCancelThumbRepair={thumbRepair.onCancelThumbRepair}
+          backlog={backlog.backlog}
+          onCancelBacklog={backlog.onCancelBacklog}
+          onProcessBacklog={readOnly ? undefined : (rootId) => {
+            const root = roots.find((r) => r.id === rootId);
+            if (!root) {
+              setError("Select a folder to process its backlog.");
+              return;
+            }
+            void scanManager.startScanWithMode(
+              root.rootPath,
+              "backlog",
+              `Processing backlog of ${root.rootName}`,
+            );
+          }}
           onPickAndScan={() => scanManager.onPickAndScan(setup, readOnly)}
           onCancelScan={(scan) => scanManager.onCancelScan(scan, readOnly)}
           onResumeScan={(scan) => scanManager.onResumeScan(scan, readOnly)}

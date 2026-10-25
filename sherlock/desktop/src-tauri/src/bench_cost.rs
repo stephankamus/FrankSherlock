@@ -68,6 +68,9 @@ struct Sample {
     /// may cost far more than `read + load_from_memory` because it reads through
     /// a `BufReader`; this column decides how the shared decode should read.
     open_ms: f64,
+    /// Phase 1: decode once, then produce the thumbnail and the model JPEG from
+    /// the same buffer. This is what the pipeline producer will do.
+    shared_ms: f64,
     /// Ollama request wall time (`None` without `BENCH_MODEL` or on failure).
     request_ms: Option<f64>,
     prefill_ms: Option<f64>,
@@ -325,6 +328,11 @@ fn bench_cost_split() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let thumb_dir = tmp.path().join("thumbs");
     let prep_dir = tmp.path().join("prep");
+    // Separate directory on purpose: `prepare_from_decoded` would otherwise
+    // resolve to the same temp path as the box measurement (same source, size,
+    // resolution and kernel) and its `Drop` would delete the file the request
+    // is about to upload.
+    let shared_dir = tmp.path().join("prep-shared");
 
     eprintln!(
         "bench: {} file(s), model={}, image_max_side={}",
@@ -334,7 +342,7 @@ fn bench_cost_split() {
     );
 
     println!(
-        "file,bytes,read_ms,decode_ms,dhash_ms,thumb_ms,prepare_box_ms,prepare_lanczos_ms,open_ms,request_ms,prefill_ms,decode_gpu_ms,ollama_cpu_ms"
+        "file,bytes,read_ms,decode_ms,dhash_ms,thumb_ms,prepare_box_ms,prepare_lanczos_ms,open_ms,shared_ms,request_ms,prefill_ms,decode_gpu_ms,ollama_cpu_ms"
     );
 
     let mut samples: Vec<Sample> = Vec::new();
@@ -389,12 +397,8 @@ fn bench_cost_split() {
         // area average the thumbnail already uses; Lanczos3 is what `prepare`
         // used until now. Different temp paths, so both can be alive at once.
         let started = Instant::now();
-        let prepared_box = vision_prep::prepare_with(
-            path,
-            settings.image_max_side,
-            &prep_dir,
-            ImageFilter::Box,
-        );
+        let prepared_box =
+            vision_prep::prepare_with(path, settings.image_max_side, &prep_dir, ImageFilter::Box);
         let prepare_box_ms = started.elapsed().as_secs_f64() * 1000.0;
 
         let started = Instant::now();
@@ -430,8 +434,38 @@ fn bench_cost_split() {
             }
         };
 
+        // Phase 1: one decode feeding both artifacts, which is what the pipeline
+        // producer will run. Compared below against `thumb + prepare box`, the
+        // two-decode path used today.
+        let file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let started = Instant::now();
+        let mut shared_ok = false;
+        if let Some(shared) = thumbnail::decode_source(path) {
+            let thumb_ok = thumbnail::thumbnail_from_decoded(
+                &shared,
+                &thumb_dir,
+                &format!("shared-{index}.jpg"),
+            )
+            .is_some();
+            let prep_ok = vision_prep::prepare_from_decoded(
+                path,
+                file_bytes,
+                shared.orientation,
+                &shared.image,
+                settings.image_max_side,
+                &shared_dir,
+                ImageFilter::Auto,
+            )
+            .is_ok();
+            shared_ok = thumb_ok && prep_ok;
+        }
+        let shared_ms = started.elapsed().as_secs_f64() * 1000.0;
+        if !shared_ok {
+            eprintln!("bench: shared-decode path failed for {}", path.display());
+        }
+
         let mut sample = Sample {
-            bytes: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+            bytes: file_bytes,
             read_ms,
             decode_ms,
             dhash_ms,
@@ -439,6 +473,7 @@ fn bench_cost_split() {
             prepare_box_ms,
             prepare_lanczos_ms,
             open_ms,
+            shared_ms,
             ..Sample::default()
         };
 
@@ -479,7 +514,7 @@ fn bench_cost_split() {
         }
 
         println!(
-            "{},{},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{},{},{},{}",
+            "{},{},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{},{},{},{}",
             path.display(),
             sample.bytes,
             sample.read_ms,
@@ -489,6 +524,7 @@ fn bench_cost_split() {
             sample.prepare_box_ms,
             sample.prepare_lanczos_ms,
             sample.open_ms,
+            sample.shared_ms,
             fmt_ms(sample.request_ms),
             fmt_ms(sample.prefill_ms),
             fmt_ms(sample.decode_gpu_ms),
@@ -514,6 +550,7 @@ fn bench_cost_split() {
     // for photos. A mixed folder lands between the two means.
     let prepare = prepare_box;
     let open = mean(&samples, |s| Some(s.open_ms)).unwrap_or(0.0);
+    let shared = mean(&samples, |s| Some(s.shared_ms)).unwrap_or(0.0);
     let request = mean(&samples, |s| s.request_ms);
     let prefill = mean(&samples, |s| s.prefill_ms).unwrap_or(0.0);
     let decode_gpu = mean(&samples, |s| s.decode_gpu_ms).unwrap_or(0.0);
@@ -541,6 +578,17 @@ fn bench_cost_split() {
         "image::open       : {open:.1}  (BufReader read + decode = {:.0} % of read+decode)",
         open / duplicated * 100.0
     );
+    let two_decodes = thumb + prepare_box;
+    println!("thumb+prepare     : {two_decodes:.1}  (two decodes, today)");
+    println!(
+        "one decode        : {shared:.1}  ({:+.1} ms, {:+.0} %)",
+        shared - two_decodes,
+        if two_decodes > 0.0 {
+            (shared / two_decodes - 1.0) * 100.0
+        } else {
+            0.0
+        }
+    );
     match request {
         Some(request) => {
             println!("request (total)   : {request:.1}");
@@ -557,7 +605,8 @@ fn bench_cost_split() {
     // Per-file cost today: both decodes plus the request. This is the baseline
     // the pipeline has to beat by at least 20 % (`plans/pipeline-cpu-gpu-overlap.md`).
     let seq = thumb + prepare + request.unwrap_or(0.0);
-    let cpu_after_shared_decode = (thumb + prepare + ollama_cpu.unwrap_or(0.0) - duplicated).max(0.0);
+    let cpu_after_shared_decode =
+        (thumb + prepare + ollama_cpu.unwrap_or(0.0) - duplicated).max(0.0);
     let gpu_active = prefill + decode_gpu;
     // Ceiling only: it assumes the pipeline overlaps CPU and GPU perfectly and
     // that the workers do not steal CPU from Ollama's preprocessing. Real runs

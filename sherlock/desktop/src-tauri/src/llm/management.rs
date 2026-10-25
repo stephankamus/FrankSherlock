@@ -150,6 +150,63 @@ pub fn list_loaded_models() -> (bool, Vec<String>) {
 }
 
 /// Unload all currently loaded Ollama models via HTTP API.
+/// Shared state of the "runner wedged" recovery.
+fn reload_state() -> &'static std::sync::Mutex<Option<std::time::Instant>> {
+    static LAST: std::sync::OnceLock<std::sync::Mutex<Option<std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    LAST.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// A request went through: a wedge that comes later deserves its own reload.
+///
+/// Without this the throttle below turned into a 10 s blackout in which a genuinely
+/// wedged runner was retried without a reload and the file was marked as failed —
+/// measured: 13 of 107 files lost to attempts that were throttled out.
+pub fn note_success() {
+    if let Ok(mut last) = reload_state().lock() {
+        *last = None;
+    }
+}
+
+/// Unload a model so the next request loads a fresh runner.
+///
+/// Ollama 0.40.11 answers requests with its zero-value frame once a runner has
+/// wedged (measured: ~1-2 minutes into a scan, and then on every request until the
+/// model is reloaded). Unloading is the only cure; the next `generate` pays the load.
+/// Throttled to once every 10 s only to survive a runner that wedges immediately
+/// after every reload — [`note_success`] clears the throttle as soon as one request
+/// goes through.
+///
+/// Returns whether a reload was actually performed.
+pub fn reload_model(model: &str) -> bool {
+    use std::time::{Duration, Instant};
+    let state = reload_state();
+    let mut last = match state.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let now = Instant::now();
+    if last.is_some_and(|previous| now.duration_since(previous) < Duration::from_secs(10)) {
+        return false;
+    }
+    *last = Some(now);
+    drop(last);
+
+    let agent: ureq::Agent = ureq::Agent::config_builder().build().into();
+    let payload = serde_json::json!({ "model": model, "keep_alive": 0 });
+    let sent = agent
+        .post(&format!("{}/api/generate", super::ollama_base()))
+        .send_json(&payload);
+    match sent {
+        Ok(_) => log::info!("Unloaded {model} to reset a wedged runner"),
+        Err(e) => log::warn!("Could not unload {model}: {e}"),
+    }
+    // The unload is asynchronous: the retry has to arrive after the runner is gone,
+    // otherwise Ollama cancels the unload and the wedged runner keeps serving.
+    std::thread::sleep(Duration::from_millis(400));
+    true
+}
+
 pub fn cleanup_loaded_models() -> AppResult<()> {
     let (_, models) = list_loaded_models();
     let agent: ureq::Agent = ureq::Agent::config_builder()

@@ -244,10 +244,13 @@ export function useScanManager(cb: ScanManagerCallbacks) {
 
   async function onResumeScan(scan: ScanJobStatus, readOnly: boolean) {
     if (readOnly) return;
+    // The job row remembers the phase it died in, so an interrupted backlog pass
+    // resumes as a backlog pass instead of turning into a full rescan.
+    const mode: ScanMode = scan.phase === "backlog" ? "backlog" : "full";
     await startScanWithMode(
       scan.rootPath,
-      "full",
-      `Resuming scan for ${basename(scan.rootPath)}`,
+      mode,
+      `Resuming ${mode === "backlog" ? "backlog" : "scan"} for ${basename(scan.rootPath)}`,
     );
   }
 
@@ -256,13 +259,14 @@ export function useScanManager(cb: ScanManagerCallbacks) {
     await Promise.all(
       activeScans
         .filter((s) => s.status === "interrupted")
-        .map((scan) =>
-          startScanWithMode(
+        .map((scan) => {
+          const mode: ScanMode = scan.phase === "backlog" ? "backlog" : "full";
+          return startScanWithMode(
             scan.rootPath,
-            "full",
-            `Resuming scan for ${basename(scan.rootPath)}`,
-          ),
-        ),
+            mode,
+            `Resuming ${mode === "backlog" ? "backlog" : "scan"} for ${basename(scan.rootPath)}`,
+          );
+        }),
     );
     await pollRuntimeAndScans();
   }

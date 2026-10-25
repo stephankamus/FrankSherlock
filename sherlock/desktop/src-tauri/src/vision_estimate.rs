@@ -581,7 +581,10 @@ mod tests {
         assert_ne!(k1, k2);
         assert_ne!(k1, k3);
         assert_ne!(k1, k4);
-        assert_ne!(k1, k5, "changing the filter must invalidate the calibration");
+        assert_ne!(
+            k1, k5,
+            "changing the filter must invalidate the calibration"
+        );
     }
 
     #[test]
