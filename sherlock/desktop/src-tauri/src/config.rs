@@ -162,6 +162,12 @@ image_max_side = 1024
 # - detailed  adds anime series/character candidates: ~78 output tokens (slower)
 prompt_profile = "concise"
 
+# Resampling filter used to downscale the image sent to the vision model.
+# - auto     area-average for photos/JPEG (fast), Lanczos3 for screenshots/documents
+# - box      always area-average: the fastest option
+# - lanczos  always Lanczos3: sharpest thin text, several times slower
+image_filter = "auto"
+
 # OCR engine used for screenshots/documents.
 # - off    never run OCR
 # - llm    reuse the vision model (fast, lower recall)
@@ -190,6 +196,8 @@ pub const DEFAULT_IMAGE_MAX_SIDE: u32 = 1024;
 pub const DEFAULT_DEDUPE_DHASH_DISTANCE: u32 = 6;
 /// Upper bound accepted from `settings.toml`; beyond this bursts collapse.
 pub const MAX_DEDUPE_DHASH_DISTANCE: u32 = 16;
+/// Default resampler for the image handed to the model.
+pub const DEFAULT_IMAGE_FILTER: ImageFilter = ImageFilter::Auto;
 /// Smallest accepted longest-side. Below this the model starts losing small subjects.
 pub const MIN_IMAGE_MAX_SIDE: u32 = 640;
 /// Largest accepted longest-side. Above this Ollama caps image tokens anyway.
@@ -218,6 +226,43 @@ impl PromptProfile {
         match raw.trim().to_ascii_lowercase().as_str() {
             "concise" | "short" => Some(PromptProfile::Concise),
             "detailed" | "full" => Some(PromptProfile::Detailed),
+            _ => None,
+        }
+    }
+}
+
+/// Resampling kernel used to downscale the image handed to the vision model.
+///
+/// Measured on a 174-file SMB library: `prepare` cost 606 ms/file with
+/// Lanczos3, while the thumbnail (same resize + encode, box filter) cost 300 ms.
+/// Lanczos is sharpest for thin text; the box filter is an area average, which
+/// is what a 4× downscale of a photo actually needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageFilter {
+    /// Box for photos (JPEG/HEIC), Lanczos3 for screenshot/document formats.
+    Auto,
+    /// Always area-average (`imageops::thumbnail`).
+    Box,
+    /// Always Lanczos3.
+    Lanczos,
+}
+
+impl ImageFilter {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ImageFilter::Auto => "auto",
+            ImageFilter::Box => "box",
+            ImageFilter::Lanczos => "lanczos",
+        }
+    }
+
+    /// Accepts the values exposed in `settings.toml`.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(ImageFilter::Auto),
+            "box" | "area" | "thumbnail" => Some(ImageFilter::Box),
+            "lanczos" | "lanczos3" => Some(ImageFilter::Lanczos),
             _ => None,
         }
     }
@@ -294,6 +339,8 @@ pub struct RuntimeSettings {
     /// Longest side of the image handed to the model. `0` = original bytes.
     pub image_max_side: u32,
     pub prompt_profile: PromptProfile,
+    /// Resampler used when downscaling the image for the model.
+    pub image_filter: ImageFilter,
     pub ocr_engine: OcrEngine,
     /// Behaviour when opening a folder that is already indexed.
     pub startup_scan: StartupScan,
@@ -308,6 +355,7 @@ impl Default for RuntimeSettings {
             model_override: None,
             image_max_side: DEFAULT_IMAGE_MAX_SIDE,
             prompt_profile: PromptProfile::Concise,
+            image_filter: DEFAULT_IMAGE_FILTER,
             ocr_engine: OcrEngine::Llm,
             startup_scan: StartupScan::Ask,
             dedupe_dhash_distance: DEFAULT_DEDUPE_DHASH_DISTANCE,
@@ -400,6 +448,15 @@ fn parse_runtime_settings(data: &str) -> AppResult<RuntimeSettings> {
                     ),
                 }
             }
+            "image_filter" => {
+                let parsed = parse_settings_string(value.trim())?;
+                match ImageFilter::parse(&parsed) {
+                    Some(v) => settings.image_filter = v,
+                    None => log::warn!(
+                        "settings.toml: ignoring image_filter '{parsed}' (expected: auto | box | lanczos)"
+                    ),
+                }
+            }
             "ocr_engine" => {
                 let parsed = parse_settings_string(value.trim())?;
                 match OcrEngine::parse(&parsed) {
@@ -450,6 +507,7 @@ pub fn save_runtime_settings(settings: &RuntimeSettings) -> AppResult<()> {
         "model_override",
         "image_max_side",
         "prompt_profile",
+        "image_filter",
         "ocr_engine",
         "startup_scan",
         "dedupe_dhash_distance",
@@ -473,6 +531,13 @@ pub fn save_runtime_settings(settings: &RuntimeSettings) -> AppResult<()> {
         format!(
             "prompt_profile = {}",
             serde_json::json!(settings.prompt_profile.as_str())
+        ),
+    );
+    replacements.insert(
+        "image_filter",
+        format!(
+            "image_filter = {}",
+            serde_json::json!(settings.image_filter.as_str())
         ),
     );
     replacements.insert(
@@ -799,6 +864,7 @@ mod tests {
             model_override: Some("qwen2.5vl:3b".to_string()),
             image_max_side: 768,
             prompt_profile: PromptProfile::Detailed,
+            image_filter: ImageFilter::Box,
             ocr_engine: OcrEngine::Off,
             startup_scan: StartupScan::ClassifyOnly,
             dedupe_dhash_distance: 4,
@@ -811,6 +877,7 @@ mod tests {
         assert!(text.contains("model_override = \"qwen2.5vl:3b\""));
         assert!(text.contains("image_max_side = 768"));
         assert!(text.contains("prompt_profile = \"detailed\""));
+        assert!(text.contains("image_filter = \"box\""));
         assert!(text.contains("ocr_engine = \"off\""));
         assert!(text.contains("startup_scan = \"classify_only\""));
 

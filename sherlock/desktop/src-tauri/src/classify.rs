@@ -466,11 +466,15 @@ fn classify_primary(model: &str, prepared: &PreparedImage, profile: PromptProfil
 }
 
 /// Result of one real first-pass request, used to calibrate the pre-scan estimate.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ProbeResult {
     pub ok: bool,
     pub wall_s: f64,
     pub timings: crate::llm::OllamaTimings,
+    /// Raw response body. Production only reads the timings; the cost bench keeps
+    /// it to compare two resampling kernels on the same image.
+    #[allow(dead_code)]
+    pub raw: String,
 }
 
 /// Run the production first-pass request once and report how long it took.
@@ -506,6 +510,7 @@ pub fn probe_primary(model: &str, prepared: &PreparedImage, profile: PromptProfi
         ok: resp.ok,
         wall_s,
         timings: resp.timings,
+        raw: resp.raw,
     }
 }
 
@@ -792,7 +797,13 @@ pub fn classify_image(
     // `vision_prep`, which downscales and applies EXIF orientation once so every
     // stage below reuses the same bytes instead of re-encoding per attempt.
     let frame_source = first_frame_if_gif(image_path, tmp_dir);
-    let prepared = match vision_prep::prepare(&frame_source, vision.image_max_side, tmp_dir) {
+    let prepared =
+        match vision_prep::prepare_with(
+            &frame_source,
+            vision.image_max_side,
+            tmp_dir,
+            vision.image_filter,
+        ) {
         Ok(p) => p,
         Err(e) => {
             log::warn!(
@@ -995,7 +1006,12 @@ pub fn classify_video(
     // downscale treatment as photos: it reuses `prepared_frame` for the anime
     // enrichment pass below instead of re-reading the file.
     let prepared_frame = keyframes.first().and_then(|frame| {
-        match vision_prep::prepare(frame, vision.image_max_side, &video_tmp) {
+        match vision_prep::prepare_with(
+            frame,
+            vision.image_max_side,
+            &video_tmp,
+            vision.image_filter,
+        ) {
             Ok(p) => Some(p),
             Err(e) => {
                 log::warn!("cannot prepare keyframe {}: {e}", frame.display());
@@ -1197,7 +1213,12 @@ pub fn classify_pdf(
                 log::warn!("Failed to save PDF page for classification: {e}");
                 None
             } else {
-                match vision_prep::prepare(&tmp_img_path, vision.image_max_side, tmp_dir) {
+                match vision_prep::prepare_with(
+                    &tmp_img_path,
+                    vision.image_max_side,
+                    tmp_dir,
+                    vision.image_filter,
+                ) {
                     Ok(p) => Some(p),
                     Err(e) => {
                         log::warn!("Failed to prepare PDF page for classification: {e}");
@@ -1542,6 +1563,7 @@ mod tests {
         let vision = crate::models::VisionSettings {
             image_max_side: 1024,
             prompt_profile: PromptProfile::Concise,
+            image_filter: crate::config::ImageFilter::Auto,
             // Surya needs a provisioned venv; keep the smoke test self-contained.
             ocr_engine: OcrEngine::Off,
         };

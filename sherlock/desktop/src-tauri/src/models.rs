@@ -362,6 +362,8 @@ pub struct ScanContext {
     /// Longest side of the image sent to the model (`0` = original bytes).
     pub image_max_side: u32,
     pub prompt_profile: crate::config::PromptProfile,
+    /// Resampler used when downscaling the image for the model.
+    pub image_filter: crate::config::ImageFilter,
     pub ocr_engine: crate::config::OcrEngine,
     pub pdfium_lib_path: std::path::PathBuf,
     /// Hamming distance under which two photos are treated as the same picture
@@ -383,6 +385,7 @@ impl ScanContext {
         VisionSettings {
             image_max_side: self.image_max_side,
             prompt_profile: self.prompt_profile,
+            image_filter: self.image_filter,
             ocr_engine: self.ocr_engine,
         }
     }
@@ -394,6 +397,7 @@ impl ScanContext {
 pub struct VisionSettings {
     pub image_max_side: u32,
     pub prompt_profile: crate::config::PromptProfile,
+    pub image_filter: crate::config::ImageFilter,
     pub ocr_engine: crate::config::OcrEngine,
 }
 
@@ -403,6 +407,7 @@ impl Default for VisionSettings {
         Self {
             image_max_side: defaults.image_max_side,
             prompt_profile: defaults.prompt_profile,
+            image_filter: defaults.image_filter,
             ocr_engine: defaults.ocr_engine,
         }
     }

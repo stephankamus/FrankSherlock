@@ -10,7 +10,6 @@
 > `thumb_path` morto no scan, dedupe por fingerprint/dhash com hardlink, move
 > detection que não rouba a linha de cópias byte-idênticas, `[search_debug]` em
 > `debug` e o comando `repair_thumbnails` com botão na sidebar.
->>>>> REPLACE
 
 ## 0. Sintoma medido (banco real do usuário)
 

@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 
@@ -161,6 +162,7 @@ pub fn generate_thumbnail(
 
     let effective_path = first_frame_if_gif(source_path);
 
+    let decode_started = Instant::now();
     let img = match image::open(&effective_path) {
         Ok(img) => img,
         Err(e) => {
@@ -175,19 +177,31 @@ pub fn generate_thumbnail(
     // Apply EXIF orientation so thumbnails match the preview display
     let orientation = crate::exif::extract_orientation(source_path);
     let img = crate::exif::apply_orientation(img, orientation);
+    let decode_ms = decode_started.elapsed().as_millis();
 
+    let dhash_started = Instant::now();
     let dhash = compute_dhash(&img);
+    let dhash_ms = dhash_started.elapsed().as_millis();
 
     // Images that already fit are kept as-is (just re-encoded as JPEG).
     let resized = downscale(img, 300);
 
     let rgb = resized.to_rgb8();
     let mut buf = std::io::Cursor::new(Vec::new());
+    let encode_started = Instant::now();
     let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 80);
     if let Err(e) = rgb.write_with_encoder(encoder) {
         log::warn!("Failed to encode thumbnail: {e}");
         return None;
     }
+    // Phase 0 of `plans/pipeline-cpu-gpu-overlap.md`: `vision_prep::prepare`
+    // decodes this same file again a moment later in a scan. These numbers are
+    // the thumbnail half of the duplicate cost.
+    log::debug!(
+        "thumbnail {}: decode={decode_ms}ms dhash={dhash_ms}ms encode={}ms",
+        source_path.display(),
+        encode_started.elapsed().as_millis()
+    );
 
     if let Err(e) = std::fs::write(&thumb_path, buf.into_inner()) {
         log::warn!("Failed to write thumbnail {}: {e}", thumb_path.display());

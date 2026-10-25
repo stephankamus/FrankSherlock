@@ -18,6 +18,9 @@ mod video_server;
 mod vision_estimate;
 mod vision_prep;
 
+#[cfg(test)]
+mod bench_cost;
+
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1830,6 +1833,7 @@ fn vision_settings_from_config() -> models::VisionSettings {
     models::VisionSettings {
         image_max_side: settings.image_max_side,
         prompt_profile: settings.prompt_profile,
+        image_filter: settings.image_filter,
         ocr_engine: settings.ocr_engine,
     }
 }
@@ -1858,6 +1862,7 @@ fn build_scan_context(app_state: &AppState, app_handle: &tauri::AppHandle) -> mo
         model: model_selection.scan_model,
         image_max_side: vision.image_max_side,
         prompt_profile: vision.prompt_profile,
+        image_filter: vision.image_filter,
         ocr_engine: vision.ocr_engine,
         pdfium_lib_path,
         dedupe_dhash_distance: runtime.dedupe_dhash_distance,

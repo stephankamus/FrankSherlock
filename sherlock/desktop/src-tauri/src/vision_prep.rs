@@ -11,8 +11,9 @@
 
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
-use crate::config::RuntimeSettings;
+use crate::config::{ImageFilter, RuntimeSettings};
 use crate::error::{AppError, AppResult};
 
 /// JPEG quality used for the downscaled copy. High enough that small text in
@@ -64,12 +65,53 @@ pub fn image_dimensions(path: &Path) -> AppResult<(u32, u32)> {
     })
 }
 
+/// Prepare `source` for the vision model with the default kernel policy.
+///
+/// Callers that carry [`crate::models::VisionSettings`] use [`prepare_with`] so
+/// the user's `image_filter` is honoured; this wrapper exists for tests and for
+/// any future caller that has no settings at hand.
+#[allow(dead_code)]
+pub fn prepare(source: &Path, max_side: u32, tmp_dir: &Path) -> AppResult<PreparedImage> {
+    prepare_with(source, max_side, tmp_dir, ImageFilter::Auto)
+}
+
+/// True when `filter` resolves to the area-average kernel for this file.
+///
+/// `Auto` picks Lanczos only for the formats that are usually screenshots or
+/// documents, where thin text benefits from a sharpening kernel. Photos are
+/// dominated by chroma noise, and a 3–4× downscale is exactly what an area
+/// average is for. Measured on a 174-file SMB library, `prepare` cost
+/// 606 ms/file with Lanczos3 against 300 ms for the thumbnail, which does the
+/// same resize + encode with the box filter.
+pub fn prefers_box(source: &Path, filter: ImageFilter) -> bool {
+    match filter {
+        ImageFilter::Box => true,
+        ImageFilter::Lanczos => false,
+        ImageFilter::Auto => !is_text_like(source),
+    }
+}
+
+fn is_text_like(source: &Path) -> bool {
+    source
+        .extension()
+        .map(|ext| {
+            let ext = ext.to_string_lossy().to_ascii_lowercase();
+            matches!(ext.as_str(), "png" | "bmp" | "tif" | "tiff")
+        })
+        .unwrap_or(false)
+}
+
 /// Prepare `source` for the vision model.
 ///
 /// Fast paths (no re-encode, no temp file):
 /// - `max_side == 0` (user asked for originals)
 /// - source is a JPEG that already fits within `max_side` and needs no rotation
-pub fn prepare(source: &Path, max_side: u32, tmp_dir: &Path) -> AppResult<PreparedImage> {
+pub fn prepare_with(
+    source: &Path,
+    max_side: u32,
+    tmp_dir: &Path,
+    filter: ImageFilter,
+) -> AppResult<PreparedImage> {
     let max_side = RuntimeSettings::normalize_image_max_side(max_side);
     let original_bytes = std::fs::metadata(source).map(|m| m.len()).unwrap_or(0);
     let (src_w, src_h) = image_dimensions(source)?;
@@ -109,27 +151,47 @@ pub fn prepare(source: &Path, max_side: u32, tmp_dir: &Path) -> AppResult<Prepar
         });
     }
 
+    let decode_started = Instant::now();
     let decoded = image::open(source)
         .map_err(|e| AppError::Config(format!("cannot decode {}: {e}", source.display())))?;
     let decoded = crate::exif::apply_orientation(decoded, orientation);
+    let decode_ms = decode_started.elapsed().as_millis();
 
+    let box_filter = prefers_box(source, filter);
     let (w, h) = (decoded.width(), decoded.height());
+    let resize_started = Instant::now();
     let resized = if w.max(h) > max_side {
         let scale = max_side as f64 / w.max(h) as f64;
         let new_w = ((w as f64 * scale).round() as u32).max(1);
         let new_h = ((h as f64 * scale).round() as u32).max(1);
-        decoded.resize(new_w, new_h, image::imageops::FilterType::Lanczos3)
+        if box_filter {
+            image::DynamicImage::ImageRgba8(image::imageops::thumbnail(&decoded, new_w, new_h))
+        } else {
+            decoded.resize(new_w, new_h, image::imageops::FilterType::Lanczos3)
+        }
     } else {
         decoded
     };
+    let resize_ms = resize_started.elapsed().as_millis();
 
     let (out_w, out_h) = (resized.width(), resized.height());
-    let out_path = tmp_path(source, max_side, tmp_dir)?;
+    let out_path = tmp_path(source, max_side, tmp_dir, box_filter)?;
+    let encode_started = Instant::now();
     let rgb = resized.to_rgb8();
     let mut file = std::fs::File::create(&out_path)?;
     let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut file, JPEG_QUALITY);
     rgb.write_with_encoder(encoder)
         .map_err(|e| AppError::Config(format!("cannot encode {}: {e}", out_path.display())))?;
+    let encode_ms = encode_started.elapsed().as_millis();
+
+    // Phase 0 of `plans/pipeline-cpu-gpu-overlap.md`: this decode repeats the one
+    // `thumbnail::generate_thumbnail` already did for the same file, and a scan
+    // runs both. The split is what tells us how much a shared decode would save.
+    log::debug!(
+        "vision_prep {}: {w}x{h} -> {out_w}x{out_h} filter={} decode={decode_ms}ms resize={resize_ms}ms encode={encode_ms}ms",
+        source.display(),
+        if box_filter { "box" } else { "lanczos3" }
+    );
 
     let prepared_bytes = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
     Ok(PreparedImage {
@@ -143,9 +205,15 @@ pub fn prepare(source: &Path, max_side: u32, tmp_dir: &Path) -> AppResult<Prepar
     })
 }
 
-/// Stable temp path for a (source, max_side) pair so repeated calls inside one
-/// scan reuse the same file instead of spraying the temp directory.
-fn tmp_path(source: &Path, max_side: u32, tmp_dir: &Path) -> AppResult<PathBuf> {
+/// Stable temp path for a (source, max_side, kernel) tuple so repeated calls
+/// inside one scan reuse the same file instead of spraying the temp directory,
+/// and two kernels never resolve to the same file.
+fn tmp_path(
+    source: &Path,
+    max_side: u32,
+    tmp_dir: &Path,
+    box_filter: bool,
+) -> AppResult<PathBuf> {
     let meta = std::fs::metadata(source)
         .map_err(|e| AppError::Config(format!("cannot stat {}: {e}", source.display())))?;
     let mtime = meta
@@ -160,6 +228,7 @@ fn tmp_path(source: &Path, max_side: u32, tmp_dir: &Path) -> AppResult<PathBuf> 
     meta.len().hash(&mut hasher);
     mtime.hash(&mut hasher);
     max_side.hash(&mut hasher);
+    box_filter.hash(&mut hasher);
     let hash = hasher.finish();
 
     std::fs::create_dir_all(tmp_dir)?;
@@ -248,6 +317,40 @@ mod tests {
         };
         assert!(!path.exists(), "temp copy must be cleaned up");
         assert!(src.exists(), "source must never be touched");
+    }
+
+    #[test]
+    fn auto_picks_box_for_photos_and_lanczos_for_screenshots() {
+        assert!(prefers_box(Path::new("photo.jpg"), ImageFilter::Auto));
+        assert!(!prefers_box(Path::new("shot.png"), ImageFilter::Auto));
+        assert!(!prefers_box(Path::new("scan.tiff"), ImageFilter::Auto));
+        assert!(prefers_box(Path::new("shot.png"), ImageFilter::Box));
+        assert!(!prefers_box(Path::new("photo.jpg"), ImageFilter::Lanczos));
+    }
+
+    /// Both kernels must land on the same geometry and never share a temp file,
+    /// so a `BENCH_QUALITY` comparison really compares the kernels.
+    #[test]
+    fn box_and_lanczos_agree_on_size_but_not_on_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("big.png");
+        RgbImage::from_fn(2000, 1500, |x, y| Rgb([(x % 256) as u8, (y % 256) as u8, 90]))
+            .save(&src)
+            .expect("save png");
+        let tmp = dir.path().join("tmp");
+
+        let boxed = prepare_with(&src, 1024, &tmp, ImageFilter::Box).expect("box");
+        let lanczos = prepare_with(&src, 1024, &tmp, ImageFilter::Lanczos).expect("lanczos");
+
+        assert_eq!((boxed.width, boxed.height), (1024, 768));
+        assert_eq!(
+            (boxed.width, boxed.height),
+            (lanczos.width, lanczos.height)
+        );
+        assert_ne!(
+            boxed.path, lanczos.path,
+            "kernels must not resolve to the same temp file"
+        );
     }
 
     #[test]

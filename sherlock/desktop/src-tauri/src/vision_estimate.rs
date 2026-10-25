@@ -236,11 +236,12 @@ fn cache_path() -> Option<PathBuf> {
 
 fn cache_key(root: &Path, model: &str, settings: &VisionSettings, gpu_signature: &str) -> String {
     format!(
-        "{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}",
         root.display(),
         model,
         settings.image_max_side,
         settings.prompt_profile.as_str(),
+        settings.image_filter.as_str(),
         gpu_signature
     )
 }
@@ -313,7 +314,12 @@ pub fn estimate(
     let mut any_ok = false;
 
     for sample in &samples {
-        let prepared = match vision_prep::prepare(sample, settings.image_max_side, tmp_dir) {
+        let prepared = match vision_prep::prepare_with(
+            sample,
+            settings.image_max_side,
+            tmp_dir,
+            settings.image_filter,
+        ) {
             Ok(p) => p,
             Err(e) => {
                 log::warn!("estimate: cannot prepare {}: {e}", sample.display());
@@ -563,13 +569,19 @@ mod tests {
             prompt_profile: PromptProfile::Detailed,
             ..concise
         };
+        let boxed = VisionSettings {
+            image_filter: crate::config::ImageFilter::Box,
+            ..concise
+        };
         let k1 = cache_key(root, "qwen2.5vl:3b", &concise, "gpu-12gb");
         let k2 = cache_key(root, "qwen2.5vl:3b", &detailed, "gpu-12gb");
         let k3 = cache_key(root, "qwen2.5vl:7b", &concise, "gpu-12gb");
         let k4 = cache_key(root, "qwen2.5vl:3b", &concise, "gpu-8gb");
+        let k5 = cache_key(root, "qwen2.5vl:3b", &boxed, "gpu-12gb");
         assert_ne!(k1, k2);
         assert_ne!(k1, k3);
         assert_ne!(k1, k4);
+        assert_ne!(k1, k5, "changing the filter must invalidate the calibration");
     }
 
     #[test]

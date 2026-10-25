@@ -1820,6 +1820,7 @@ mod tests {
             model: "qwen2.5vl:7b".to_string(),
             image_max_side: vision.image_max_side,
             prompt_profile: vision.prompt_profile,
+            image_filter: vision.image_filter,
             ocr_engine: vision.ocr_engine,
             pdfium_lib_path: tmp.path().join("lib"),
             dedupe_dhash_distance: 0,

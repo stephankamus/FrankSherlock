@@ -160,3 +160,77 @@ python3 -u _bench_vision/bench_compare.py
   GPU saudável e `size_vram > 0`.
 - `load_duration` foi excluído das médias (modelo pré-aquecido); carregar o 7b do disco
   frio levou 50 s.
+
+## 7. Pipeline CPU/GPU — Fase 0 (medir antes de construir)
+
+Plano: [`plans/pipeline-cpu-gpu-overlap.md`](../plans/pipeline-cpu-gpu-overlap.md).
+Mede a duplicação atual — a thumbnail e `vision_prep::prepare` decodificam o **mesmo**
+arquivo duas vezes — e quanto custaria eliminá-la.
+
+```bash
+cd sherlock/desktop/src-tauri
+BENCH_ROOT=/caminho/da/raiz BENCH_LIMIT=200 BENCH_MODEL=qwen2.5vl:3b \
+  cargo test --release bench_cost_split -- --ignored --nocapture
+```
+
+Colunas por arquivo (ms): `read` (primeiro toque — o custo de I/O que o cache local não
+esconde), `decode` (decompressão pura, sem I/O), `dhash`, `thumb` (total), `prepare`
+(total), `request`, `prefill`, `decode_gpu` e `ollama_cpu` (`request − prefill − decode`,
+tudo em CPU dentro do Ollama).
+
+A unidade duplicada é **`read + decode`**: é o que o pipeline remove por arquivo.
+Registrar hardware, modelo, `image_max_side` e se a raiz é SMB ou disco local — o número
+não é transportável entre máquinas.
+
+| Data | Raiz | mídia | modelo | max_side | read | decode | thumb | prepare | request | ollama_cpu | duplicado / seq | veredito |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 2026-10-25 | `smb-share:...share=fotos/…/Baixa dos 2020` (GVFS) | SMB | — | 1024 | 22,1 | 10,2 | 76,6 | **195,4** | — | — | 32,3 / 272,0 (12 %) | só CPU; medir com modelo |
+| 2026-10-25 | `smb-share:...share=fotos/Fotos/2026/Ilha do Mangabal` (GVFS) | SMB | qwen2.5vl:3b | 1024 | 136,3 | 50,7 | 300,3 | **606,7** | 2105,6 | 1519,6 | 187,1 / 3012,6 (**6 %**) | teto do pipeline **26 %** |
+| — | — | — | — | — | — | — | — | — | — | — | — | pendente |
+
+Segunda rodada (174 arquivos, 1,41 MB de média, 16 vCPU, sem o app rodando):
+
+- **A ordem dos ganhos se inverteu.** O duplicado é 6 % do custo, mas o request tem
+  **1519,6 ms de CPU com a GPU ociosa** (prefill+decode = 586 ms). Adiantar thumb+prepare
+  nessa janela vale até **26 %** no total. O critério "duplicado ≥ 20 %" era o critério
+  errado: ele ignora a sobreposição, que é o objetivo da mudança.
+- **Viabilidade**: produtor = 907 ms (thumb+prepare) contra consumidor = 2105,6 ms por
+  arquivo. Um produtor entrega 2,3× mais rápido do que o consumidor consome. Não é cenário
+  de contenção.
+- **`prepare` = 20 % do total** (606,7 ms). É mais que o decode compartilhado e não depende
+  de concorrência: o filtro box da thumbnail custa uma fração do Lanczos3.
+- `image::open` (154,3) é 18 % **mais barato** que `read + load_from_memory` (187,1) neste
+  mount. O decode compartilhado deve decodificar via `image::open` uma vez e reusar o
+  `DynamicImage`, não "ler para memória".
+- `dhash` custa 81,3 ms sobre a imagem em resolução cheia.
+- **NEF não é lido**: os arquivos de 14 MB ficaram fora (`SUPPORTED_EXTS` não tem `.nef` e o
+  `image` não decodifica NEF). Com NEF no índice, o duplicado subiria para ~2,4 s/arquivo.
+
+### 7.1 Fase 0.5 — filtro do downscale (A/B, 6 arquivos, sem modelo)
+
+| Kernel | ms/arquivo |
+|---|---|
+| box (`imageops::thumbnail`) | **383,8** |
+| Lanczos3 (anterior) | 571,4 |
+| diferença | **−187,6 (−33 %)** |
+
+−6,2 % do custo total por arquivo medido acima, sem concorrência. Implementado como
+`settings.toml: image_filter = "auto" | "box" | "lanczos"`; `auto` usa box para JPEG/HEIC e
+Lanczos3 para PNG/BMP/TIFF.
+
+Pendente: `BENCH_QUALITY=1` (exige `BENCH_MODEL`) imprime as respostas dos dois kernels lado
+a lado — rodar em uma pasta de screenshots/texto fino antes de confiar no `auto` como padrão
+para documentos.
+
+Primeira rodada (3 arquivos, 0,24 MB cada, JPEG de WhatsApp):
+
+- `image::open` = 30,6 ms ≈ `read + decode` (95 %) — o `BufReader` do `image` **não** é um
+  problema no GVFS; a estratégia de leitura não precisa mudar.
+- `prepare` (195,4 ms) custa **2,5×** a thumbnail (76,6 ms) e **6×** o read+decode. O custo
+  não está no I/O nem no decode: é Lanczos3 + `to_rgb8` + encode q88 + o `stat`/EXIF extra
+  que o `prepare` faz por conta própria. A thumbnail usa o filtro box de `imageops::thumbnail`,
+  que é muito mais barato.
+- Sem `BENCH_MODEL` os percentuais são relativos só à CPU. Com o request de ~3,5 s (3b a
+  1024 px) o duplicado de 32 ms vira **~1 %** do custo por arquivo nesta classe de tamanho.
+- Conclusão preliminar: para JPEGs pequenos o pipeline não paga; o ganho mora nos arquivos
+  grandes (12–14 MP) e na **paralelização** da fase 2, que hoje usa 1 core.
