@@ -120,6 +120,45 @@ describe("Sidebar", () => {
     expect(onCompactDatabase).toHaveBeenCalled();
   });
 
+  it("shows thumbnail repair progress and offers cancellation", () => {
+    render(
+      <Sidebar
+        {...defaultProps}
+        roots={[sampleRoot]}
+        onRepairThumbnails={vi.fn()}
+        onCancelThumbRepair={vi.fn()}
+        thumbRepair={{
+          rootId: 1,
+          total: 32030,
+          processed: 1234,
+          repaired: 1200,
+          failed: 0,
+          startedAt: Math.floor(Date.now() / 1000) - 600,
+          phase: "repairing",
+          error: null,
+        }}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: /Repairing 1234\/32030/ })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /Cancel Repair/ })).toBeInTheDocument();
+  });
+
+  it("starts thumbnail repair when the button is clicked", async () => {
+    const onRepairThumbnails = vi.fn();
+    render(
+      <Sidebar
+        {...defaultProps}
+        roots={[sampleRoot]}
+        onRepairThumbnails={onRepairThumbnails}
+      />,
+    );
+
+    // No root selected → repair every root.
+    await userEvent.click(screen.getByRole("button", { name: /Repair Thumbnails/ }));
+    expect(onRepairThumbnails).toHaveBeenCalledWith(null);
+  });
+
   it("disables add button when setup not ready", () => {
     render(<Sidebar {...defaultProps} setupReady={false} />);
     const addBtn = screen.getByTitle("Add folder to scan");

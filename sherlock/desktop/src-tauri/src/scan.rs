@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -30,6 +30,10 @@ const SUPPORTED_EXTS: [&str; 20] = [
 /// Skip tiny images likely to be web icons, spacer GIFs, favicons, etc.
 /// 10 KB is roughly a 64x64 PNG or any icon-sized image.
 const MIN_IMAGE_SIZE_BYTES: u64 = 10_240;
+
+/// Threads used by the thumbnail repair pass. Decoding is CPU-bound and the share
+/// keeps up with a handful of parallel readers (measured: 13.5 -> 15 MB/s with 4).
+const REPAIR_WORKERS: usize = 4;
 
 /// File classification state determined during incremental discovery.
 #[derive(Debug)]
@@ -152,6 +156,10 @@ fn run_scan_job_internal(
     db::mark_root_online(db_path, job.root_id)?;
 
     let root_path = canonical_root_path(&job.root_path)?;
+    // One cache directory per root: `<thumbnails>/<root_key>`. Two roots covering
+    // the same tree used to share (and delete) each other's thumbnails.
+    let root_key = thumbnail::root_key(&job.root_path);
+    let thumb_dir = ctx.thumb_dir_for(&root_key);
 
     // Resuming classification must not pay for a full discovery walk again: on a
     // network share with tens of thousands of files that is the slowest part of
@@ -223,6 +231,38 @@ fn run_scan_job_internal(
     let walk_errors = discovery.walk_errors;
     let probes = discovery.probes;
 
+    // Thumbnail dedupe caches, seeded from rows that still have a thumbnail on disk.
+    let mut thumb_caches = ThumbCaches::seed(db_path, job.root_id)?;
+
+    // Rows the DB claims to have a thumbnail for, but the file is gone: the cache was
+    // wiped by a purge, an interrupted run, or a root removed and re-added. Unchanged
+    // files are never re-thumbnailed otherwise, so the pointer would stay dead forever.
+    let heal: HashSet<String> = probes
+        .iter()
+        .filter(|p| matches!(p.status, FileStatus::Unchanged))
+        .filter(|p| {
+            existing_by_path
+                .get(&p.rel_path)
+                .map(|e| match e.thumb_path.as_deref() {
+                    Some(tp) => !Path::new(tp).exists(),
+                    None => true,
+                })
+                .unwrap_or(false)
+        })
+        .map(|p| p.rel_path.clone())
+        .collect();
+    if !heal.is_empty() {
+        log::info!(
+            "Scan job {}: {} unchanged file(s) lost their thumbnail and will be regenerated",
+            job_id,
+            heal.len()
+        );
+    }
+
+    // A fingerprint match is only a move when the old path disappeared from the
+    // discovery; otherwise it is a byte-identical copy living beside the original.
+    let discovered: HashSet<&str> = probes.iter().map(|p| p.rel_path.as_str()).collect();
+
     // If cancelled during discovery, bail out
     if cancel_flag.is_some_and(|f| f.load(Ordering::Relaxed)) {
         db::cancel_scan_job(db_path, job_id)?;
@@ -236,6 +276,8 @@ fn run_scan_job_internal(
             unchanged: 0,
             deleted: 0,
             elapsed_ms: started.elapsed().as_millis() as u64,
+            healed: 0,
+            deduped: 0,
         });
     }
 
@@ -278,11 +320,13 @@ fn run_scan_job_internal(
         discovery_start.elapsed().as_secs_f64()
     );
 
-    let mut processed_files = job.processed_files.max(start_index as u64);
+    let mut processed_files = start_index as u64;
     let mut added = job.added;
     let mut modified = job.modified;
     let mut moved = job.moved;
     let mut unchanged = job.unchanged;
+    let mut healed: u64 = 0;
+    let mut deduped: u64 = 0;
     let mut used_moved_ids = HashSet::new();
     let mut last_cursor: Option<String> = job.cursor_rel_path.clone();
     let mut skipped_unreadable: u64 = 0;
@@ -307,10 +351,11 @@ fn run_scan_job_internal(
 
         if start_index > 0 {
             log::info!(
-                "Scan job {}: resuming thumbnailing from index {} (cursor: {:?})",
+                "Scan job {}: resuming thumbnailing from index {} (cursor: {:?}, {} previous progress)",
                 job_id,
                 start_index,
-                job.cursor_rel_path
+                job.cursor_rel_path,
+                job.processed_files
             );
         } else {
             log::info!("Scan job {}: starting thumbnailing from beginning", job_id);
@@ -323,6 +368,7 @@ fn run_scan_job_internal(
             .iter()
             .skip(start_index)
             .filter(|p| matches!(p.status, FileStatus::Unchanged))
+            .filter(|p| !heal.contains(&p.rel_path))
             .map(|p| p.rel_path.as_str())
             .collect();
         let unchanged_total = unchanged_paths.len() as u64;
@@ -350,9 +396,54 @@ fn run_scan_job_internal(
             unchanged,
         )?;
 
+        // Files before the resume cursor are never visited by the loop below, so a
+        // thumbnail lost in an earlier run would stay missing forever. Heal them first;
+        // the job cursor is left untouched so the resume position stays monotonic.
+        if start_index > 0 {
+            let pre_cursor: Vec<&FileProbe> = probes
+                .iter()
+                .take(start_index)
+                .filter(|p| heal.contains(&p.rel_path))
+                .collect();
+            if !pre_cursor.is_empty() {
+                log::info!(
+                    "Scan job {}: healing {} thumbnail(s) before the resume cursor",
+                    job_id,
+                    pre_cursor.len()
+                );
+            }
+            for probe in pre_cursor {
+                if cancel_flag.is_some_and(|f| f.load(Ordering::Relaxed)) {
+                    break;
+                }
+                let Some(fingerprint) = probe.fingerprint.clone() else {
+                    continue;
+                };
+                let thumb_result = thumbnail_only(
+                    ctx,
+                    &thumb_dir,
+                    probe,
+                    &fingerprint,
+                    true,
+                    false,
+                    &mut thumb_caches,
+                );
+                if let Some(ref thumb) = thumb_result.thumb_path {
+                    db::update_file_thumb_and_dhash(
+                        db_path,
+                        job.root_id,
+                        &probe.rel_path,
+                        thumb,
+                        thumb_result.dhash.map(|h| h as i64),
+                    )?;
+                }
+                healed += 1;
+            }
+        }
+
         // Phase 2: Thumbnailing loop — generate thumbnails for new/modified files
         for (i, probe) in probes.iter().enumerate().skip(start_index) {
-            if matches!(probe.status, FileStatus::Unchanged) {
+            if matches!(probe.status, FileStatus::Unchanged) && !heal.contains(&probe.rel_path) {
                 continue; // already flushed above
             }
 
@@ -369,6 +460,8 @@ fn run_scan_job_internal(
                         unchanged,
                         deleted: 0,
                         elapsed_ms: started.elapsed().as_millis() as u64,
+                        healed,
+                        deduped,
                     });
                 }
             }
@@ -429,9 +522,39 @@ fn run_scan_job_internal(
             };
 
             match probe.status {
-                FileStatus::Unchanged => unreachable!("filtered above"),
+                FileStatus::Unchanged => {
+                    // Only the thumbnail is missing: regenerate it and leave the
+                    // classification untouched (no EXIF re-read needed either).
+                    let thumb_result = thumbnail_only(
+                        ctx,
+                        &thumb_dir,
+                        probe,
+                        &fingerprint,
+                        true,
+                        false,
+                        &mut thumb_caches,
+                    );
+                    if let Some(ref thumb) = thumb_result.thumb_path {
+                        db::update_file_thumb_and_dhash(
+                            db_path,
+                            job.root_id,
+                            &probe.rel_path,
+                            thumb,
+                            thumb_result.dhash.map(|h| h as i64),
+                        )?;
+                    }
+                    healed += 1;
+                }
                 FileStatus::Modified => {
-                    let thumb_result = thumbnail_only(ctx, probe);
+                    let thumb_result = thumbnail_only(
+                        ctx,
+                        &thumb_dir,
+                        probe,
+                        &fingerprint,
+                        true,
+                        true,
+                        &mut thumb_caches,
+                    );
                     let record = probe_to_minimal_record(
                         job.root_id,
                         job.scan_marker,
@@ -461,7 +584,15 @@ fn run_scan_job_internal(
                             )?;
                             // Thumbnails are removed when a row is soft-deleted,
                             // so regenerate the ones that are gone.
-                            let thumb_result = thumbnail_only(ctx, probe);
+                            let thumb_result = thumbnail_only(
+                                ctx,
+                                &thumb_dir,
+                                probe,
+                                &fingerprint,
+                                false,
+                                true,
+                                &mut thumb_caches,
+                            );
                             if let Some(ref thumb) = thumb_result.thumb_path {
                                 db::update_file_thumb_path(
                                     db_path,
@@ -492,7 +623,12 @@ fn run_scan_job_internal(
                     // Check for move detection by fingerprint
                     if let Some(candidates) = by_fingerprint.get(&fingerprint) {
                         if let Some(candidate) = candidates.iter().find(|c| {
-                            !used_moved_ids.contains(&c.id) && c.rel_path != probe.rel_path
+                            !used_moved_ids.contains(&c.id)
+                                && c.rel_path != probe.rel_path
+                                // A byte-identical copy is not a move: the old path is
+                                // still on disk, so stealing its row would re-insert the
+                                // original with a blank classification.
+                                && !discovered.contains(c.rel_path.as_str())
                         }) {
                             used_moved_ids.insert(candidate.id);
                             moved += 1;
@@ -507,36 +643,23 @@ fn run_scan_job_internal(
                                 job.scan_marker,
                             )?;
 
-                            // Regenerate thumbnail at new path
-                            let abs = Path::new(&probe.abs_path);
-                            let thumb_result = if is_video(abs) {
-                                thumbnail::generate_video_thumbnail(
-                                    abs,
-                                    &ctx.thumbnails_dir,
-                                    &probe.rel_path,
-                                    &ctx.tmp_dir,
-                                )
-                            } else if is_pdf_file(abs) {
-                                thumbnail::generate_pdf_thumbnail(
-                                    abs,
-                                    &ctx.thumbnails_dir,
-                                    &probe.rel_path,
-                                    &ctx.pdfium_lib_path,
-                                    None,
-                                )
-                            } else {
-                                thumbnail::generate_thumbnail(
-                                    abs,
-                                    &ctx.thumbnails_dir,
-                                    &probe.rel_path,
-                                )
-                            };
-                            if let Some(ref tr) = thumb_result {
-                                db::update_file_thumb_path(
+                            // Regenerate thumbnail at the new path
+                            let thumb_result = thumbnail_only(
+                                ctx,
+                                &thumb_dir,
+                                probe,
+                                &fingerprint,
+                                true,
+                                false,
+                                &mut thumb_caches,
+                            );
+                            if let Some(ref tr) = thumb_result.thumb_path {
+                                db::update_file_thumb_and_dhash(
                                     db_path,
                                     job.root_id,
                                     &probe.rel_path,
-                                    &tr.path,
+                                    tr,
+                                    thumb_result.dhash.map(|h| h as i64),
                                 )?;
                             }
 
@@ -559,7 +682,15 @@ fn run_scan_job_internal(
                     }
 
                     // Genuinely new file — thumbnail only (classification deferred)
-                    let thumb_result = thumbnail_only(ctx, probe);
+                    let thumb_result = thumbnail_only(
+                        ctx,
+                        &thumb_dir,
+                        probe,
+                        &fingerprint,
+                        false,
+                        true,
+                        &mut thumb_caches,
+                    );
                     let record = probe_to_minimal_record(
                         job.root_id,
                         job.scan_marker,
@@ -621,6 +752,8 @@ fn run_scan_job_internal(
             unchanged,
             deleted: 0,
             elapsed_ms: started.elapsed().as_millis() as u64,
+            healed,
+            deduped,
         });
     }
 
@@ -662,6 +795,18 @@ fn run_scan_job_internal(
             classify_total
         );
 
+        // Photos that are visually identical to an already classified file inherit
+        // its classification instead of paying for another vision request.
+        let mut dedupe = DedupeIndex::seed(db_path, job.root_id, ctx.dedupe_dhash_distance)?;
+        if !dedupe.is_disabled() {
+            log::info!(
+                "Scan job {}: dedupe index seeded with {} classified hashes (max distance {})",
+                job_id,
+                dedupe.len(),
+                ctx.dedupe_dhash_distance
+            );
+        }
+
         for file in &unclassified {
             if let Some(flag) = cancel_flag {
                 if flag.load(Ordering::Relaxed) {
@@ -676,6 +821,8 @@ fn run_scan_job_internal(
                         unchanged,
                         deleted: 0,
                         elapsed_ms: started.elapsed().as_millis() as u64,
+                        healed,
+                        deduped,
                     });
                 }
             }
@@ -688,7 +835,19 @@ fn run_scan_job_internal(
                 }
             }
 
-            classify_and_update(ctx, file.id, &file.abs_path);
+            match dedupe.representative_for(file) {
+                Some(representative) => {
+                    if db::copy_classification(db_path, file.id, representative).is_ok() {
+                        deduped += 1;
+                    } else {
+                        classify_and_update(ctx, file.id, &file.abs_path);
+                    }
+                }
+                None => {
+                    classify_and_update(ctx, file.id, &file.abs_path);
+                    dedupe.remember(file);
+                }
+            }
 
             classify_processed += 1;
             last_cursor = Some(file.rel_path.clone());
@@ -707,9 +866,10 @@ fn run_scan_job_internal(
         }
 
         log::info!(
-            "Scan job {}: classification complete ({} files)",
+            "Scan job {}: classification complete ({} files, {} deduped)",
             job_id,
-            classify_total
+            classify_total,
+            deduped
         );
     }
 
@@ -734,7 +894,7 @@ fn run_scan_job_internal(
         let deleted_at_before = db::now_epoch_secs_pub();
         let deleted = db::mark_missing_as_deleted(db_path, job.root_id, job.scan_marker)?;
         if deleted > 0 {
-            cleanup_deleted_caches(db_path, job.root_id, deleted_at_before, &ctx.thumbnails_dir);
+            cleanup_deleted_caches(db_path, job.root_id, deleted_at_before, &thumb_dir);
         }
         deleted
     };
@@ -750,6 +910,8 @@ fn run_scan_job_internal(
         unchanged,
         deleted,
         elapsed_ms: started.elapsed().as_millis() as u64,
+        healed,
+        deduped,
     };
     db::complete_scan_job_by_id(db_path, job_id, &summary, last_cursor.as_deref())?;
     Ok(summary)
@@ -797,7 +959,10 @@ fn run_classify_only(
     )?;
 
     let mut processed: u64 = 0;
+    let mut deduped: u64 = 0;
     let mut last_cursor: Option<String> = None;
+
+    let mut dedupe = DedupeIndex::seed(db_path, job.root_id, ctx.dedupe_dhash_distance)?;
 
     for file in &pending {
         if let Some(flag) = cancel_flag {
@@ -813,11 +978,25 @@ fn run_classify_only(
                     unchanged: job.unchanged,
                     deleted: 0,
                     elapsed_ms: started.elapsed().as_millis() as u64,
+                    healed: 0,
+                    deduped,
                 });
             }
         }
 
-        classify_and_update(ctx, file.id, &file.abs_path);
+        match dedupe.representative_for(file) {
+            Some(representative) => {
+                if db::copy_classification(db_path, file.id, representative).is_ok() {
+                    deduped += 1;
+                } else {
+                    classify_and_update(ctx, file.id, &file.abs_path);
+                }
+            }
+            None => {
+                classify_and_update(ctx, file.id, &file.abs_path);
+                dedupe.remember(file);
+            }
+        }
         processed += 1;
         last_cursor = Some(file.rel_path.clone());
         db::checkpoint_scan_job(
@@ -844,6 +1023,8 @@ fn run_classify_only(
         unchanged: job.unchanged,
         deleted: 0,
         elapsed_ms: started.elapsed().as_millis() as u64,
+        healed: 0,
+        deduped,
     };
     db::touch_root_scan(db_path, job.root_id)?;
     db::complete_scan_job_by_id(db_path, job_id, &summary, last_cursor.as_deref())?;
@@ -866,11 +1047,129 @@ fn is_video(path: &Path) -> bool {
     video::is_video_file(path)
 }
 
+/// Thumbnails already produced during this job, used to avoid reading the source
+/// again when the library holds byte-identical (or visually identical) copies.
+#[derive(Default)]
+struct ThumbCaches {
+    /// Content fingerprint → (thumbnail, dhash) of a file already thumbnailed.
+    by_fingerprint: std::collections::HashMap<String, (PathBuf, Option<u64>)>,
+    /// dHash → thumbnail of a file already thumbnailed.
+    by_dhash: std::collections::HashMap<u64, PathBuf>,
+}
+
+impl ThumbCaches {
+    /// Seed from rows whose recorded thumbnail still exists on disk.
+    fn seed(db_path: &Path, root_id: i64) -> AppResult<Self> {
+        let mut caches = Self::default();
+        for (fingerprint, dhash, thumb) in db::list_thumb_cache_seed(db_path, root_id)? {
+            let path = PathBuf::from(&thumb);
+            if !path.exists() {
+                continue;
+            }
+            let hash = dhash.map(|h| h as u64);
+            if let Some(hash) = hash {
+                caches.by_dhash.entry(hash).or_insert_with(|| path.clone());
+            }
+            caches.by_fingerprint.insert(fingerprint, (path, hash));
+        }
+        Ok(caches)
+    }
+
+    fn remember(&mut self, fingerprint: &str, thumb: &Path, dhash: Option<u64>) {
+        if let Some(hash) = dhash {
+            self.by_dhash
+                .entry(hash)
+                .or_insert_with(|| thumb.to_path_buf());
+        }
+        self.by_fingerprint.insert(
+            fingerprint.to_string(),
+            (thumb.to_path_buf(), dhash),
+        );
+    }
+}
+
+/// Near-duplicate index used to skip vision requests during classification.
+struct DedupeIndex {
+    threshold: u32,
+    index: crate::similarity::DhashIndex,
+}
+
+impl DedupeIndex {
+    fn seed(db_path: &Path, root_id: i64, threshold: u32) -> AppResult<Self> {
+        let mut index = crate::similarity::DhashIndex::new();
+        if threshold > 0 {
+            for (id, dhash) in db::list_classified_dhashes(db_path, root_id)? {
+                index.insert(dhash as u64, id);
+            }
+        }
+        Ok(Self { threshold, index })
+    }
+
+    fn is_disabled(&self) -> bool {
+        self.threshold == 0
+    }
+
+    fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    /// Only still images have a stable perceptual hash: a video or PDF hashes a
+    /// single keyframe/page, so folding them would be guesswork.
+    fn eligible(file: &crate::models::UnclassifiedFile) -> Option<u64> {
+        match file.media_type.as_str() {
+            "photo" | "screenshot" => file.dhash.map(|h| h as u64),
+            _ => None,
+        }
+    }
+
+    fn representative_for(&self, file: &crate::models::UnclassifiedFile) -> Option<i64> {
+        let dhash = Self::eligible(file)?;
+        self.index.find_near(dhash, self.threshold)
+    }
+
+    fn remember(&mut self, file: &crate::models::UnclassifiedFile) {
+        if let Some(dhash) = Self::eligible(file) {
+            self.index.insert(dhash, file.id);
+        }
+    }
+}
+
 /// Generate thumbnail and extract EXIF (no LLM classification).
-fn thumbnail_only(ctx: &ScanContext, probe: &FileProbe) -> ThumbnailOnlyResult {
+///
+/// `force` regenerates even when the cache file exists (new/modified/moved/heal);
+/// `want_exif` is skipped for heals, whose row already stores the location.
+fn thumbnail_only(
+    ctx: &ScanContext,
+    thumb_dir: &Path,
+    probe: &FileProbe,
+    fingerprint: &str,
+    force: bool,
+    want_exif: bool,
+    caches: &mut ThumbCaches,
+) -> ThumbnailOnlyResult {
     let abs = Path::new(&probe.abs_path);
     let is_pdf = is_pdf_file(abs);
     let is_vid = is_video(abs);
+
+    // 1. Byte-identical file already thumbnailed: hard link it, the source is never
+    //    opened. This is the common case in libraries with duplicated albums.
+    if let Some((shared, dhash)) = caches.by_fingerprint.get(fingerprint).cloned() {
+        if let Some(tr) = thumbnail::reuse_thumbnail(&shared, dhash, thumb_dir, &probe.rel_path) {
+            // The copy carries its own EXIF, so the upsert must not overwrite
+            // `location_text` with an empty string.
+            let location_text = if want_exif && !is_pdf && !is_vid {
+                crate::exif::extract_location(abs).location_text
+            } else {
+                String::new()
+            };
+            return ThumbnailOnlyResult {
+                thumb_path: Some(tr.path),
+                location_text,
+                dhash: tr.dhash,
+            };
+        }
+        caches.by_fingerprint.remove(fingerprint);
+    }
 
     let pdf_password: Option<String> =
         if is_pdf && crate::pdf::is_password_protected(abs, &ctx.pdfium_lib_path) {
@@ -881,28 +1180,63 @@ fn thumbnail_only(ctx: &ScanContext, probe: &FileProbe) -> ThumbnailOnlyResult {
         };
 
     let thumb_result = if is_vid {
-        thumbnail::generate_video_thumbnail(abs, &ctx.thumbnails_dir, &probe.rel_path, &ctx.tmp_dir)
+        thumbnail::generate_video_thumbnail(abs, thumb_dir, &probe.rel_path, &ctx.tmp_dir, force)
     } else if is_pdf {
         thumbnail::generate_pdf_thumbnail(
             abs,
-            &ctx.thumbnails_dir,
+            thumb_dir,
             &probe.rel_path,
             &ctx.pdfium_lib_path,
             pdf_password.as_deref(),
+            force,
         )
     } else {
-        thumbnail::generate_thumbnail(abs, &ctx.thumbnails_dir, &probe.rel_path)
+        thumbnail::generate_thumbnail(abs, thumb_dir, &probe.rel_path, force)
     };
 
-    let exif_location: crate::exif::ExifLocation = if is_pdf || is_vid {
+    let Some(tr) = thumb_result else {
+        return ThumbnailOnlyResult {
+            thumb_path: None,
+            location_text: String::new(),
+            dhash: None,
+        };
+    };
+
+    // 2. Visually identical image already encoded: keep one JPEG on disk and give
+    //    this row its own hard link. The decode was unavoidable (the dHash comes
+    //    from it), but the second copy on disk is not.
+    let dhash = tr.dhash;
+    let thumb_path = match dhash {
+        Some(hash) => {
+            let linked = caches
+                .by_dhash
+                .get(&hash)
+                .cloned()
+                .and_then(|shared| {
+                    thumbnail::reuse_thumbnail(&shared, Some(hash), thumb_dir, &probe.rel_path)
+                });
+            match linked {
+                Some(linked) => Some(linked.path),
+                None => {
+                    caches
+                        .by_dhash
+                        .entry(hash)
+                        .or_insert_with(|| PathBuf::from(&tr.path));
+                    Some(tr.path)
+                }
+            }
+        }
+        None => Some(tr.path),
+    };
+
+    if let Some(ref path) = thumb_path {
+        caches.remember(fingerprint, Path::new(path), dhash);
+    }
+
+    let exif_location: crate::exif::ExifLocation = if !want_exif || is_pdf || is_vid {
         Default::default()
     } else {
         crate::exif::extract_location(abs)
-    };
-
-    let (thumb_path, dhash) = match thumb_result {
-        Some(tr) => (Some(tr.path), tr.dhash),
-        None => (None, None),
     };
 
     ThumbnailOnlyResult {
@@ -1225,7 +1559,7 @@ fn collect_image_probes_incremental(
     })
 }
 
-fn cleanup_deleted_caches(db_path: &Path, root_id: i64, deleted_at: i64, thumbnails_dir: &Path) {
+fn cleanup_deleted_caches(db_path: &Path, root_id: i64, deleted_at: i64, thumb_dir: &Path) {
     let paths = match db::get_deleted_file_paths(db_path, root_id, deleted_at) {
         Ok(p) => p,
         Err(e) => {
@@ -1239,7 +1573,7 @@ fn cleanup_deleted_caches(db_path: &Path, root_id: i64, deleted_at: i64, thumbna
             let _ = std::fs::remove_file(&tp);
         }
         // Also try the expected path
-        let expected_thumb = thumbnails_dir.join(normalize_rel_path(
+        let expected_thumb = thumb_dir.join(normalize_rel_path(
             &Path::new(&rel_path).with_extension("jpg").to_string_lossy(),
         ));
         let _ = std::fs::remove_file(&expected_thumb);
@@ -1251,6 +1585,181 @@ fn cleanup_deleted_caches(db_path: &Path, root_id: i64, deleted_at: i64, thumbna
             let _ = std::fs::remove_file(cp);
         }
     }
+}
+
+/// Summary of a thumbnail repair pass.
+#[derive(Debug, Default, Clone)]
+pub struct ThumbRepairSummary {
+    pub scanned: u64,
+    pub repaired: u64,
+    pub failed: u64,
+    /// Rows skipped because their root is not reachable right now.
+    pub skipped: u64,
+}
+
+/// Repair order: still images and PDFs before videos.
+fn thumb_repair_rank(rel_path: &str) -> u8 {
+    let lower = rel_path.to_lowercase();
+    if video::is_video_file(Path::new(&lower)) {
+        2
+    } else if lower.ends_with(".pdf") {
+        1
+    } else {
+        0
+    }
+}
+
+/// Regenerate every thumbnail whose cache file is missing, without walking the
+/// share (a full discovery is the slowest part on a network mount).
+///
+/// `root_id = None` covers every root. `on_progress(processed, total, repaired,
+/// failed)` fires every 25 files, and the pass stops as soon as `cancel` is set.
+///
+/// Thumbnailing is CPU-bound (JPEG decode) and the pass is long, so the work is
+/// spread over [`REPAIR_WORKERS`] threads. Reads do not saturate the share, so the
+/// wall-clock gain is close to linear until the network becomes the limit.
+pub fn repair_missing_thumbnails(
+    ctx: &ScanContext,
+    root_id: Option<i64>,
+    cancel: &AtomicBool,
+    on_progress: impl Fn(u64, u64, u64, u64) + Sync,
+) -> AppResult<ThumbRepairSummary> {
+    let mut summary = ThumbRepairSummary::default();
+    let root_paths = db::list_root_paths(&ctx.db_path)?;
+
+    let mut by_root: HashMap<i64, Vec<db::ThumbRepairRow>> = HashMap::new();
+    for row in db::list_thumb_repair_rows(&ctx.db_path, root_id)? {
+        by_root.entry(row.root_id).or_default().push(row);
+    }
+
+    for (rid, rows) in by_root {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let Some(root_path) = root_paths
+            .iter()
+            .find(|(id, _)| *id == rid)
+            .map(|(_, path)| path.clone())
+        else {
+            summary.skipped += rows.len() as u64;
+            continue;
+        };
+        if !probe_dir(Path::new(&root_path), ROOT_PROBE_TIMEOUT).is_dir {
+            log::warn!("Thumbnail repair: root {root_path} is unreachable, skipping");
+            summary.skipped += rows.len() as u64;
+            continue;
+        }
+
+        let thumb_dir = ctx.thumb_dir_for(&thumbnail::root_key(&root_path));
+
+        let mut pending: Vec<db::ThumbRepairRow> = rows
+            .into_iter()
+            .filter(|row| match row.thumb_path.as_deref() {
+                Some(path) => !Path::new(path).exists(),
+                None => true,
+            })
+            .collect();
+        // Photos and PDFs first (cheap, and the bulk of the library); videos last,
+        // because ffmpeg has to seek through the whole file over the network.
+        pending.sort_by_key(|row| thumb_repair_rank(&row.rel_path));
+        let total = pending.len() as u64;
+        log::info!("Thumbnail repair: {total} file(s) of {root_path} need a thumbnail");
+
+        let processed = AtomicU64::new(0);
+        let repaired = AtomicU64::new(0);
+        let failed = AtomicU64::new(0);
+
+        if total > 0 {
+            // Contiguous blocks keep duplicates (which sit next to each other in
+            // rel_path order) inside the same worker, so its caches still fold them.
+            let workers = REPAIR_WORKERS.min(pending.len()).max(1);
+            let block = pending.len().div_ceil(workers);
+            let processed = &processed;
+            let repaired = &repaired;
+            let failed = &failed;
+            let on_progress = &on_progress;
+            let thumb_dir: &Path = &thumb_dir;
+            std::thread::scope(|scope| {
+                for chunk in pending.chunks(block) {
+                    scope.spawn(move || {
+                        let mut caches = match ThumbCaches::seed(&ctx.db_path, rid) {
+                            Ok(caches) => caches,
+                            Err(e) => {
+                                log::warn!("Thumbnail repair: cache seed failed: {e}");
+                                ThumbCaches::default()
+                            }
+                        };
+                        for row in chunk {
+                            if cancel.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            let probe = FileProbe {
+                                rel_path: row.rel_path.clone(),
+                                abs_path: row.abs_path.clone(),
+                                filename: crate::platform::paths::rel_path_filename(&row.rel_path)
+                                    .to_string(),
+                                mtime_ns: 0,
+                                size_bytes: 0,
+                                fingerprint: Some(row.fingerprint.clone()),
+                                status: FileStatus::Modified,
+                            };
+                            let result = thumbnail_only(
+                                ctx,
+                                thumb_dir,
+                                &probe,
+                                &row.fingerprint,
+                                true,
+                                false,
+                                &mut caches,
+                            );
+                            let stored = match result.thumb_path {
+                                Some(path) => db::update_file_thumb_and_dhash(
+                                    &ctx.db_path,
+                                    rid,
+                                    &row.rel_path,
+                                    &path,
+                                    result.dhash.map(|h| h as i64),
+                                )
+                                .map(|_| true),
+                                None => db::clear_thumb_path(&ctx.db_path, row.id).map(|_| false),
+                            };
+                            match stored {
+                                Ok(true) => {
+                                    repaired.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Ok(false) => {
+                                    failed.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "Thumbnail repair: could not record {}: {e}",
+                                        row.rel_path
+                                    );
+                                    failed.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            let done = processed.fetch_add(1, Ordering::Relaxed) + 1;
+                            if done % 25 == 0 {
+                                on_progress(
+                                    done,
+                                    total,
+                                    repaired.load(Ordering::Relaxed),
+                                    failed.load(Ordering::Relaxed),
+                                );
+                            }
+                        }
+                    });
+                }
+            });
+        }
+
+        summary.scanned += processed.load(Ordering::Relaxed);
+        summary.repaired += repaired.load(Ordering::Relaxed);
+        summary.failed += failed.load(Ordering::Relaxed);
+        on_progress(summary.scanned, total, summary.repaired, summary.failed);
+    }
+
+    Ok(summary)
 }
 
 fn fingerprint_file(path: &Path, size: u64) -> AppResult<String> {
@@ -1313,7 +1822,172 @@ mod tests {
             prompt_profile: vision.prompt_profile,
             ocr_engine: vision.ocr_engine,
             pdfium_lib_path: tmp.path().join("lib"),
+            dedupe_dhash_distance: 0,
         }
+    }
+
+    /// Context whose thumbnail cache lives in a caller-owned directory.
+    fn scan_context_with_cache(db_path: &Path, cache_dir: &Path) -> ScanContext {
+        let mut ctx = make_scan_context(db_path);
+        ctx.thumbnails_dir = cache_dir.join("thumbs");
+        ctx
+    }
+
+    /// A real decodable image (`write_test_image` writes raw bytes `image` cannot open).
+    fn write_real_image(path: &Path) {
+        let img = image::RgbImage::from_fn(120, 90, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 90])
+        });
+        image::DynamicImage::ImageRgb8(img)
+            .save(path)
+            .expect("save image");
+    }
+
+    fn probe_for(rel: &str, abs: &str, fingerprint: &str) -> FileProbe {
+        FileProbe {
+            rel_path: rel.to_string(),
+            abs_path: abs.to_string(),
+            filename: crate::platform::paths::rel_path_filename(rel).to_string(),
+            mtime_ns: 1,
+            size_bytes: 1,
+            fingerprint: Some(fingerprint.to_string()),
+            status: FileStatus::New,
+        }
+    }
+
+    /// A byte-identical copy must not be decoded again: the source is never opened
+    /// (the test points it at a nonexistent path on purpose).
+    #[test]
+    fn identical_content_reuses_thumbnail_without_reading_the_source() {
+        let root_dir = tempfile::tempdir().expect("root");
+        let db_dir = tempfile::tempdir().expect("dbdir");
+        let cache_dir = tempfile::tempdir().expect("cache");
+        let db_path = db_dir.path().join("index.sqlite");
+        db::init_database(&db_path).expect("init");
+        let ctx = scan_context_with_cache(&db_path, cache_dir.path());
+        let thumb_dir = ctx.thumbnails_dir.clone();
+
+        let image = root_dir.path().join("a.png");
+        write_real_image(&image);
+
+        let mut caches = ThumbCaches::default();
+        let first = probe_for("a.png", &image.display().to_string(), "fp-a");
+        let out1 = thumbnail_only(&ctx, &thumb_dir, &first, "fp-a", false, true, &mut caches);
+        let thumb1 = out1.thumb_path.clone().expect("first thumbnail");
+        let dhash1 = out1.dhash.expect("first hash");
+
+        let copy = probe_for("b/copy.png", "/nonexistent/copy.png", "fp-a");
+        let out2 = thumbnail_only(&ctx, &thumb_dir, &copy, "fp-a", false, true, &mut caches);
+        let thumb2 = out2.thumb_path.clone().expect("reused thumbnail");
+
+        assert_eq!(out2.dhash, Some(dhash1));
+        assert_ne!(thumb1, thumb2);
+        assert!(Path::new(&thumb1).exists());
+        assert!(Path::new(&thumb2).exists());
+    }
+
+    /// The `Reparar thumbnails` path: rows whose cache file vanished get a fresh
+    /// thumbnail without any discovery walk.
+    #[test]
+    fn repair_regenerates_thumbnails_with_dead_paths() {
+        let root_dir = tempfile::tempdir().expect("root");
+        let db_dir = tempfile::tempdir().expect("dbdir");
+        let cache_dir = tempfile::tempdir().expect("cache");
+        let db_path = db_dir.path().join("index.sqlite");
+        db::init_database(&db_path).expect("init");
+        let root_path = root_dir.path().to_str().expect("path").to_string();
+        let root_id = db::upsert_root(&db_path, &root_path).expect("root");
+
+        let ctx = scan_context_with_cache(&db_path, cache_dir.path());
+        let thumb_dir = ctx.thumb_dir_for(&thumbnail::root_key(&root_path));
+
+        let image = root_dir.path().join("a.png");
+        write_real_image(&image);
+        let probe = probe_for("a.png", &image.display().to_string(), "fp-a");
+        let mut caches = ThumbCaches::default();
+        let thumb = thumbnail_only(&ctx, &thumb_dir, &probe, "fp-a", false, true, &mut caches);
+        let thumb_path = thumb.thumb_path.clone().expect("thumbnail");
+
+        let record = probe_to_minimal_record(root_id, 1, &probe, "fp-a", &thumb);
+        db::upsert_file_record(&db_path, &record).expect("insert");
+        db::update_file_thumb_path(&db_path, root_id, "a.png", &thumb_path).expect("pointer");
+
+        // Cache wiped (root purged, interrupted run, ...).
+        std::fs::remove_file(&thumb_path).expect("remove thumb");
+
+        let summary = repair_missing_thumbnails(
+            &ctx,
+            Some(root_id),
+            &AtomicBool::new(false),
+            |_, _, _, _| {},
+        )
+        .expect("repair");
+        assert_eq!(summary.repaired, 1);
+        assert_eq!(summary.failed, 0);
+        assert!(
+            Path::new(&thumb_path).exists(),
+            "thumbnail must be regenerated"
+        );
+    }
+
+    /// Only still images are folded; a video sharing the hash would be a guess.
+    #[test]
+    fn dedupe_index_only_matches_photos() {
+        let db_dir = tempfile::tempdir().expect("dbdir");
+        let db_path = db_dir.path().join("index.sqlite");
+        db::init_database(&db_path).expect("init");
+        let root_id = db::upsert_root(&db_path, "/tmp/dedupe").expect("root");
+        let id = db::upsert_file_record(
+            &db_path,
+            &crate::models::FileRecordUpsert {
+                root_id,
+                rel_path: "a.jpg".to_string(),
+                abs_path: "/tmp/dedupe/a.jpg".to_string(),
+                filename: "a.jpg".to_string(),
+                media_type: "photo".to_string(),
+                description: "beach".to_string(),
+                extracted_text: String::new(),
+                canonical_mentions: String::new(),
+                confidence: 0.8,
+                lang_hint: "en".to_string(),
+                mtime_ns: 1,
+                size_bytes: 1,
+                fingerprint: "fp".to_string(),
+                scan_marker: 1,
+                location_text: String::new(),
+                dhash: Some(42),
+                duration_secs: None,
+                video_width: None,
+                video_height: None,
+                video_codec: None,
+                audio_codec: None,
+            },
+        )
+        .expect("insert");
+
+        let dedupe = DedupeIndex::seed(&db_path, root_id, 6).expect("seed");
+        assert_eq!(dedupe.len(), 1);
+
+        let candidate = crate::models::UnclassifiedFile {
+            id: id + 1,
+            rel_path: "b.jpg".to_string(),
+            abs_path: "/tmp/dedupe/b.jpg".to_string(),
+            media_type: "photo".to_string(),
+            dhash: Some(44), // 2 bits away from 42
+        };
+        assert_eq!(dedupe.representative_for(&candidate), Some(id));
+
+        let video = crate::models::UnclassifiedFile {
+            media_type: "video".to_string(),
+            ..candidate.clone()
+        };
+        assert_eq!(dedupe.representative_for(&video), None);
+
+        let far = crate::models::UnclassifiedFile {
+            dhash: Some(0b111_1111_1111),
+            ..candidate
+        };
+        assert_eq!(dedupe.representative_for(&far), None);
     }
 
     /// An unreadable file must not abort the job: the scan completes and the

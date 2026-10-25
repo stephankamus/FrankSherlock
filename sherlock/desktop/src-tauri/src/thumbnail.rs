@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 use crate::platform::paths::normalize_rel_path;
 
 /// Result of thumbnail generation, including optional perceptual hash.
@@ -30,35 +32,123 @@ pub fn compute_dhash(img: &image::DynamicImage) -> u64 {
     hash
 }
 
+/// Downscale so the longest side is at most `max_dim`.
+///
+/// `imageops::thumbnail` is a box filter specialized for large downscales: on a
+/// 12-40 MP photo it is several times faster than `resize(.., Lanczos3)` and the
+/// difference is invisible at 300 px. Images that already fit are returned as-is.
+fn downscale(img: image::DynamicImage, max_dim: u32) -> image::DynamicImage {
+    let (w, h) = (img.width(), img.height());
+    if w <= max_dim && h <= max_dim {
+        return img;
+    }
+    let max_dim = max_dim.max(1);
+    let max_side = w.max(h).max(1);
+    let new_w = ((w as f64 * max_dim as f64 / max_side as f64).round() as u32).max(1);
+    let new_h = ((h as f64 * max_dim as f64 / max_side as f64).round() as u32).max(1);
+    image::DynamicImage::ImageRgba8(image::imageops::thumbnail(&img, new_w, new_h))
+}
+
+/// Downscale to an exact target size (PDF pages are already small).
+fn downscale_to(img: image::DynamicImage, new_w: u32, new_h: u32) -> image::DynamicImage {
+    image::DynamicImage::ImageRgba8(image::imageops::thumbnail(&img, new_w.max(1), new_h.max(1)))
+}
+
+/// Directory prefix of the thumbnail cache that belongs to one root.
+///
+/// Derived from the canonical root path instead of `root_id`: removing a root and
+/// adding it back reuses the cache, and two roots can never resolve to the same
+/// file — which is what allowed one root's purge to delete another root's
+/// thumbnails.
+pub fn root_key(root_path: &str) -> String {
+    let digest = Sha256::digest(normalize_rel_path(root_path).as_bytes());
+    hex::encode(digest)[..16].to_string()
+}
+
+/// Canonical path of the thumbnail for `rel_path` under `<thumbnails>/<root_key>`.
+pub fn thumb_path_for(thumbnails_dir: &Path, root_key: &str, rel_path: &str) -> PathBuf {
+    thumb_path_in(&thumbnails_dir.join(root_key), rel_path)
+}
+
+/// Thumbnail path for `rel_path` inside an already root-scoped directory.
+fn thumb_path_in(thumb_dir: &Path, rel_path: &str) -> PathBuf {
+    let stem = normalize_rel_path(&Path::new(rel_path).with_extension("jpg").to_string_lossy());
+    thumb_dir.join(stem)
+}
+
+/// Create `<thumb_dir>/<rel_path>.jpg` as a hard link to an existing thumbnail.
+///
+/// Used to deduplicate: byte-identical files never touch the source at all, and
+/// near-duplicates reuse the JPEG that was already encoded. Each row keeps its own
+/// path name (so deleting one row's thumbnail is safe) while the inode — and
+/// therefore the disk space — is shared.
+pub fn reuse_thumbnail(
+    shared: &Path,
+    dhash: Option<u64>,
+    thumb_dir: &Path,
+    rel_path: &str,
+) -> Option<ThumbnailResult> {
+    if !shared.exists() {
+        return None;
+    }
+    let thumb_path = thumb_path_in(thumb_dir, rel_path);
+    if thumb_path == shared {
+        // Already the same file: nothing to link.
+        return Some(ThumbnailResult {
+            path: thumb_path.display().to_string(),
+            dhash,
+        });
+    }
+    if let Some(parent) = thumb_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            log::warn!("Failed to create thumbnail dir {}: {e}", parent.display());
+            return None;
+        }
+    }
+    if thumb_path.exists() {
+        let _ = std::fs::remove_file(&thumb_path);
+    }
+    if let Err(link_err) = std::fs::hard_link(shared, &thumb_path) {
+        // Different filesystem (cache moved between devices) — copy instead.
+        if let Err(copy_err) = std::fs::copy(shared, &thumb_path) {
+            log::warn!(
+                "Failed to link thumbnail {} -> {}: {link_err} / {copy_err}",
+                shared.display(),
+                thumb_path.display()
+            );
+            return None;
+        }
+    }
+    Some(ThumbnailResult {
+        path: thumb_path.display().to_string(),
+        dhash,
+    })
+}
+
 /// Generate a thumbnail for the given source image.
 ///
 /// Returns a `ThumbnailResult` with the path and optional dHash, or `None`
-/// if generation fails. Skips regeneration if the thumbnail already exists
-/// and the source hasn't changed (in which case `dhash` will be `None`).
+/// if generation fails. When `force` is `false` and the thumbnail already exists
+/// it is reused without decoding anything (`dhash` is then `None`).
+///
+/// Validation never compares filesystem mtimes: SMB servers routinely report
+/// timestamps in the future, which made `thumb_mtime >= source_mtime` always fail
+/// and forced a full re-decode of the library on every scan. Whether the source
+/// changed is decided by the scan's own size+mtime discovery, which passes
+/// `force = true` for new/modified files only.
 pub fn generate_thumbnail(
     source_path: &Path,
     thumb_dir: &Path,
     rel_path: &str,
+    force: bool,
 ) -> Option<ThumbnailResult> {
-    let stem = normalize_rel_path(&Path::new(rel_path).with_extension("jpg").to_string_lossy());
-    let thumb_path = thumb_dir.join(&stem);
+    let thumb_path = thumb_path_in(thumb_dir, rel_path);
 
-    // Skip if thumbnail already exists and source mtime hasn't changed
-    if thumb_path.exists() {
-        let source_mtime = std::fs::metadata(source_path)
-            .ok()
-            .and_then(|m| m.modified().ok());
-        let thumb_mtime = std::fs::metadata(&thumb_path)
-            .ok()
-            .and_then(|m| m.modified().ok());
-        if let (Some(s), Some(t)) = (source_mtime, thumb_mtime) {
-            if t >= s {
-                return Some(ThumbnailResult {
-                    path: thumb_path.display().to_string(),
-                    dhash: None,
-                });
-            }
-        }
+    if !force && thumb_path.exists() {
+        return Some(ThumbnailResult {
+            path: thumb_path.display().to_string(),
+            dhash: None,
+        });
     }
 
     // Ensure parent directory exists
@@ -88,16 +178,8 @@ pub fn generate_thumbnail(
 
     let dhash = compute_dhash(&img);
 
-    let max_dim = 300u32;
-    let (w, h) = (img.width(), img.height());
-    let resized = if w > max_dim || h > max_dim {
-        let scale = max_dim as f64 / w.max(h) as f64;
-        let new_w = (w as f64 * scale).round() as u32;
-        let new_h = (h as f64 * scale).round() as u32;
-        img.resize(new_w, new_h, image::imageops::FilterType::Lanczos3)
-    } else {
-        img // Already small enough, just re-encode as JPEG
-    };
+    // Images that already fit are kept as-is (just re-encoded as JPEG).
+    let resized = downscale(img, 300);
 
     let rgb = resized.to_rgb8();
     let mut buf = std::io::Cursor::new(Vec::new());
@@ -125,26 +207,15 @@ pub fn generate_pdf_thumbnail(
     rel_path: &str,
     pdfium_lib: &Path,
     password: Option<&str>,
+    force: bool,
 ) -> Option<ThumbnailResult> {
-    let stem = normalize_rel_path(&Path::new(rel_path).with_extension("jpg").to_string_lossy());
-    let thumb_path = thumb_dir.join(&stem);
+    let thumb_path = thumb_path_in(thumb_dir, rel_path);
 
-    // Skip if thumbnail already exists and source mtime hasn't changed
-    if thumb_path.exists() {
-        let source_mtime = std::fs::metadata(pdf_path)
-            .ok()
-            .and_then(|m| m.modified().ok());
-        let thumb_mtime = std::fs::metadata(&thumb_path)
-            .ok()
-            .and_then(|m| m.modified().ok());
-        if let (Some(s), Some(t)) = (source_mtime, thumb_mtime) {
-            if t >= s {
-                return Some(ThumbnailResult {
-                    path: thumb_path.display().to_string(),
-                    dhash: None,
-                });
-            }
-        }
+    if !force && thumb_path.exists() {
+        return Some(ThumbnailResult {
+            path: thumb_path.display().to_string(),
+            dhash: None,
+        });
     }
 
     // Ensure parent directory exists
@@ -185,7 +256,7 @@ pub fn generate_pdf_thumbnail(
                 let target_w = 150u32;
                 let scale = target_w as f64 / img.width().max(1) as f64;
                 let new_h = (img.height() as f64 * scale).round() as u32;
-                let resized = img.resize(target_w, new_h, image::imageops::FilterType::Lanczos3);
+                let resized = downscale_to(img, target_w, new_h);
                 page_images.push(resized);
             }
             Err(e) => {
@@ -217,16 +288,7 @@ pub fn generate_pdf_thumbnail(
     };
 
     // Scale composite so longest side is 300px
-    let max_dim = 300u32;
-    let (w, h) = (composite.width(), composite.height());
-    let final_img = if w > max_dim || h > max_dim {
-        let scale = max_dim as f64 / w.max(h) as f64;
-        let new_w = (w as f64 * scale).round() as u32;
-        let new_h = (h as f64 * scale).round() as u32;
-        composite.resize(new_w, new_h, image::imageops::FilterType::Lanczos3)
-    } else {
-        composite
-    };
+    let final_img = downscale(composite, 300);
 
     let dhash = compute_dhash(&final_img);
 
@@ -259,26 +321,15 @@ pub fn generate_video_thumbnail(
     thumb_dir: &Path,
     rel_path: &str,
     tmp_dir: &Path,
+    force: bool,
 ) -> Option<ThumbnailResult> {
-    let stem = normalize_rel_path(&Path::new(rel_path).with_extension("jpg").to_string_lossy());
-    let thumb_path = thumb_dir.join(&stem);
+    let thumb_path = thumb_path_in(thumb_dir, rel_path);
 
-    // Skip if thumbnail already exists and source mtime hasn't changed
-    if thumb_path.exists() {
-        let source_mtime = std::fs::metadata(video_path)
-            .ok()
-            .and_then(|m| m.modified().ok());
-        let thumb_mtime = std::fs::metadata(&thumb_path)
-            .ok()
-            .and_then(|m| m.modified().ok());
-        if let (Some(s), Some(t)) = (source_mtime, thumb_mtime) {
-            if t >= s {
-                return Some(ThumbnailResult {
-                    path: thumb_path.display().to_string(),
-                    dhash: None,
-                });
-            }
-        }
+    if !force && thumb_path.exists() {
+        return Some(ThumbnailResult {
+            path: thumb_path.display().to_string(),
+            dhash: None,
+        });
     }
 
     // Ensure parent directory exists
@@ -299,7 +350,9 @@ pub fn generate_video_thumbnail(
     ));
     let _ = std::fs::create_dir_all(&video_tmp);
 
-    let frames = crate::video::extract_keyframes(video_path, &video_tmp, 3);
+    // Only the first non-black frame is used here, so ask for a single one: each
+    // extra frame is another ffmpeg seek + decode over the network.
+    let frames = crate::video::extract_keyframes(video_path, &video_tmp, 1);
     if frames.is_empty() {
         let _ = std::fs::remove_dir_all(&video_tmp);
         return None;
@@ -318,16 +371,7 @@ pub fn generate_video_thumbnail(
 
     let dhash = compute_dhash(&img);
 
-    let max_dim = 300u32;
-    let (w, h) = (img.width(), img.height());
-    let resized = if w > max_dim || h > max_dim {
-        let scale = max_dim as f64 / w.max(h) as f64;
-        let new_w = (w as f64 * scale).round() as u32;
-        let new_h = (h as f64 * scale).round() as u32;
-        img.resize(new_w, new_h, image::imageops::FilterType::Lanczos3)
-    } else {
-        img
-    };
+    let resized = downscale(img, 300);
 
     let rgb = resized.to_rgb8();
     let mut buf = std::io::Cursor::new(Vec::new());
@@ -380,12 +424,35 @@ mod tests {
         path
     }
 
+    /// Manual benchmark over real files: `BENCH_PHOTOS=<paths, one per line>`.
+    #[test]
+    #[ignore = "manual benchmark"]
+    fn bench_real_photos() {
+        let paths = std::env::var("BENCH_PHOTOS").expect("BENCH_PHOTOS");
+        let thumb_dir = tempfile::tempdir().expect("tempdir");
+        let (mut total, mut n) = (0.0_f64, 0_u32);
+        for (i, line) in paths.lines().enumerate() {
+            let p = Path::new(line.trim());
+            if !p.exists() {
+                continue;
+            }
+            let t0 = std::time::Instant::now();
+            let ok = generate_thumbnail(p, thumb_dir.path(), &format!("f{i}.jpg"), true).is_some();
+            let dt = t0.elapsed().as_secs_f64();
+            if ok {
+                total += dt;
+                n += 1;
+            }
+        }
+        eprintln!("bench: {n} files, avg {:.3} s/file", total / n as f64);
+    }
+
     #[test]
     fn generates_thumbnail_at_expected_path() {
         let src_dir = tempfile::tempdir().expect("tempdir");
         let thumb_dir = tempfile::tempdir().expect("tempdir");
         let source = create_test_image(src_dir.path(), "photo.png", 600, 400);
-        let result = generate_thumbnail(&source, thumb_dir.path(), "subdir/photo.png");
+        let result = generate_thumbnail(&source, thumb_dir.path(), "subdir/photo.png", false);
         assert!(result.is_some());
         let tr = result.unwrap();
         let thumb_path = PathBuf::from(&tr.path);
@@ -407,16 +474,16 @@ mod tests {
         let thumb_dir = tempfile::tempdir().expect("tempdir");
         let source = create_test_image(src_dir.path(), "pic.png", 400, 300);
 
-        let r1 = generate_thumbnail(&source, thumb_dir.path(), "pic.png");
+        let r1 = generate_thumbnail(&source, thumb_dir.path(), "pic.png", false);
         assert!(r1.is_some());
         assert!(r1.as_ref().unwrap().dhash.is_some());
 
         let thumb_path = PathBuf::from(&r1.unwrap().path);
         let mtime1 = std::fs::metadata(&thumb_path).unwrap().modified().unwrap();
 
-        // Generate again - should skip (dhash will be None)
+        // Not forced - reuses the file without decoding (dhash will be None)
         std::thread::sleep(std::time::Duration::from_millis(50));
-        let r2 = generate_thumbnail(&source, thumb_dir.path(), "pic.png");
+        let r2 = generate_thumbnail(&source, thumb_dir.path(), "pic.png", false);
         assert!(r2.is_some());
         assert!(r2.as_ref().unwrap().dhash.is_none());
 
@@ -424,11 +491,94 @@ mod tests {
         assert_eq!(mtime1, mtime2);
     }
 
+    /// SMB servers regularly report timestamps in the future. Cache validation used
+    /// to compare the thumbnail mtime with the source mtime, so every scan re-decoded
+    /// those files. Only the explicit `force` flag may invalidate now.
+    #[test]
+    fn future_source_mtime_does_not_invalidate_cache() {
+        let src_dir = tempfile::tempdir().expect("tempdir");
+        let thumb_dir = tempfile::tempdir().expect("tempdir");
+        let source = create_test_image(src_dir.path(), "future.png", 400, 300);
+
+        let handle = std::fs::File::options()
+            .write(true)
+            .open(&source)
+            .expect("open source");
+        handle
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(86_400 * 365 * 11)),
+            )
+            .expect("set mtime");
+        drop(handle);
+
+        let r1 = generate_thumbnail(&source, thumb_dir.path(), "future.png", false);
+        assert!(r1.is_some());
+        assert!(r1.as_ref().unwrap().dhash.is_some());
+
+        let r2 = generate_thumbnail(&source, thumb_dir.path(), "future.png", false);
+        assert!(r2.is_some());
+        assert!(
+            r2.as_ref().unwrap().dhash.is_none(),
+            "must reuse the cached thumbnail despite the future source mtime"
+        );
+
+        let r3 = generate_thumbnail(&source, thumb_dir.path(), "future.png", true);
+        assert!(r3.is_some());
+        assert!(r3.as_ref().unwrap().dhash.is_some(), "force must regenerate");
+    }
+
+    #[test]
+    fn root_key_is_stable_and_root_specific() {
+        let a = root_key("/run/user/1000/gvfs/smb-share:server=nas,share=fotos/Fotos");
+        assert_eq!(
+            a,
+            root_key("/run/user/1000/gvfs/smb-share:server=nas,share=fotos/Fotos")
+        );
+        assert_eq!(a.len(), 16);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(
+            a,
+            root_key("/run/user/1000/gvfs/smb-share:server=nas,share=fotos")
+        );
+    }
+
+    #[test]
+    fn thumb_path_for_namespaces_by_root() {
+        let base = Path::new("/cache/thumbnails");
+        let a = thumb_path_for(base, "aaa", "2012/foto.jpg");
+        let b = thumb_path_for(base, "bbb", "2012/foto.jpg");
+        assert_eq!(a, base.join("aaa").join("2012/foto.jpg"));
+        assert_ne!(a, b);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reuse_thumbnail_hardlinks_shared_file() {
+        use std::os::unix::fs::MetadataExt;
+
+        let src_dir = tempfile::tempdir().expect("tempdir");
+        let thumb_dir = tempfile::tempdir().expect("tempdir");
+        let source = create_test_image(src_dir.path(), "orig.png", 400, 300);
+        let first = generate_thumbnail(&source, thumb_dir.path(), "a/orig.png", false)
+            .expect("first thumbnail");
+        let dhash = first.dhash;
+
+        let reused =
+            reuse_thumbnail(Path::new(&first.path), dhash, thumb_dir.path(), "b/copy.png")
+                .expect("reused thumbnail");
+        assert_eq!(reused.dhash, dhash);
+        assert!(Path::new(&reused.path).exists());
+        let shared_ino = std::fs::metadata(&first.path).expect("meta shared").ino();
+        let reused_ino = std::fs::metadata(&reused.path).expect("meta reused").ino();
+        assert_eq!(shared_ino, reused_ino, "must share the inode");
+    }
+
     #[test]
     fn handles_missing_source_gracefully() {
         let thumb_dir = tempfile::tempdir().expect("tempdir");
         let missing = std::env::temp_dir().join("nonexistent_image_12345.png");
-        let result = generate_thumbnail(&missing, thumb_dir.path(), "missing.png");
+        let result = generate_thumbnail(&missing, thumb_dir.path(), "missing.png", false);
         assert!(result.is_none());
     }
 
@@ -437,7 +587,7 @@ mod tests {
         let src_dir = tempfile::tempdir().expect("tempdir");
         let thumb_dir = tempfile::tempdir().expect("tempdir");
         let source = create_test_image(src_dir.path(), "tall.png", 200, 800);
-        let result = generate_thumbnail(&source, thumb_dir.path(), "tall.png");
+        let result = generate_thumbnail(&source, thumb_dir.path(), "tall.png", false);
         assert!(result.is_some());
         let thumb_img = image::open(result.unwrap().path).expect("open");
         assert!(thumb_img.height() <= 300);
@@ -449,7 +599,7 @@ mod tests {
         let src_dir = tempfile::tempdir().expect("tempdir");
         let thumb_dir = tempfile::tempdir().expect("tempdir");
         let source = create_test_image(src_dir.path(), "small.png", 100, 80);
-        let result = generate_thumbnail(&source, thumb_dir.path(), "small.png");
+        let result = generate_thumbnail(&source, thumb_dir.path(), "small.png", false);
         assert!(result.is_some());
         let thumb_img = image::open(result.unwrap().path).expect("open");
         assert_eq!(thumb_img.width(), 100);

@@ -157,6 +157,10 @@ pub struct ScanSummary {
     pub unchanged: u64,
     pub deleted: u64,
     pub elapsed_ms: u64,
+    /// Unchanged files whose thumbnail was missing and got regenerated.
+    pub healed: u64,
+    /// Pending files that inherited the classification of a near-duplicate.
+    pub deduped: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -203,6 +207,9 @@ pub struct UnclassifiedFile {
     pub id: i64,
     pub rel_path: String,
     pub abs_path: String,
+    pub media_type: String,
+    /// Perceptual hash of the thumbnail. `None` when it was never generated.
+    pub dhash: Option<i64>,
 }
 
 /// What the startup prompt needs to know about an already-indexed root.
@@ -339,6 +346,9 @@ pub struct ExistingFile {
     pub size_bytes: i64,
     #[allow(dead_code)] // Used for has_classification checks in future
     pub confidence: f32,
+    /// Path recorded in the DB. May be stale: the scan verifies it on disk
+    /// before trusting it (see the thumbnail self-heal pass).
+    pub thumb_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -354,9 +364,20 @@ pub struct ScanContext {
     pub prompt_profile: crate::config::PromptProfile,
     pub ocr_engine: crate::config::OcrEngine,
     pub pdfium_lib_path: std::path::PathBuf,
+    /// Hamming distance under which two photos are treated as the same picture
+    /// during classification. `0` disables the dedupe.
+    pub dedupe_dhash_distance: u32,
 }
 
 impl ScanContext {
+    /// Root-scoped thumbnail directory: `<thumbnails>/<root_key>`.
+    ///
+    /// Keeping one directory per root is what stops two roots that cover the same
+    /// tree from sharing — and deleting — each other's thumbnail files.
+    pub fn thumb_dir_for(&self, root_key: &str) -> std::path::PathBuf {
+        self.thumbnails_dir.join(root_key)
+    }
+
     /// Parameters shared by every vision request issued by this scan.
     pub fn vision_settings(&self) -> VisionSettings {
         VisionSettings {
@@ -529,6 +550,24 @@ pub struct DuplicatesResponse {
 }
 
 // ── Face detection ──────────────────────────────────────────────────
+
+/// Progress of a thumbnail repair pass (`repair_thumbnails`).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThumbRepairProgress {
+    /// `None` while repairing every root.
+    pub root_id: Option<i64>,
+    pub total: u64,
+    pub processed: u64,
+    pub repaired: u64,
+    pub failed: u64,
+    /// Unix seconds when the run started, so the UI can show rate and ETA.
+    pub started_at: i64,
+    /// `"scanning"` while collecting dead pointers, `"repairing"` while
+    /// regenerating, then `"done"`, `"cancelled"` or `"failed"`.
+    pub phase: String,
+    pub error: Option<String>,
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]

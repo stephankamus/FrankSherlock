@@ -684,7 +684,7 @@ pub fn list_unclassified_files(
 ) -> AppResult<Vec<crate::models::UnclassifiedFile>> {
     let conn = open_conn(db_path)?;
     let mut stmt = conn.prepare(
-        "SELECT id, rel_path, abs_path FROM files
+        "SELECT id, rel_path, abs_path, media_type, dhash FROM files
          WHERE root_id = ?1 AND scan_marker = ?2 AND confidence = 0.0
            AND deleted_at IS NULL
          ORDER BY rel_path",
@@ -694,6 +694,8 @@ pub fn list_unclassified_files(
             id: row.get(0)?,
             rel_path: row.get(1)?,
             abs_path: row.get(2)?,
+            media_type: row.get(3)?,
+            dhash: row.get(4)?,
         })
     })?;
     let mut out = Vec::new();
@@ -714,7 +716,7 @@ pub fn list_unclassified_files_any_marker(
 ) -> AppResult<Vec<crate::models::UnclassifiedFile>> {
     let conn = open_conn(db_path)?;
     let mut stmt = conn.prepare(
-        "SELECT id, rel_path, abs_path FROM files
+        "SELECT id, rel_path, abs_path, media_type, dhash FROM files
          WHERE root_id = ?1 AND confidence = 0.0 AND deleted_at IS NULL
          ORDER BY rel_path",
     )?;
@@ -723,6 +725,8 @@ pub fn list_unclassified_files_any_marker(
             id: row.get(0)?,
             rel_path: row.get(1)?,
             abs_path: row.get(2)?,
+            media_type: row.get(3)?,
+            dhash: row.get(4)?,
         })
     })?;
     let mut out = Vec::new();
@@ -875,7 +879,7 @@ pub fn fail_scan_job(db_path: &Path, job_id: i64, error_text: &str) -> AppResult
 pub fn load_existing_files(db_path: &Path, root_id: i64) -> AppResult<Vec<ExistingFile>> {
     let conn = open_conn(db_path)?;
     let mut stmt = conn.prepare(
-        "SELECT id, rel_path, fingerprint, mtime_ns, size_bytes, confidence
+        "SELECT id, rel_path, fingerprint, mtime_ns, size_bytes, confidence, thumb_path
          FROM files
          WHERE root_id = ?1 AND deleted_at IS NULL",
     )?;
@@ -888,6 +892,7 @@ pub fn load_existing_files(db_path: &Path, root_id: i64) -> AppResult<Vec<Existi
             mtime_ns: row.get(3)?,
             size_bytes: row.get(4)?,
             confidence: row.get::<_, f64>(5)? as f32,
+            thumb_path: row.get(6)?,
         })
     })?;
 
@@ -906,7 +911,7 @@ pub fn load_existing_files(db_path: &Path, root_id: i64) -> AppResult<Vec<Existi
 pub fn load_deleted_files(db_path: &Path, root_id: i64) -> AppResult<Vec<ExistingFile>> {
     let conn = open_conn(db_path)?;
     let mut stmt = conn.prepare(
-        "SELECT id, rel_path, fingerprint, mtime_ns, size_bytes, confidence
+        "SELECT id, rel_path, fingerprint, mtime_ns, size_bytes, confidence, thumb_path
          FROM files
          WHERE root_id = ?1 AND deleted_at IS NOT NULL",
     )?;
@@ -919,6 +924,7 @@ pub fn load_deleted_files(db_path: &Path, root_id: i64) -> AppResult<Vec<Existin
             mtime_ns: row.get(3)?,
             size_bytes: row.get(4)?,
             confidence: row.get::<_, f64>(5)? as f32,
+            thumb_path: row.get(6)?,
         })
     })?;
 
@@ -997,6 +1003,268 @@ pub fn update_file_thumb_path(
         params![thumb_path, now_epoch_secs(), root_id, rel_path],
     )?;
     Ok(())
+}
+
+/// Store the thumbnail path and the dHash in a single write.
+///
+/// Used by the self-heal pass: the row keeps its classification, only the cache
+/// pointer (and the hash that enables dedupe) change.
+pub fn update_file_thumb_and_dhash(
+    db_path: &Path,
+    root_id: i64,
+    rel_path: &str,
+    thumb_path: &str,
+    dhash: Option<i64>,
+) -> AppResult<()> {
+    let conn = open_conn(db_path)?;
+    conn.execute(
+        "UPDATE files SET thumb_path = ?1, dhash = COALESCE(?2, dhash), updated_at = ?3 \
+         WHERE root_id = ?4 AND rel_path = ?5",
+        params![thumb_path, dhash, now_epoch_secs(), root_id, rel_path],
+    )?;
+    Ok(())
+}
+
+/// Invalidate a thumbnail pointer whose file disappeared from the cache.
+pub fn clear_thumb_path(db_path: &Path, file_id: i64) -> AppResult<()> {
+    let conn = open_conn(db_path)?;
+    conn.execute(
+        "UPDATE files SET thumb_path = NULL WHERE id = ?1",
+        params![file_id],
+    )?;
+    Ok(())
+}
+
+/// Copy the classification of a near-duplicate representative onto `target_id`.
+///
+/// `extracted_text` stays empty: OCR of a differently scaled/cropped image is not
+/// guaranteed to match, while the description is what search and the UI use.
+pub fn copy_classification(db_path: &Path, target_id: i64, source_id: i64) -> AppResult<()> {
+    let conn = open_conn(db_path)?;
+    conn.execute(
+        "UPDATE files SET \
+             media_type = (SELECT media_type FROM files WHERE id = ?2), \
+             description = (SELECT description FROM files WHERE id = ?2), \
+             canonical_mentions = (SELECT canonical_mentions FROM files WHERE id = ?2), \
+             confidence = (SELECT confidence FROM files WHERE id = ?2), \
+             lang_hint = (SELECT lang_hint FROM files WHERE id = ?2), \
+             extracted_text = '', \
+             updated_at = ?3 \
+         WHERE id = ?1",
+        params![target_id, source_id, now_epoch_secs()],
+    )?;
+    Ok(())
+}
+
+/// One row of the thumbnail repair work list.
+#[derive(Debug, Clone)]
+pub struct ThumbRepairRow {
+    pub id: i64,
+    pub root_id: i64,
+    pub rel_path: String,
+    pub abs_path: String,
+    pub fingerprint: String,
+    pub thumb_path: Option<String>,
+}
+
+/// Every live row of a root (or of all roots), ordered by `rel_path`.
+///
+/// Existence of the thumbnail file is verified by the caller — SQL cannot stat.
+pub fn list_thumb_repair_rows(
+    db_path: &Path,
+    root_id: Option<i64>,
+) -> AppResult<Vec<ThumbRepairRow>> {
+    let conn = open_conn(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, root_id, rel_path, abs_path, fingerprint, thumb_path
+         FROM files
+         WHERE deleted_at IS NULL AND (?1 IS NULL OR root_id = ?1)
+         ORDER BY rel_path",
+    )?;
+    let rows = stmt.query_map(params![root_id], |row| {
+        Ok(ThumbRepairRow {
+            id: row.get(0)?,
+            root_id: row.get(1)?,
+            rel_path: row.get(2)?,
+            abs_path: row.get(3)?,
+            fingerprint: row.get(4)?,
+            thumb_path: row.get(5)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// `(fingerprint, dhash, thumb_path)` of rows that claim to have a thumbnail.
+///
+/// The caller drops entries whose file is gone; they are the seed of the
+/// fingerprint/dHash dedupe caches.
+pub fn list_thumb_cache_seed(
+    db_path: &Path,
+    root_id: i64,
+) -> AppResult<Vec<(String, Option<i64>, String)>> {
+    let conn = open_conn(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT fingerprint, dhash, thumb_path FROM files
+         WHERE root_id = ?1 AND deleted_at IS NULL AND thumb_path IS NOT NULL",
+    )?;
+    let rows = stmt.query_map(params![root_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<i64>>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// `(file_id, dhash)` of rows that already carry a classification.
+///
+/// Seeds the dedupe index so a photo that duplicates something classified in an
+/// earlier run costs no vision request at all.
+pub fn list_classified_dhashes(db_path: &Path, root_id: i64) -> AppResult<Vec<(i64, i64)>> {
+    let conn = open_conn(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, dhash FROM files
+         WHERE root_id = ?1 AND deleted_at IS NULL AND confidence > 0 AND dhash IS NOT NULL",
+    )?;
+    let rows = stmt.query_map(params![root_id], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn update_file_thumb_path_by_id_conn(conn: &Connection, file_id: i64, thumb_path: &str) -> AppResult<()> {
+    conn.execute(
+        "UPDATE files SET thumb_path = ?1, updated_at = ?2 WHERE id = ?3",
+        params![thumb_path, now_epoch_secs(), file_id],
+    )?;
+    Ok(())
+}
+
+pub fn set_thumb_path_null_by_id_conn(conn: &Connection, file_id: i64) -> AppResult<()> {
+    conn.execute(
+        "UPDATE files SET thumb_path = NULL WHERE id = ?1",
+        params![file_id],
+    )?;
+    Ok(())
+}
+
+/// Outcome of [`migrate_thumbnail_layout`].
+#[derive(Debug, Default, Clone)]
+pub struct ThumbLayoutMigration {
+    pub moved: u64,
+    pub nulled: u64,
+    pub already_done: bool,
+}
+
+/// Marker written inside the cache directory once the layout is migrated.
+const THUMB_LAYOUT_SENTINEL: &str = ".layout-v2";
+
+/// Move the thumbnail cache from `<rel_path>.jpg` to `<root_key>/<rel_path>.jpg`.
+///
+/// The old layout had no root component, so two roots covering the same tree
+/// shared the same files and deleting one root's thumbnails broke the other's.
+/// Rows whose file is already gone get `thumb_path = NULL` (the invariant the
+/// repair command relies on) instead of a dangling pointer.
+///
+/// Idempotent: a sentinel file short-circuits every later boot.
+pub fn migrate_thumbnail_layout(
+    db_path: &Path,
+    thumbnails_dir: &Path,
+) -> AppResult<ThumbLayoutMigration> {
+    let sentinel = thumbnails_dir.join(THUMB_LAYOUT_SENTINEL);
+    if sentinel.exists() {
+        return Ok(ThumbLayoutMigration {
+            already_done: true,
+            ..Default::default()
+        });
+    }
+
+    let conn = open_conn(db_path)?;
+    let roots: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare("SELECT id, root_path FROM roots")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    let mut result = ThumbLayoutMigration::default();
+    let tx = conn.unchecked_transaction()?;
+    for (root_id, root_path) in roots {
+        let key = crate::thumbnail::root_key(&root_path);
+        let file_rows: Vec<(i64, String, Option<String>)> = {
+            let mut stmt = tx.prepare("SELECT id, rel_path, thumb_path FROM files WHERE root_id = ?1")?;
+            let rows = stmt.query_map(params![root_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        for (file_id, rel_path, old_thumb) in file_rows {
+            let target = crate::thumbnail::thumb_path_for(thumbnails_dir, &key, &rel_path);
+            if target.exists() {
+                update_file_thumb_path_by_id_conn(&tx, file_id, &target.display().to_string())?;
+                continue;
+            }
+
+            let mut moved = false;
+            if let Some(ref old) = old_thumb {
+                let old_path = Path::new(old);
+                if old_path.exists() && old_path != target.as_path() {
+                    if let Some(parent) = target.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if std::fs::rename(old_path, &target).is_ok()
+                        || (std::fs::copy(old_path, &target).is_ok()
+                            && std::fs::remove_file(old_path).is_ok())
+                    {
+                        moved = true;
+                    }
+                }
+            }
+
+            if moved {
+                update_file_thumb_path_by_id_conn(&tx, file_id, &target.display().to_string())?;
+                result.moved += 1;
+            } else if old_thumb.is_some() {
+                set_thumb_path_null_by_id_conn(&tx, file_id)?;
+                result.nulled += 1;
+            }
+        }
+    }
+    tx.commit()?;
+
+    // Best effort: a read-only cache directory would redo the (idempotent) move.
+    let _ = std::fs::write(&sentinel, b"v2\n");
+    Ok(result)
+}
+
+/// Canonical path of the root that owns `file_id`.
+pub fn get_root_path_for_file(db_path: &Path, file_id: i64) -> AppResult<Option<String>> {
+    let conn = open_conn(db_path)?;
+    let path: Option<String> = conn
+        .query_row(
+            "SELECT r.root_path FROM files f JOIN roots r ON r.id = f.root_id WHERE f.id = ?1",
+            params![file_id],
+            |row| row.get(0),
+        )
+        .ok();
+    Ok(path)
 }
 
 pub fn upsert_file_record(db_path: &Path, record: &FileRecordUpsert) -> AppResult<i64> {
@@ -2116,7 +2384,7 @@ fn search_images_normalized(
     for item in rows {
         let item = item?;
         if items.len() < 3 {
-            log::info!(
+            log::debug!(
                 "[search_debug] id={} rel_path={} thumb_path={:?}",
                 item.id,
                 item.rel_path,
@@ -2800,7 +3068,7 @@ pub fn list_files_needing_face_scan(
     // Include files that are either:
     //   (a) classified as image types, OR
     //   (b) have an image extension (not yet classified)
-    let sql = "SELECT f.id, f.rel_path, f.abs_path
+    let sql = "SELECT f.id, f.rel_path, f.abs_path, f.media_type, f.dhash
          FROM files f
          WHERE f.deleted_at IS NULL
            AND f.face_count = 0
@@ -2823,6 +3091,8 @@ pub fn list_files_needing_face_scan(
             id: row.get(0)?,
             rel_path: row.get(1)?,
             abs_path: row.get(2)?,
+            media_type: row.get(3)?,
+            dhash: row.get(4)?,
         })
     })?;
 
@@ -4171,6 +4441,87 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("index.sqlite");
         (dir, db_path)
+    }
+
+    #[test]
+    fn migrate_thumbnail_layout_moves_files_and_nulls_dead_pointers() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let thumbs = tempfile::tempdir().expect("thumbs");
+        let root_dir = tempfile::tempdir().expect("root");
+        let root_path = root_dir.path().to_str().expect("path").to_string();
+        let root_id = upsert_root(&db_path, &root_path).expect("root");
+
+        upsert_file_record(&db_path, &sample_record(root_id, "a.jpg", "fp-a")).expect("a");
+        upsert_file_record(&db_path, &sample_record(root_id, "b.jpg", "fp-b")).expect("b");
+
+        // Legacy flat layout: one live thumbnail, one pointer with no file.
+        let legacy = thumbs.path().join("a.jpg");
+        std::fs::write(&legacy, b"thumb").expect("write legacy");
+        update_file_thumb_path(&db_path, root_id, "a.jpg", &legacy.display().to_string())
+            .expect("thumb a");
+        let dangling = thumbs.path().join("b.jpg");
+        update_file_thumb_path(&db_path, root_id, "b.jpg", &dangling.display().to_string())
+            .expect("thumb b");
+
+        let outcome = migrate_thumbnail_layout(&db_path, thumbs.path()).expect("migrate");
+        assert_eq!(outcome.moved, 1);
+        assert_eq!(outcome.nulled, 1);
+        assert!(!legacy.exists(), "legacy file must be moved, not copied");
+
+        let key = crate::thumbnail::root_key(&root_path);
+        let expected = crate::thumbnail::thumb_path_for(thumbs.path(), &key, "a.jpg");
+        assert!(expected.exists());
+
+        let rows = list_thumb_repair_rows(&db_path, Some(root_id)).expect("rows");
+        let a = rows.iter().find(|r| r.rel_path == "a.jpg").expect("row a");
+        assert_eq!(
+            a.thumb_path.as_deref(),
+            Some(expected.display().to_string().as_str())
+        );
+        let b = rows.iter().find(|r| r.rel_path == "b.jpg").expect("row b");
+        assert!(b.thumb_path.is_none(), "dead pointer must be nulled");
+
+        let again = migrate_thumbnail_layout(&db_path, thumbs.path()).expect("again");
+        assert!(again.already_done);
+        assert_eq!(again.moved, 0);
+    }
+
+    #[test]
+    fn copy_classification_copies_fields_but_clears_text() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/dedupe").expect("root");
+        let source =
+            upsert_file_record(&db_path, &sample_record(root_id, "src.jpg", "fp1")).expect("src");
+        let target =
+            upsert_file_record(&db_path, &sample_record(root_id, "dst.jpg", "fp2")).expect("dst");
+        update_file_classification(
+            &db_path,
+            source,
+            "document",
+            "a scanned page",
+            "OCR TEXT",
+            "mentions",
+            0.9,
+            "pt",
+        )
+        .expect("classify");
+
+        copy_classification(&db_path, target, source).expect("copy");
+
+        let conn = open_conn(&db_path).expect("open");
+        let (media, description, text, confidence): (String, String, String, f64) = conn
+            .query_row(
+                "SELECT media_type, description, extracted_text, confidence FROM files WHERE id = ?1",
+                params![target],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("row");
+        assert_eq!(media, "document");
+        assert_eq!(description, "a scanned page");
+        assert!(text.is_empty(), "OCR text is not copied");
+        assert!((confidence - 0.9).abs() < 1e-6);
     }
 
     fn sample_record(root_id: i64, rel: &str, fp: &str) -> FileRecordUpsert {

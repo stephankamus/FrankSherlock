@@ -298,6 +298,20 @@ export type DuplicatesResponse = {
   groups: DuplicateGroup[];
 };
 
+// ── Thumbnail repair ────────────────────────────────────────────────
+
+export type ThumbRepairProgress = {
+  rootId?: number | null;
+  total: number;
+  processed: number;
+  repaired: number;
+  failed: number;
+  /** Unix seconds when the run started (used for rate and ETA). */
+  startedAt: number;
+  phase: "scanning" | "repairing" | "done" | "cancelled" | "failed";
+  error: string | null;
+};
+
 // ── Face detection ──────────────────────────────────────────────────
 
 export type FaceDetectProgress = {

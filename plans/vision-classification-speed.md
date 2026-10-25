@@ -1,10 +1,14 @@
 # Plano — velocidade e seleção de modelo na classificação por visão
 
-> **Status: implementado.** Passos 1–4 da ordem abaixo estão no código
+> **Status: implementado.** Passos 1–5 da ordem abaixo estão no código
 > (`vision_prep.rs`, `vision_estimate.rs`, `llm/client.rs`, `classify.rs`,
-> `config.rs`, `ModelPickerModal.tsx`). Medido de ponta a ponta pelo teste
-> `vision_pipeline_smoke`: 20,11 s → **3,09 s** por imagem. Dedupe por dhash
-> (passo 5) e HEIC/NEF (passo 6) continuam pendentes.
+> `config.rs`, `ModelPickerModal.tsx`, `similarity::DhashIndex`). Medido de ponta
+> a ponta pelo teste `vision_pipeline_smoke`: 20,11 s → **3,09 s** por imagem.
+> Dedupe por dhash (passo 5) entregue em
+> [`thumbnail-cache-and-dhash-dedupe.md`](./thumbnail-cache-and-dhash-dedupe.md):
+> fotos com Hamming ≤ `dedupe_dhash_distance` (padrão 6) herdam a classificação
+> do representante e thumbnails byte-idênticos não são decodificados de novo.
+> HEIC/NEF (passo 6) continua pendente.
 
 Medições completas em [`_bench_vision/RESULTS.md`](../_bench_vision/RESULTS.md).
 Hardware de referência dos testes: RTX 3060 12 GB / 32 GB RAM / Ollama 0.23.1.

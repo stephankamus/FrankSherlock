@@ -14,6 +14,16 @@ rust-version = "1.77.2"
 name = "sherlock_app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# `tauri dev` builds unoptimized by default, and that makes image decoding — the
+# whole thumbnail pipeline — 10-30x slower than in release (measured: 100% of one
+# core per photo, ~3.5 s/file). Optimizing dependencies keeps debug info for our
+# own crate while making dev builds usable for real libraries.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
 [build-dependencies]
 tauri-build = { version = "2.5.5", features = [] }
 

@@ -12,6 +12,65 @@ pub fn dhash_similarity(a: u64, b: u64) -> f32 {
     1.0 - hamming_distance(a, b) as f32 / 64.0
 }
 
+/// Bands used by [`DhashIndex`] to find near-duplicates without a full scan.
+///
+/// Seven bands of nine bits (covering bits 0..=62): with a threshold of at most 6
+/// differing bits, at least one band must be identical (pigeonhole), so the
+/// candidate lookup never misses a pair that the exact distance check accepts.
+const DEDUPE_BANDS: usize = 7;
+const DEDUPE_BAND_BITS: u32 = 9;
+
+/// Incremental index of dHash values used to fold near-duplicate photos.
+///
+/// Insertion and lookup are O(1) in the number of indexed files, which matters
+/// because classification runs over tens of thousands of rows.
+#[derive(Default)]
+pub struct DhashIndex {
+    bands: [std::collections::HashMap<u16, Vec<(u64, i64)>>; DEDUPE_BANDS],
+}
+
+impl DhashIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn band_key(dhash: u64, band: usize) -> u16 {
+        let shift = band as u32 * DEDUPE_BAND_BITS;
+        ((dhash >> shift) & ((1 << DEDUPE_BAND_BITS) - 1)) as u16
+    }
+
+    pub fn insert(&mut self, dhash: u64, file_id: i64) {
+        for band in 0..DEDUPE_BANDS {
+            self.bands[band]
+                .entry(Self::band_key(dhash, band))
+                .or_default()
+                .push((dhash, file_id));
+        }
+    }
+
+    /// Closest indexed file within `threshold` bits, if any.
+    pub fn find_near(&self, dhash: u64, threshold: u32) -> Option<i64> {
+        let mut best: Option<(u32, i64)> = None;
+        for band in 0..DEDUPE_BANDS {
+            let Some(candidates) = self.bands[band].get(&Self::band_key(dhash, band)) else {
+                continue;
+            };
+            for &(candidate_hash, file_id) in candidates {
+                let dist = hamming_distance(dhash, candidate_hash);
+                if dist <= threshold && best.map(|(b, _)| dist < b).unwrap_or(true) {
+                    best = Some((dist, file_id));
+                }
+            }
+        }
+        best.map(|(_, file_id)| file_id)
+    }
+
+    /// Number of indexed hashes.
+    pub fn len(&self) -> usize {
+        self.bands[0].values().map(Vec::len).sum()
+    }
+}
+
 /// Jaccard word overlap between two descriptions.
 ///
 /// Words are lowercased and filtered to length > 1.
@@ -155,6 +214,35 @@ mod tests {
     #[test]
     fn hamming_all_different() {
         assert_eq!(hamming_distance(0, u64::MAX), 64);
+    }
+
+    #[test]
+    fn dhash_index_finds_pairs_within_threshold() {
+        let mut index = DhashIndex::new();
+        index.insert(0, 7);
+        index.insert(u64::MAX, 8);
+        assert_eq!(index.len(), 2);
+
+        assert_eq!(index.find_near(0b111, 6), Some(7));
+        assert_eq!(index.find_near(u64::MAX, 6), Some(8));
+    }
+
+    #[test]
+    fn dhash_index_rejects_beyond_threshold() {
+        let mut index = DhashIndex::new();
+        index.insert(0, 7);
+        // 7 bits away from 0 → above the default threshold of 6.
+        assert_eq!(index.find_near(0b111_1111, 6), None);
+        assert_eq!(index.find_near(0b111_1111, 7), Some(7));
+    }
+
+    #[test]
+    fn dhash_index_prefers_the_closest_hash() {
+        let mut index = DhashIndex::new();
+        index.insert(0b111, 1);
+        index.insert(0b111_1000, 2);
+        // 0b11 is 2 bits from the first entry and 3 from the second.
+        assert_eq!(index.find_near(0b11, 6), Some(1));
     }
 
     #[test]

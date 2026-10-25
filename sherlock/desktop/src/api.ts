@@ -28,6 +28,7 @@ import type {
   SetupStatus,
   SmartFolder,
   SubdirEntry,
+  ThumbRepairProgress,
   SearchRequest,
   SearchResponse,
   VenvProvisionStatus,
@@ -152,6 +153,22 @@ export async function relinkRoot(rootId: number, newPath: string): Promise<RootI
 /** Run VACUUM to reclaim space left by deletes or purges. */
 export async function compactDatabase(): Promise<CompactResult> {
   return invoke<CompactResult>("compact_database");
+}
+
+/**
+ * Regenerate every thumbnail whose cache file is missing, without walking the
+ * share again. `rootId` omitted = every root.
+ */
+export async function repairThumbnails(rootId?: number | null): Promise<boolean> {
+  return invoke<boolean>("repair_thumbnails", { rootId: rootId ?? null });
+}
+
+export async function getThumbRepairStatus(): Promise<ThumbRepairProgress | null> {
+  return invoke<ThumbRepairProgress | null>("thumb_repair_status");
+}
+
+export async function cancelThumbRepair(): Promise<boolean> {
+  return invoke<boolean>("cancel_thumb_repair");
 }
 
 export async function listSubdirectories(rootId: number, parentPrefix: string): Promise<SubdirEntry[]> {

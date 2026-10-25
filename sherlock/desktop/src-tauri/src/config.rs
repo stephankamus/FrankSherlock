@@ -174,10 +174,22 @@ ocr_engine = "llm"
 # - full          run a complete scan (discovery + thumbnails + classification)
 # - none          just open the existing index
 startup_scan = "ask"
+
+# Maximum Hamming distance between two dHash values (0-64 bits) for the images to
+# be treated as the same picture. Near-duplicates inherit the classification of the
+# first one instead of paying for another vision request.
+# - 0   disables the dedupe (classify every file)
+# - 6   default: identical-looking copies, including resized/re-encoded ones
+# - 10+ starts folding bursts and near-identical shots into one description
+dedupe_dhash_distance = 6
 "#;
 
 /// Default longest-side for images sent to the vision model.
 pub const DEFAULT_IMAGE_MAX_SIDE: u32 = 1024;
+/// Default Hamming distance used to fold near-duplicate photos (`0` = off).
+pub const DEFAULT_DEDUPE_DHASH_DISTANCE: u32 = 6;
+/// Upper bound accepted from `settings.toml`; beyond this bursts collapse.
+pub const MAX_DEDUPE_DHASH_DISTANCE: u32 = 16;
 /// Smallest accepted longest-side. Below this the model starts losing small subjects.
 pub const MIN_IMAGE_MAX_SIDE: u32 = 640;
 /// Largest accepted longest-side. Above this Ollama caps image tokens anyway.
@@ -285,6 +297,9 @@ pub struct RuntimeSettings {
     pub ocr_engine: OcrEngine,
     /// Behaviour when opening a folder that is already indexed.
     pub startup_scan: StartupScan,
+    /// Hamming distance under which two photos are considered the same picture.
+    /// `0` disables the near-duplicate dedupe.
+    pub dedupe_dhash_distance: u32,
 }
 
 impl Default for RuntimeSettings {
@@ -295,6 +310,7 @@ impl Default for RuntimeSettings {
             prompt_profile: PromptProfile::Concise,
             ocr_engine: OcrEngine::Llm,
             startup_scan: StartupScan::Ask,
+            dedupe_dhash_distance: DEFAULT_DEDUPE_DHASH_DISTANCE,
         }
     }
 }
@@ -309,6 +325,11 @@ impl RuntimeSettings {
         } else {
             value.clamp(MIN_IMAGE_MAX_SIDE, MAX_IMAGE_MAX_SIDE)
         }
+    }
+
+    /// Clamp the dedupe threshold to a range where it still means "same picture".
+    pub fn normalize_dedupe_distance(value: u32) -> u32 {
+        value.min(MAX_DEDUPE_DHASH_DISTANCE)
     }
 }
 
@@ -397,6 +418,18 @@ fn parse_runtime_settings(data: &str) -> AppResult<RuntimeSettings> {
                     ),
                 }
             }
+            "dedupe_dhash_distance" => {
+                let parsed = parse_settings_string(value.trim())?;
+                match parsed.trim().parse::<u32>() {
+                    Ok(v) => {
+                        settings.dedupe_dhash_distance =
+                            RuntimeSettings::normalize_dedupe_distance(v)
+                    }
+                    Err(_) => log::warn!(
+                        "settings.toml: ignoring dedupe_dhash_distance '{parsed}' (expected: 0..={MAX_DEDUPE_DHASH_DISTANCE})"
+                    ),
+                }
+            }
             _ => {}
         }
     }
@@ -419,6 +452,7 @@ pub fn save_runtime_settings(settings: &RuntimeSettings) -> AppResult<()> {
         "prompt_profile",
         "ocr_engine",
         "startup_scan",
+        "dedupe_dhash_distance",
     ];
 
     let model_line = match &settings.model_override {
@@ -453,6 +487,13 @@ pub fn save_runtime_settings(settings: &RuntimeSettings) -> AppResult<()> {
         format!(
             "startup_scan = {}",
             serde_json::json!(settings.startup_scan.as_str())
+        ),
+    );
+    replacements.insert(
+        "dedupe_dhash_distance",
+        format!(
+            "dedupe_dhash_distance = {}",
+            RuntimeSettings::normalize_dedupe_distance(settings.dedupe_dhash_distance)
         ),
     );
 
@@ -760,6 +801,7 @@ mod tests {
             prompt_profile: PromptProfile::Detailed,
             ocr_engine: OcrEngine::Off,
             startup_scan: StartupScan::ClassifyOnly,
+            dedupe_dhash_distance: 4,
         };
         save_runtime_settings(&settings).expect("save");
 

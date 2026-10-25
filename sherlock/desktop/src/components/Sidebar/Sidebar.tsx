@@ -1,6 +1,7 @@
-import type { Album, DbStats, FaceDetectProgress, RootInfo, ScanJobStatus, SmartFolder, UpdateInfo } from "../../types";
+import type { Album, DbStats, FaceDetectProgress, RootInfo, ScanJobStatus, SmartFolder, ThumbRepairProgress, UpdateInfo } from "../../types";
 import { formatBytes } from "../../utils/format";
 import { useDragReorder } from "../../hooks/useDragReorder";
+import { formatEta } from "../../utils/scanEta";
 import RootCard from "./RootCard";
 import AlbumCard from "./AlbumCard";
 import SmartFolderCard from "./SmartFolderCard";
@@ -30,6 +31,10 @@ type SidebarProps = {
   onRelinkRoot?: (root: RootInfo) => void;
   onCompactDatabase?: () => void;
   compacting?: boolean;
+  /** Live progress of the "Repair Thumbnails" tool. */
+  thumbRepair?: ThumbRepairProgress | null;
+  onRepairThumbnails?: (rootId?: number | null) => void;
+  onCancelThumbRepair?: () => void;
   onDetectFaces: (root: RootInfo) => void;
   onCancelFaceDetect: () => void;
   onCancelScan: (scan: ScanJobStatus) => void;
@@ -58,6 +63,7 @@ export default function Sidebar({
   selectedSubdir, faceProgress, onSelectSubdir,
   onSelectRoot, onDeleteRoot, onRescanRoot, onRefreshRoot, onCopyRootPath, onPickAndScan,
   onRelinkRoot, onCompactDatabase, compacting,
+  thumbRepair, onRepairThumbnails, onCancelThumbRepair,
   onDetectFaces, onCancelFaceDetect,
   onCancelScan, onResumeScan,
   onSelectAlbum, onDeleteAlbum, onSelectSmartFolder, onDeleteSmartFolder,
@@ -73,6 +79,22 @@ export default function Sidebar({
   function scanForRoot(rootId: number): ScanJobStatus | undefined {
     return activeScans.find((s) => s.rootId === rootId && (s.status === "running" || s.status === "interrupted"));
   }
+
+  const repairing =
+    thumbRepair != null && (thumbRepair.phase === "scanning" || thumbRepair.phase === "repairing");
+
+  // Throughput matters here: repairing a whole library over SMB runs for hours, and
+  // a bare counter makes the wait look infinite.
+  const repairProgress = (() => {
+    if (!thumbRepair || thumbRepair.phase !== "repairing" || thumbRepair.total <= 0) {
+      return "";
+    }
+    const elapsed = Math.max(1, Math.floor(Date.now() / 1000) - thumbRepair.startedAt);
+    const rate = thumbRepair.processed / elapsed;
+    if (!Number.isFinite(rate) || rate <= 0) return "";
+    const remaining = Math.max(0, thumbRepair.total - thumbRepair.processed);
+    return ` (${Math.round(rate * 60)}/min, ${formatEta(remaining / rate)})`;
+  })();
 
   return (
     <aside className="sidebar">
@@ -172,7 +194,7 @@ export default function Sidebar({
         )}
       </div>
 
-      {(onFindDuplicates || onOpenPdfPasswords || onOpenFaces || onCheckUpdates) && (
+      {(onFindDuplicates || onOpenPdfPasswords || onOpenFaces || onCheckUpdates || onRepairThumbnails) && (
         <div className="sidebar-tools-fixed">
           <div className="sidebar-section"><span>Tools</span></div>
           <div className="sidebar-tool-list">
@@ -204,6 +226,31 @@ export default function Sidebar({
                 title="Browse images with detected faces"
               >
                 Faces
+              </button>
+            )}
+            {onRepairThumbnails && (
+              <button
+                type="button"
+                className="sidebar-tool-btn"
+                onClick={() => onRepairThumbnails(selectedRootId)}
+                disabled={repairing}
+                title="Regenerate thumbnails whose cache file is missing (no rescan needed)"
+              >
+                {repairing && thumbRepair
+                  ? thumbRepair.phase === "scanning"
+                    ? "Checking thumbnails…"
+                    : `Repairing ${thumbRepair.processed}/${thumbRepair.total}${repairProgress}…`
+                  : "Repair Thumbnails"}
+              </button>
+            )}
+            {repairing && onCancelThumbRepair && (
+              <button
+                type="button"
+                className="sidebar-tool-btn"
+                onClick={onCancelThumbRepair}
+                title="Stop repairing thumbnails"
+              >
+                Cancel Repair
               </button>
             )}
             {onCheckUpdates && (

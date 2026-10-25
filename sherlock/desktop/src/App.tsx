@@ -58,6 +58,7 @@ import { useGridNavigation } from "./hooks/useGridNavigation";
 import { useAppInit } from "./hooks/useAppInit";
 import { useAutoUpdate } from "./hooks/useAutoUpdate";
 import { useFaceDetection } from "./hooks/useFaceDetection";
+import { useThumbRepair } from "./hooks/useThumbRepair";
 import { useAlbumManager } from "./hooks/useAlbumManager";
 import { useSmartFolderManager } from "./hooks/useSmartFolderManager";
 import { useDuplicatesManager } from "./hooks/useDuplicatesManager";
@@ -129,6 +130,17 @@ export default function App() {
   /* ── Feature hooks ── */
   const autoUpdate = useAutoUpdate({ onNotice: setNotice, onError: setError });
   const faces = useFaceDetection({ pollMs: POLL_MS, onNotice: setNotice, onError: setError });
+  const thumbRepair = useThumbRepair({
+    pollMs: POLL_MS,
+    onNotice: setNotice,
+    onError: setError,
+    // Thumbnail size is shown in the sidebar footer, so refresh it when a run ends.
+    onFinished: () => {
+      ensureDatabase()
+        .then((stats) => setDbStats(stats))
+        .catch(() => {});
+    },
+  });
   const albumManager = useAlbumManager({ onNotice: setNotice, onError: setError });
   const smartFolderManager = useSmartFolderManager({ onNotice: setNotice, onError: setError });
   const duplicates = useDuplicatesManager({ onNotice: setNotice, onError: setError });
@@ -869,6 +881,9 @@ export default function App() {
           onRelinkRoot={onRelinkRoot}
           onCompactDatabase={onCompactDatabase}
           compacting={compacting}
+          thumbRepair={thumbRepair.thumbRepair}
+          onRepairThumbnails={readOnly ? undefined : thumbRepair.onRepairThumbnails}
+          onCancelThumbRepair={thumbRepair.onCancelThumbRepair}
           onPickAndScan={() => scanManager.onPickAndScan(setup, readOnly)}
           onCancelScan={(scan) => scanManager.onCancelScan(scan, readOnly)}
           onResumeScan={(scan) => scanManager.onResumeScan(scan, readOnly)}

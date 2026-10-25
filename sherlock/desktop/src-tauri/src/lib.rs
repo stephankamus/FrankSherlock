@@ -58,6 +58,8 @@ struct AppState {
     face_detect_progress: Arc<Mutex<Option<models::FaceDetectProgress>>>,
     face_detect_cancel: Arc<AtomicBool>,
     recluster_progress: Arc<Mutex<Option<models::ReclusterProgress>>>,
+    thumb_repair_progress: Arc<Mutex<Option<models::ThumbRepairProgress>>>,
+    thumb_repair_cancel: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -455,6 +457,128 @@ fn relink_root(
     )
     .map_err(|e| e.to_string())?;
     db::probe_roots(&state.paths.db_file).map_err(|e| e.to_string())
+}
+
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Regenerate every thumbnail whose cache file is missing, without walking the
+/// share again (a full discovery is the slow part on SMB).
+///
+/// `root_id = None` repairs every root. Progress and cancellation follow the
+/// face-detection pattern so the sidebar can show a live counter.
+#[tauri::command]
+async fn repair_thumbnails(
+    root_id: Option<i64>,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<bool, String> {
+    require_writable(state.inner())?;
+    if !state
+        .running_scan_jobs
+        .lock()
+        .expect("scan job mutex poisoned")
+        .is_empty()
+    {
+        return Err("Cannot repair thumbnails while a scan is running".to_string());
+    }
+
+    let app_state = state.inner().clone();
+    {
+        let mut progress = app_state
+            .thumb_repair_progress
+            .lock()
+            .expect("thumb repair mutex poisoned");
+        if progress
+            .as_ref()
+            .is_some_and(|p| p.phase == "scanning" || p.phase == "repairing")
+        {
+            return Err("Thumbnail repair is already running".to_string());
+        }
+        *progress = Some(models::ThumbRepairProgress {
+            root_id,
+            total: 0,
+            processed: 0,
+            repaired: 0,
+            failed: 0,
+            started_at: unix_now_secs(),
+            phase: "scanning".to_string(),
+            error: None,
+        });
+    }
+
+    app_state.thumb_repair_cancel.store(false, Ordering::Relaxed);
+    let ctx = build_scan_context(&app_state, &app_handle);
+    let progress_arc = app_state.thumb_repair_progress.clone();
+    let cancel = app_state.thumb_repair_cancel.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let outcome =
+            scan::repair_missing_thumbnails(&ctx, root_id, &cancel, |processed, total, done, failed| {
+                let mut guard = progress_arc.lock().expect("thumb repair mutex poisoned");
+                if let Some(p) = guard.as_mut() {
+                    p.phase = "repairing".to_string();
+                    p.processed = processed;
+                    p.total = total;
+                    p.repaired = done;
+                    p.failed = failed;
+                }
+            });
+
+        let mut guard = progress_arc.lock().expect("thumb repair mutex poisoned");
+        match outcome {
+            Ok(summary) => {
+                if let Some(p) = guard.as_mut() {
+                    p.processed = summary.scanned;
+                    p.total = summary.scanned + summary.skipped;
+                    p.repaired = summary.repaired;
+                    p.failed = summary.failed;
+                    p.phase = if cancel.load(Ordering::Relaxed) {
+                        "cancelled".to_string()
+                    } else {
+                        "done".to_string()
+                    };
+                }
+                log::info!(
+                    "Thumbnail repair: {} repaired, {} failed, {} skipped in {} file(s)",
+                    summary.repaired,
+                    summary.failed,
+                    summary.skipped,
+                    summary.scanned
+                );
+            }
+            Err(e) => {
+                log::error!("Thumbnail repair failed: {e}");
+                if let Some(p) = guard.as_mut() {
+                    p.phase = "failed".to_string();
+                    p.error = Some(e.to_string());
+                }
+            }
+        }
+    });
+
+    Ok(true)
+}
+
+#[tauri::command]
+fn thumb_repair_status(
+    state: State<'_, AppState>,
+) -> Result<Option<models::ThumbRepairProgress>, String> {
+    Ok(state
+        .thumb_repair_progress
+        .lock()
+        .expect("thumb repair mutex poisoned")
+        .clone())
+}
+
+#[tauri::command]
+fn cancel_thumb_repair(state: State<'_, AppState>) -> Result<bool, String> {
+    state.thumb_repair_cancel.store(true, Ordering::Relaxed);
+    Ok(true)
 }
 
 /// Reclaim disk space with `VACUUM` after deletions or a root purge.
@@ -858,13 +982,16 @@ async fn retry_protected_pdfs(
                     scan_ctx.vision_settings(),
                 );
 
-                // Generate thumbnail
+                // Generate thumbnail (root-scoped cache directory)
+                let thumb_dir =
+                    thumbnails_dir.join(thumbnail::root_key(&pdf.root_path));
                 let thumb_result = thumbnail::generate_pdf_thumbnail(
                     abs,
-                    &thumbnails_dir,
+                    &thumb_dir,
                     &pdf.rel_path,
                     &scan_ctx.pdfium_lib_path,
                     Some(&pw),
+                    true,
                 );
 
                 // Update the DB record with actual classification
@@ -935,12 +1062,17 @@ async fn reclassify_pdf(
             scan_ctx.vision_settings(),
         );
 
+        let thumb_dir = match db::get_root_path_for_file(&db_path, file_id) {
+            Ok(Some(root_path)) => thumbnails_dir.join(thumbnail::root_key(&root_path)),
+            _ => thumbnails_dir.clone(),
+        };
         let thumb_result = thumbnail::generate_pdf_thumbnail(
             abs,
-            &thumbnails_dir,
+            &thumb_dir,
             &rel_path,
             &scan_ctx.pdfium_lib_path,
             working_pw.as_deref(),
+            true,
         );
 
         let _ = db::update_file_classification(
@@ -1716,6 +1848,7 @@ fn build_scan_context(app_state: &AppState, app_handle: &tauri::AppHandle) -> mo
     let pdfium_lib_path = resolve_pdfium_lib(app_handle);
     let model_selection = select_model_for_app(app_state.gpu_info());
     let vision = vision_settings_from_config();
+    let runtime = config::load_runtime_settings().unwrap_or_default();
     models::ScanContext {
         db_path: app_state.paths.db_file.clone(),
         thumbnails_dir: app_state.paths.thumbnails_dir.clone(),
@@ -1727,6 +1860,7 @@ fn build_scan_context(app_state: &AppState, app_handle: &tauri::AppHandle) -> mo
         prompt_profile: vision.prompt_profile,
         ocr_engine: vision.ocr_engine,
         pdfium_lib_path,
+        dedupe_dhash_distance: runtime.dedupe_dhash_distance,
     }
 }
 
@@ -1899,6 +2033,22 @@ pub fn run() {
                 // Full read-write mode
                 db::recover_incomplete_scan_jobs(&paths.db_file).ok();
 
+                // Move the thumbnail cache to `<thumbnails>/<root_key>/` once. The old
+                // flat layout let one root's purge delete another root's thumbnails.
+                match db::migrate_thumbnail_layout(&paths.db_file, &paths.thumbnails_dir) {
+                    Ok(m) if m.moved > 0 || m.nulled > 0 => log::info!(
+                        "Thumbnail cache migrated per root ({} moved, {} pointers nulled)",
+                        m.moved,
+                        m.nulled
+                    ),
+                    Ok(m) => {
+                        if m.already_done {
+                            log::debug!("Thumbnail cache layout already migrated");
+                        }
+                    }
+                    Err(e) => log::warn!("Thumbnail cache migration skipped: {e}"),
+                }
+
                 match db::startup_health_check(&paths.db_file, &paths.db_dir) {
                     Ok(HealthCheckOutcome::RestoredFromBackup) => {
                         log::warn!("Database restored from backup");
@@ -1976,6 +2126,8 @@ pub fn run() {
         face_detect_progress: Arc::new(Mutex::new(None)),
         face_detect_cancel: Arc::new(AtomicBool::new(false)),
         recluster_progress: Arc::new(Mutex::new(None)),
+        thumb_repair_progress: Arc::new(Mutex::new(None)),
+        thumb_repair_cancel: Arc::new(AtomicBool::new(false)),
     };
 
     tauri::Builder::default()
@@ -2021,6 +2173,9 @@ pub fn run() {
             probe_roots,
             relink_root,
             compact_database,
+            repair_thumbnails,
+            thumb_repair_status,
+            cancel_thumb_repair,
             list_subdirectories,
             load_user_config,
             save_user_config,
