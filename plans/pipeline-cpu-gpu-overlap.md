@@ -727,6 +727,42 @@ Uma classificação bem-sucedida limpa o estado (e mantém `classify_attempts`, 
 
 O que fica: `mark_failed` só grava o que um retry com outro modelo/resolução poderia realmente resolver — o resto é índice desatualizado, e esconder isso no banco seria transformar um problema de descoberta em um problema de classificação.
 
+### 5.11 O lote de 26/10 (925 arquivos) e por que ele pareceu 4× mais rápido
+
+Segunda passada medida com o resumo novo, numa raiz recém-indexada:
+
+| métrica | 25/10 (raiz cheia) | 26/10 (lote de 925) |
+|---|---|---|
+| wall | 5,84 s/arquivo | **1,47 s/arquivo** |
+| requests/arquivo | 2,34 | **1,14** |
+| p50 / p95 por request | 1,29 / 12,64 s | 1,28 / **1,47 s** |
+| GPU / wall | 94 % | **98,4 %** |
+| 500 / 400 | 186 / 19 | 16 / 0 |
+| deduped / failed | 104 / 63 | 60 / 8 |
+
+O `p50` por request é o mesmo. O que sumiu foi a **cauda de ~13 s**, que é o passe de OCR
+dos documentos: essa pasta quase não tem documento (`max 13,37 s` aparece uma vez). Ou
+seja, o ganho é de **composição do lote**, não de velocidade — e por isso a projeção para
+una biblioteca mista continua sendo a de §5.8 (com ~15 % de documentos, +36 % de GPU).
+
+Duas coisas que a medição confirmou de novo: 98,4 % do wall dentro da GPU (não há CPU
+sobrando para esconder) e zero reloads/`KvSize` único com o agrupamento de §5.9.
+
+**Encadeamento `full` → `backlog`.** `full` é o único modo que faz descoberta e limpeza;
+o backlog é o que classifica com sobreposição. Agora um `full` que termina sozinho
+dispara o passe de backlog da mesma raiz (`chain_backlog = true` em `settings.toml`), que
+é também o único momento em que o produtor tem trabalho de CPU real para esconder do GPU.
+Um scan cancelado **não** encadeia: cancelar significa parar, não continuar de outro jeito.
+
+**Filtro de documento.** Uma foto de vôlei de areia com as placas de "BANCO DO BRASIL" e
+"GOL" saiu como `[Doc: bank_transfer] [Issuer: GOL]`. A causa era o modelo responder
+`is_document_like: true` para uma cena, e o portão aceitar isso. Agora: cena (`photo`,
+`video`, `artwork`, `anime`, `manga`) **nunca** dispara o enriquecimento, `document_kind`
+ganhou `"none"` no schema, e o sufixo `[Doc]/[Issuer]` só entra quando o texto do OCR tem
+sinal de documento (valor + data, ou moeda). O custo de recall é explícito: um comprovante
+*fotografado* também é cena e para ali — a saída é um retry com overrides numa pasta que se
+sabe ser de comprovantes.
+
 ## 6. Riscos
 
 | Risco | Mitigação |

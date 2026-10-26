@@ -408,15 +408,30 @@ fn begin_scan(
         }
     }
 
-    let job = scan::start_or_resume_scan_job(&state.paths.db_file, &root_path)
+    start_scan_job(state.inner(), &app_handle, &root_path, mode, overrides)
+}
+
+/// Create the job and start its worker.
+///
+/// Split from [`begin_scan`] because the end of a scan starts the next pass itself: a
+/// `full` scan chains into the backlog. The guards and the user-facing messages belong
+/// to the command; this part is the same for both callers.
+fn start_scan_job(
+    app_state: &AppState,
+    app_handle: &tauri::AppHandle,
+    root_path: &str,
+    mode: scan::ScanMode,
+    overrides: Option<models::ScanOverrides>,
+) -> Result<ScanJobStatus, String> {
+    let job = scan::start_or_resume_scan_job(&app_state.paths.db_file, root_path)
         .map_err(|e| e.to_string())?;
     // If this root is a child of an existing parent root, adopt files from parent
-    let _ = db::adopt_child_files(&state.paths.db_file, job.root_id, &job.root_path);
+    let _ = db::adopt_child_files(&app_state.paths.db_file, job.root_id, &job.root_path);
 
     // Any other action ends the backlog story: leaving a finished record behind kept
     // the sidebar panel (and its Stop button) on screen until the app restarted.
     if !mode.uses_backlog_pipeline() {
-        let mut progress = state
+        let mut progress = app_state
             .backlog_progress
             .lock()
             .expect("backlog mutex poisoned");
@@ -426,7 +441,7 @@ fn begin_scan(
     // The backlog needs its own live record: the job row only carries one
     // counter, and the sidebar shows thumbnails and classifications side by side.
     if mode.uses_backlog_pipeline() {
-        let mut progress = state
+        let mut progress = app_state
             .backlog_progress
             .lock()
             .expect("backlog mutex poisoned");
@@ -446,9 +461,8 @@ fn begin_scan(
             error: None,
         });
     }
-    let app_state = state.inner().clone();
-    spawn_scan_worker_if_needed(app_state, &app_handle, job.id, mode, overrides);
-    db::get_scan_job(&state.paths.db_file, job.id)
+    spawn_scan_worker_if_needed(app_state.clone(), app_handle, job.id, mode, overrides);
+    db::get_scan_job(&app_state.paths.db_file, job.id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "scan job not found after start".to_string())
 }
@@ -2158,6 +2172,18 @@ fn spawn_scan_worker_if_needed(
         }
     };
 
+    // A `full` scan chains into the backlog pass. The root path has to be captured now
+    // (the scan context does not carry it) and the setting is read once, before the
+    // user can change anything mid-run.
+    let chain_root = db::get_scan_job(&app_state.paths.db_file, job_id)
+        .ok()
+        .flatten()
+        .map(|job| job.root_path);
+    let chain_backlog_enabled = config::load_runtime_settings()
+        .map(|settings| settings.chain_backlog)
+        .unwrap_or(true);
+    let chain_handle = app_handle.clone();
+
     tauri::async_runtime::spawn(async move {
         let flag = cancel_flag;
         let cancel_watch = flag.clone();
@@ -2195,15 +2221,16 @@ fn spawn_scan_worker_if_needed(
             }
         }
 
-        // Remove from tracking before checking if all jobs finished
-        let mut guard = jobs.lock().expect("scan job mutex poisoned");
-        guard.remove(&job_id);
-        let all_jobs_done = guard.is_empty();
-        drop(guard);
-
-        let mut flags = cancel_flags.lock().expect("cancel flags mutex poisoned");
-        flags.remove(&job_id);
-        drop(flags);
+        // Remove from tracking first: the chain below starts another job, and that job
+        // has to be registered before anything asks whether the app is idle.
+        {
+            let mut guard = jobs.lock().expect("scan job mutex poisoned");
+            guard.remove(&job_id);
+        }
+        {
+            let mut flags = cancel_flags.lock().expect("cancel flags mutex poisoned");
+            flags.remove(&job_id);
+        }
 
         if result.is_ok() {
             // WAL checkpoint + backup after each successful scan
@@ -2216,7 +2243,35 @@ fn spawn_scan_worker_if_needed(
             }
         }
 
+        // One action, both halves: `full` is the only mode that discovers and cleans the
+        // index, and the backlog pass is what classifies with the producer/consumer
+        // overlap — it is also the only moment a fresh folder gives the producer real
+        // CPU work to hide from the GPU. Chained only after a scan that finished on its
+        // own: a cancel means "stop", not "continue differently".
+        if mode == scan::ScanMode::Full
+            && result.is_ok()
+            && !cancel_watch.load(Ordering::Relaxed)
+            && chain_backlog_enabled
+        {
+            if let Some(root) = chain_root.as_deref() {
+                log::info!("Full scan finished; chaining the backlog pass for {root}");
+                if let Err(err) = start_scan_job(
+                    &app_state_for_task,
+                    &chain_handle,
+                    root,
+                    scan::ScanMode::Backlog,
+                    None,
+                ) {
+                    log::warn!("Could not chain the backlog pass for {root}: {err}");
+                }
+            }
+        }
+
         // Only unload models once ALL scan jobs have finished
+        let all_jobs_done = {
+            let guard = jobs.lock().expect("scan job mutex poisoned");
+            guard.is_empty()
+        };
         if all_jobs_done {
             if let Err(e) = llm::cleanup_loaded_models() {
                 log::warn!("Auto-cleanup after all scans finished: {e}");

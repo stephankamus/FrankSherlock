@@ -89,7 +89,7 @@ const OCR_PROMPT: &str =
 const RECEIPT_PROMPT: &str = concat!(
     "Given OCR text from a potential receipt/bank document, extract structured fields. ",
     "Return ONLY valid JSON schema: ",
-    r#"{"document_kind":"receipt|invoice|bank_transfer|statement|other","#,
+    r#"{"document_kind":"receipt|invoice|bank_transfer|statement|other|none","#,
     r#""issuer":"string or null","#,
     r#""counterparty":"string or null","#,
     r#""date":"YYYY-MM-DD or null","#,
@@ -100,6 +100,9 @@ const RECEIPT_PROMPT: &str = concat!(
     r#""reference_numbers":["string"],"#,
     r#""important_fields":[{"key":"string","value":"string"}],"#,
     r#""confidence":0.0}"#,
+    " Rules: use \"none\" when the text is not a receipt or a bank document — logos,",
+    " signs, subtitles and captions are not; never infer a document from brand names,",
+    " prices or dates on their own.",
     " OCR text:\n",
 );
 
@@ -262,6 +265,14 @@ pub fn should_run_anime_enrichment(primary: &Value) -> bool {
 /// subtitles and fan art with text used to pay ~8 s of Surya per image for no
 /// benefit. Surya spawns a fresh Python interpreter (torch + models) per file,
 /// so it is only worth it for actual documents.
+///
+/// A **scene** never triggers it either, not even when the model offers
+/// `is_document_like: true`: a beach-volleyball photo with the sponsor boards of
+/// Banco do Brasil and GOL came back as `[Doc: bank_transfer] [Issuer: GOL]`
+/// (2026-10-26), and the whole OCR pass (~13 s of GPU with the LLM engine) was paid
+/// for a picture of a court. The recall cost is deliberate — a *photographed* receipt
+/// is a scene too and stops here — and the escape hatch is a retry with overrides
+/// ([`crate::models::ScanOverrides`]) once a folder is known to hold receipts.
 pub fn should_run_document_enrichment(primary: &Value, ocr_engine: OcrEngine) -> bool {
     if ocr_engine == OcrEngine::Off {
         return false;
@@ -270,7 +281,10 @@ pub fn should_run_document_enrichment(primary: &Value, ocr_engine: OcrEngine) ->
         .get("media_type")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if matches!(media_type, "anime" | "manga" | "artwork") {
+    if matches!(
+        media_type,
+        "anime" | "manga" | "artwork" | "photo" | "video"
+    ) {
         return false;
     }
     let is_doc = primary
@@ -905,6 +919,45 @@ fn run_ocr(
 // Stage 2c: Document field extraction
 // ---------------------------------------------------------------------------
 
+/// The document type the model named, when it named a real one.
+///
+/// `"none"` is part of the schema on purpose: without it the model had to pick from
+/// `receipt|invoice|bank_transfer|statement|other` even when the text was not a
+/// document at all, and a beach-volleyball court came back as a `bank_transfer`
+/// because the sponsor boards said "BANCO DO BRASIL" and "GOL" (2026-10-26).
+fn document_kind_of(fields: &Value) -> Option<String> {
+    let kind = fields.get("document_kind").and_then(clean_nullable_str)?;
+    if matches!(kind.as_str(), "none" | "null") {
+        return None;
+    }
+    Some(kind)
+}
+
+/// Whether the extracted fields describe a real document instead of text that merely
+/// looks like one.
+///
+/// The model has to name a document **and** the OCR text has to carry a document
+/// signal: an amount together with a date, or a currency. A court full of logos has
+/// names and prices and is not a receipt. `extracted_text` keeps everything either
+/// way — this only decides the `[Doc: …] [Issuer: …]` suffix on the description.
+fn document_fields_are_real(fields: &Value, ocr_text: &str) -> bool {
+    if document_kind_of(fields).is_none() {
+        return false;
+    }
+    let signals = extract_receipt_regex(ocr_text);
+    let has_items = |key: &str| {
+        signals
+            .get(key)
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| !items.is_empty())
+    };
+    let currency = signals
+        .get("currency_guess")
+        .and_then(|value| value.as_str())
+        .is_some_and(|code| !code.is_empty());
+    (has_items("dates") && has_items("amount_candidates")) || currency
+}
+
 fn extract_document_fields(model: &str, ocr_text: &str) -> Value {
     let regex_fields = extract_receipt_regex(ocr_text);
 
@@ -1145,12 +1198,17 @@ pub fn classify_image_prepared(
         if ocr.ok && !ocr.text.is_empty() {
             extracted_text = ocr.text.clone();
 
+            // The suffix only goes in when the fields describe an actual document:
+            // `document_kind` alone was not enough, because the model read the sponsor
+            // boards of a volleyball court as a bank transfer.
             let doc_fields = extract_document_fields(model, &ocr.text);
-            if let Some(kind) = doc_fields.get("document_kind").and_then(clean_nullable_str) {
-                full_description = format!("{full_description} [Doc: {kind}]");
-            }
-            if let Some(issuer) = doc_fields.get("issuer").and_then(clean_nullable_str) {
-                full_description = format!("{full_description} [Issuer: {issuer}]");
+            if document_fields_are_real(&doc_fields, &ocr.text) {
+                if let Some(kind) = document_kind_of(&doc_fields) {
+                    full_description = format!("{full_description} [Doc: {kind}]");
+                }
+                if let Some(issuer) = doc_fields.get("issuer").and_then(clean_nullable_str) {
+                    full_description = format!("{full_description} [Issuer: {issuer}]");
+                }
             }
         }
     }
@@ -1571,7 +1629,8 @@ pub fn classify_pdf(
         // Char-safe: PDF text can be CJK and byte slicing panics mid-codepoint.
         let context = truncate_chars(&full_text, 2000);
         let doc_fields = extract_document_fields(model, context);
-        if let Some(kind) = doc_fields.get("document_kind").and_then(clean_nullable_str) {
+        // A PDF is a document by construction, so only `none` has to be honoured here.
+        if let Some(kind) = document_kind_of(&doc_fields) {
             description = format!("{description} [Doc: {kind}]");
         }
         if let Some(issuer) = doc_fields.get("issuer").and_then(clean_nullable_str) {
@@ -1586,7 +1645,7 @@ pub fn classify_pdf(
                 extracted_text = ocr.text.clone();
 
                 let doc_fields = extract_document_fields(model, &ocr.text);
-                if let Some(kind) = doc_fields.get("document_kind").and_then(clean_nullable_str) {
+                if let Some(kind) = document_kind_of(&doc_fields) {
                     description = format!("{description} [Doc: {kind}]");
                 }
                 if let Some(issuer) = doc_fields.get("issuer").and_then(clean_nullable_str) {
@@ -1858,8 +1917,49 @@ mod tests {
 
     #[test]
     fn should_run_document_for_document_like() {
-        let p = serde_json::json!({"media_type": "photo", "contains_text": false, "is_document_like": true});
+        // `other` is the open bucket: nothing about the picture says "scene", so the
+        // model's own `is_document_like` decides.
+        let p = serde_json::json!({"media_type": "other", "contains_text": true, "is_document_like": true});
         assert!(should_run_document_enrichment(&p, OcrEngine::Llm));
+    }
+
+    /// A scene with text in it is not a document, even when the model says it is: the
+    /// sponsor boards of a beach-volleyball court came back as a `bank_transfer`
+    /// because they said "BANCO DO BRASIL" and "GOL" (2026-10-26).
+    #[test]
+    fn should_not_run_document_for_a_scene_with_logos() {
+        for media_type in ["photo", "video", "artwork", "anime", "manga"] {
+            let p = serde_json::json!({
+                "media_type": media_type,
+                "contains_text": true,
+                "is_document_like": true,
+            });
+            assert!(
+                !should_run_document_enrichment(&p, OcrEngine::Llm),
+                "{media_type} is a scene: a logo is not a document"
+            );
+        }
+    }
+
+    /// The suffix only goes in when the OCR text carries a document signal, so brand
+    /// names alone can never turn a photo description into "[Doc: bank_transfer]".
+    #[test]
+    fn document_suffix_requires_a_document_signal() {
+        let receipt = serde_json::json!({"document_kind": "receipt", "issuer": "Padaria"});
+        assert!(document_fields_are_real(
+            &receipt,
+            "Padaria Central\nData: 2024-01-15\nTotal R$ 12,50"
+        ));
+
+        // The beach case: names and prices, no date+amount pair and no currency.
+        assert!(!document_fields_are_real(
+            &receipt,
+            "BANCO DO BRASIL GOL ITAU BRADESCO"
+        ));
+
+        // The model answering "none" wins over any signal.
+        let none = serde_json::json!({"document_kind": "none", "issuer": "GOL"});
+        assert!(!document_fields_are_real(&none, "R$ 10,00 2024-01-15"));
     }
 
     /// Burned-in subtitles used to trigger a full Surya OCR run (~8 s/image).

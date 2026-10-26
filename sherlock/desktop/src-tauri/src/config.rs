@@ -188,6 +188,12 @@ startup_scan = "ask"
 # - 6   default: identical-looking copies, including resized/re-encoded ones
 # - 10+ starts folding bursts and near-identical shots into one description
 dedupe_dhash_distance = 6
+
+# Run the backlog pass automatically when a full scan finishes.
+# A `full` scan owns discovery and cleanup; the backlog is what classifies with the
+# producer/consumer overlap, so chaining the two means one action indexes and
+# classifies a folder. Set to false to leave the backlog to the sidebar button.
+chain_backlog = true
 "#;
 
 /// Default longest-side for images sent to the vision model.
@@ -347,6 +353,12 @@ pub struct RuntimeSettings {
     /// Hamming distance under which two photos are considered the same picture.
     /// `0` disables the near-duplicate dedupe.
     pub dedupe_dhash_distance: u32,
+    /// Run the backlog pass when a `full` scan finishes.
+    ///
+    /// `full` is the only mode that discovers and cleans the index, and the backlog is
+    /// what classifies with the producer/consumer overlap. Chaining them makes one
+    /// action index and classify a folder, instead of asking for a second click.
+    pub chain_backlog: bool,
 }
 
 impl Default for RuntimeSettings {
@@ -359,6 +371,7 @@ impl Default for RuntimeSettings {
             ocr_engine: OcrEngine::Llm,
             startup_scan: StartupScan::Ask,
             dedupe_dhash_distance: DEFAULT_DEDUPE_DHASH_DISTANCE,
+            chain_backlog: true,
         }
     }
 }
@@ -487,6 +500,16 @@ fn parse_runtime_settings(data: &str) -> AppResult<RuntimeSettings> {
                     ),
                 }
             }
+            "chain_backlog" => {
+                let parsed = parse_settings_string(value.trim())?;
+                match parsed.to_ascii_lowercase().as_str() {
+                    "true" | "yes" | "1" | "on" => settings.chain_backlog = true,
+                    "false" | "no" | "0" | "off" => settings.chain_backlog = false,
+                    _ => log::warn!(
+                        "settings.toml: ignoring chain_backlog '{parsed}' (expected: true | false)"
+                    ),
+                }
+            }
             _ => {}
         }
     }
@@ -511,6 +534,7 @@ pub fn save_runtime_settings(settings: &RuntimeSettings) -> AppResult<()> {
         "ocr_engine",
         "startup_scan",
         "dedupe_dhash_distance",
+        "chain_backlog",
     ];
 
     let model_line = match &settings.model_override {
@@ -560,6 +584,10 @@ pub fn save_runtime_settings(settings: &RuntimeSettings) -> AppResult<()> {
             "dedupe_dhash_distance = {}",
             RuntimeSettings::normalize_dedupe_distance(settings.dedupe_dhash_distance)
         ),
+    );
+    replacements.insert(
+        "chain_backlog",
+        format!("chain_backlog = {}", settings.chain_backlog),
     );
 
     let mut out = String::new();
@@ -868,6 +896,7 @@ mod tests {
             ocr_engine: OcrEngine::Off,
             startup_scan: StartupScan::ClassifyOnly,
             dedupe_dhash_distance: 4,
+            chain_backlog: false,
         };
         save_runtime_settings(&settings).expect("save");
 
