@@ -1502,6 +1502,65 @@ pub fn get_root_path_for_file(db_path: &Path, file_id: i64) -> AppResult<Option<
     Ok(path)
 }
 
+/// Insert rows for the files discovery just found, without touching what is already there.
+///
+/// Discovery walks the tree but used to write nothing: the rows were created by the
+/// thumbnail phase, one file at a time. A scan cancelled in that phase therefore left an
+/// index that was a *prefix* of the folder — 925 rows of 50k, presented as a finished
+/// backlog (2026-10-26) — and the whole folder looked empty in the UI.
+///
+/// Writing the paths when the walk ends makes the index whole immediately. The thumbnail
+/// phase (and, in time, the pipeline) only fills in what needs reading: fingerprint,
+/// thumbnail, dhash, location and the classification.
+///
+/// `DO NOTHING` is the important part: an existing row may already carry a description, a
+/// thumbnail or a recorded failure, and writing a blank record over it is data loss.
+pub fn insert_pending_rows(db_path: &Path, records: &[FileRecordUpsert]) -> AppResult<u64> {
+    if records.is_empty() {
+        return Ok(0);
+    }
+    let conn = open_conn(db_path)?;
+    let tx = conn.unchecked_transaction()?;
+    let now = now_epoch_secs();
+    let mut inserted = 0u64;
+    {
+        let mut stmt = tx.prepare(
+            r#"
+            INSERT INTO files (
+                root_id, rel_path, filename, abs_path,
+                media_type, description, extracted_text, canonical_mentions,
+                confidence, lang_hint, mtime_ns, size_bytes, fingerprint,
+                scan_marker, updated_at, deleted_at, location_text, dhash,
+                duration_secs, video_width, video_height, video_codec, audio_codec
+            ) VALUES (
+                ?1, ?2, ?3, ?4,
+                ?5, '', '', '',
+                0.0, '', ?6, ?7, ?8,
+                ?9, ?10, NULL, '', NULL,
+                NULL, NULL, NULL, NULL, NULL
+            )
+            ON CONFLICT(root_id, rel_path) DO NOTHING
+            "#,
+        )?;
+        for record in records {
+            inserted += stmt.execute(params![
+                record.root_id,
+                record.rel_path,
+                record.filename,
+                record.abs_path,
+                record.media_type,
+                record.mtime_ns,
+                record.size_bytes,
+                record.fingerprint,
+                record.scan_marker,
+                now,
+            ])? as u64;
+        }
+    }
+    tx.commit()?;
+    Ok(inserted)
+}
+
 pub fn upsert_file_record(db_path: &Path, record: &FileRecordUpsert) -> AppResult<i64> {
     let conn = open_conn(db_path)?;
     let tx = conn.unchecked_transaction()?;
@@ -6602,6 +6661,37 @@ mod tests {
             )
             .expect("count");
         assert_eq!(root_count, 0);
+    }
+
+    /// Rows for the paths discovery found, without touching what is already indexed: an
+    /// existing row may carry a description, a thumbnail or a recorded failure, and
+    /// re-inserting a blank record over it is data loss.
+    #[test]
+    fn discovery_rows_are_inserted_without_touching_existing_ones() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/discovery").expect("root");
+
+        let classified =
+            upsert_file_record(&db_path, &sample_record(root_id, "a.jpg", "fp-a")).expect("a");
+        update_file_classification(&db_path, classified, "photo", "a beach", "", "", 0.4, "en")
+            .expect("classify");
+
+        // The walk found both files again; the classified one comes back blank.
+        let known = sample_record(root_id, "a.jpg", "");
+        let fresh = sample_record(root_id, "b.jpg", "");
+        let inserted = insert_pending_rows(&db_path, &[known, fresh]).expect("insert");
+        assert_eq!(inserted, 1, "only the path that was missing gets a row");
+
+        let rows = list_backlog_rows(&db_path, root_id).expect("backlog");
+        let a = rows.iter().find(|row| row.rel_path == "a.jpg").expect("a");
+        assert!(
+            !a.needs_classification,
+            "the existing description must survive the write"
+        );
+        let b = rows.iter().find(|row| row.rel_path == "b.jpg").expect("b");
+        assert!(b.needs_classification, "a new row starts pending");
+        assert!(b.thumb_path.is_none(), "and with no thumbnail yet");
     }
 
     /// Discovery only fills the file list **in memory**; the rows are written by the

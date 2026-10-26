@@ -378,6 +378,26 @@ fn run_scan_job_impl(
         discovery_start.elapsed().as_secs_f64()
     );
 
+    // Write the paths now, not during the thumbnail phase. The rows used to be created one
+    // at a time by phase 2, so a scan cancelled there left an index that was a *prefix* of
+    // the folder: 925 rows of 50k, presented as a finished backlog and as an empty folder
+    // in the UI (2026-10-26). `DO NOTHING` keeps every existing row exactly as it is.
+    let pending_rows: Vec<crate::models::FileRecordUpsert> = probes
+        .iter()
+        .filter(|probe| matches!(probe.status, FileStatus::New))
+        .map(|probe| probe_to_pending_record(job.root_id, job.scan_marker, probe))
+        .collect();
+    if !pending_rows.is_empty() {
+        let write_started = Instant::now();
+        let written = db::insert_pending_rows(db_path, &pending_rows)?;
+        log::info!(
+            "Scan job {}: {} new row(s) written in {}ms (thumbnail and classification fill them)",
+            job_id,
+            written,
+            write_started.elapsed().as_millis()
+        );
+    }
+
     let mut processed_files = start_index as u64;
     let mut added = job.added;
     let mut modified = job.modified;
@@ -2093,6 +2113,41 @@ fn infer_media_type_from_extension(filename: &str) -> &'static str {
 }
 
 /// Build a minimal DB record with placeholder classification (confidence=0).
+/// A row holding only what discovery knows: the path, the size and the timestamp.
+///
+/// Deliberately does **no** I/O — no fingerprint, no EXIF, no ffprobe, no thumbnail. That
+/// is what makes writing 58k rows at the end of the walk cheap (a single transaction), and
+/// the thumbnail phase (or the pipeline) fills the rest afterwards.
+fn probe_to_pending_record(
+    root_id: i64,
+    scan_marker: i64,
+    probe: &FileProbe,
+) -> crate::models::FileRecordUpsert {
+    crate::models::FileRecordUpsert {
+        root_id,
+        rel_path: probe.rel_path.clone(),
+        abs_path: probe.abs_path.clone(),
+        filename: probe.filename.clone(),
+        media_type: infer_media_type_from_extension(&probe.filename).to_string(),
+        description: String::new(),
+        extracted_text: String::new(),
+        canonical_mentions: String::new(),
+        confidence: 0.0,
+        lang_hint: String::new(),
+        mtime_ns: probe.mtime_ns,
+        size_bytes: probe.size_bytes,
+        fingerprint: String::new(),
+        scan_marker,
+        location_text: String::new(),
+        dhash: None,
+        duration_secs: None,
+        video_width: None,
+        video_height: None,
+        video_codec: None,
+        audio_codec: None,
+    }
+}
+
 fn probe_to_minimal_record(
     root_id: i64,
     scan_marker: i64,
@@ -3182,9 +3237,24 @@ mod tests {
             "the readable file should still be indexed"
         );
 
+        // The walk lists both paths and discovery now writes the rows, so both are in the
+        // index. The unreadable one carries nothing beyond the path — no fingerprint, no
+        // thumbnail — and stays pending, which is more honest than hiding a file that
+        // exists. Phase 2 still refuses to read it, so no work is spent on it.
         let indexed = db::load_existing_files(&db_path, job.root_id).expect("load");
-        let paths: Vec<&str> = indexed.iter().map(|f| f.rel_path.as_str()).collect();
-        assert_eq!(paths, vec!["b.jpg"]);
+        let mut paths: Vec<&str> = indexed.iter().map(|f| f.rel_path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, vec!["a.jpg", "b.jpg"]);
+
+        let backlog = db::list_backlog_rows(&db_path, job.root_id).expect("backlog");
+        let unreadable_row = backlog
+            .iter()
+            .find(|row| row.rel_path == "a.jpg")
+            .expect("the unreadable path is in the index");
+        assert!(
+            unreadable_row.thumb_path.is_none() && unreadable_row.needs_classification,
+            "an unreadable file keeps only its path: no thumbnail, still pending"
+        );
     }
 
     /// A modified file that becomes unreadable keeps its existing index entry:
