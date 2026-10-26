@@ -31,6 +31,8 @@ Why the two flags:
 - `--bundles deb,appimage` — [`tauri.conf.json`](../sherlock/desktop/src-tauri/tauri.conf.json) sets `bundle.targets` to `all`, which also builds an RPM. Without `rpmbuild` installed that step fails and aborts the build.
 - `--config '{"bundle":{"createUpdaterArtifacts":false}}'` — the config enables `createUpdaterArtifacts`, and signing needs `TAURI_SIGNING_PRIVATE_KEY`, which only exists in upstream CI. The override is merged in memory only, so the repository config is unchanged.
 
+[`scripts/build-local.sh`](../scripts/build-local.sh) wraps all of the above: it installs frontend dependencies, runs `cargo test`, and then builds. The script applies the same `createUpdaterArtifacts` override automatically **unless** `TAURI_SIGNING_PRIVATE_KEY` is exported, so a plain local build never asks for the minisign key while a release build still signs its artifacts.
+
 First release build compiles every dependency and takes a few minutes; later builds are incremental. To build only one format, use `--bundles deb` or `--bundles appimage`.
 
 If `cargo` is not found, `tauri dev` and `tauri build` both fail with `failed to run 'cargo metadata'`. Prefix `PATH` as shown, or use [`scripts/dev-linux.sh`](../scripts/dev-linux.sh) for dev runs.

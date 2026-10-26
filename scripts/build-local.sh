@@ -18,7 +18,18 @@ cargo test
 
 echo "==> Building Tauri app (release)"
 cd "$DESKTOP_DIR"
-npm run tauri:build
+# `bundle.createUpdaterArtifacts` is true in tauri.conf.json, so a plain
+# `tauri build` insists on signing the updater artifacts and fails with
+# "A public key has been found, but no private key" when the minisign key is
+# not exported. Local builds don't ship through the updater, so we turn the
+# artifacts off unless the key is actually available (that's the release case).
+if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+  echo "    signing updater artifacts (TAURI_SIGNING_PRIVATE_KEY is set)"
+  npm run tauri:build
+else
+  echo "    no TAURI_SIGNING_PRIVATE_KEY: building without updater artifacts"
+  npm run tauri:build -- --config '{"bundle":{"createUpdaterArtifacts":false}}'
+fi
 
 echo ""
 echo "==> Build complete!"
