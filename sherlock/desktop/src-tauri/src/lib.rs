@@ -323,10 +323,58 @@ fn start_scan(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<ScanJobStatus, String> {
-    require_writable(state.inner())?;
     let raw_mode = mode.unwrap_or_else(|| "full".to_string());
     let mode = scan::ScanMode::parse(&raw_mode)
         .ok_or_else(|| format!("invalid scan mode '{raw_mode}'"))?;
+    begin_scan(root_path, mode, None, state, app_handle)
+}
+
+/// Retry only the rows the previous attempts gave up on.
+///
+/// The default backlog pass skips marked failures (they would otherwise be sent to
+/// the GPU on every pass forever), so this is the way back in — and the place where
+/// trying another model or resolution makes sense, hence the overrides.
+#[tauri::command]
+fn retry_failed(
+    root_path: String,
+    overrides: Option<models::ScanOverrides>,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<ScanJobStatus, String> {
+    let overrides = overrides.unwrap_or_default();
+    // Validate before creating the job: a typo must not leave a job that dies on
+    // the first file with the settings silently ignored.
+    if let Some(profile) = overrides.prompt_profile.as_deref() {
+        config::PromptProfile::parse(profile)
+            .ok_or_else(|| format!("invalid prompt_profile '{profile}'"))?;
+    }
+    if let Some(engine) = overrides.ocr_engine.as_deref() {
+        config::OcrEngine::parse(engine).ok_or_else(|| format!("invalid ocr_engine '{engine}'"))?;
+    }
+    begin_scan(
+        root_path,
+        scan::ScanMode::RetryFailed,
+        Some(overrides),
+        state,
+        app_handle,
+    )
+}
+
+/// How many rows of this root are waiting for a retry (`Retry failed`).
+#[tauri::command]
+fn failed_classifications(root_id: i64, state: State<'_, AppState>) -> Result<u64, String> {
+    db::failed_classification_count(&state.paths.db_file, root_id).map_err(|e| e.to_string())
+}
+
+/// Body shared by every command that starts a scan job.
+fn begin_scan(
+    root_path: String,
+    mode: scan::ScanMode,
+    overrides: Option<models::ScanOverrides>,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<ScanJobStatus, String> {
+    require_writable(state.inner())?;
     log::info!("start_scan: {} in mode {}", root_path, mode.as_str());
 
     // Only require Ollama setup when the scan will actually classify files.
@@ -347,7 +395,7 @@ fn start_scan(
 
     // Any other action ends the backlog story: leaving a finished record behind kept
     // the sidebar panel (and its Stop button) on screen until the app restarted.
-    if mode != scan::ScanMode::Backlog {
+    if !mode.uses_backlog_pipeline() {
         let mut progress = state
             .backlog_progress
             .lock()
@@ -357,7 +405,7 @@ fn start_scan(
 
     // The backlog needs its own live record: the job row only carries one
     // counter, and the sidebar shows thumbnails and classifications side by side.
-    if mode == scan::ScanMode::Backlog {
+    if mode.uses_backlog_pipeline() {
         let mut progress = state
             .backlog_progress
             .lock()
@@ -379,7 +427,7 @@ fn start_scan(
         });
     }
     let app_state = state.inner().clone();
-    spawn_scan_worker_if_needed(app_state, &app_handle, job.id, mode);
+    spawn_scan_worker_if_needed(app_state, &app_handle, job.id, mode, overrides);
     db::get_scan_job(&state.paths.db_file, job.id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "scan job not found after start".to_string())
@@ -2030,6 +2078,7 @@ fn spawn_scan_worker_if_needed(
     app_handle: &tauri::AppHandle,
     job_id: i64,
     mode: scan::ScanMode,
+    overrides: Option<models::ScanOverrides>,
 ) {
     {
         let mut guard = app_state
@@ -2051,7 +2100,17 @@ fn spawn_scan_worker_if_needed(
         flags.insert(job_id, cancel_flag.clone());
     }
 
-    let scan_ctx = build_scan_context(&app_state, app_handle);
+    let mut scan_ctx = build_scan_context(&app_state, app_handle);
+    if let Some(overrides) = overrides.as_ref() {
+        overrides.apply(&mut scan_ctx);
+        log::info!(
+            "scan job {job_id}: running with overrides — model {}, {} px, profile {}, ocr {}",
+            scan_ctx.model,
+            scan_ctx.image_max_side,
+            scan_ctx.prompt_profile.as_str(),
+            scan_ctx.ocr_engine.as_str()
+        );
+    }
     let jobs = app_state.running_scan_jobs.clone();
     let cancel_flags = app_state.cancel_flags.clone();
     let app_state_for_task = app_state.clone();
@@ -2097,7 +2156,7 @@ fn spawn_scan_worker_if_needed(
             );
         }
 
-        if mode == scan::ScanMode::Backlog {
+        if mode.uses_backlog_pipeline() {
             let mut guard = app_state_for_task
                 .backlog_progress
                 .lock()
@@ -2310,6 +2369,8 @@ pub fn run() {
             thumb_repair_status,
             cancel_thumb_repair,
             backlog_status,
+            retry_failed,
+            failed_classifications,
             list_subdirectories,
             load_user_config,
             save_user_config,

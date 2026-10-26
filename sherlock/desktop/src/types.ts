@@ -392,7 +392,20 @@ export type VisionPromptProfile = "concise" | "detailed";
 export type VisionOcrEngine = "off" | "llm" | "surya";
 
 /** What a scan job is allowed to do. */
-export type ScanMode = "full" | "refresh" | "classify_only" | "backlog";
+export type ScanMode = "full" | "refresh" | "classify_only" | "backlog" | "retry_failed";
+
+/**
+ * Per-run overrides for `retryFailed`.
+ *
+ * Anything omitted keeps `settings.toml`, so a retry of known-bad files cannot
+ * silently change what the rest of the library uses.
+ */
+export type ScanOverrides = {
+  model?: string | null;
+  imageMaxSide?: number | null;
+  promptProfile?: string | null;
+  ocrEngine?: string | null;
+};
 
 /** Startup behaviour for an already-indexed folder. */
 export type StartupScanSetting = "ask" | "classify_only" | "full" | "none";

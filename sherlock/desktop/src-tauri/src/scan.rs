@@ -93,6 +93,12 @@ pub enum ScanMode {
     /// or a classification. No discovery, no cleanup; the backlog is re-derived
     /// from the index on every run, so an interrupted pass resumes by itself.
     Backlog,
+    /// The rows the last attempts gave up on, and nothing else.
+    ///
+    /// Same pipeline, different selection: it is the way back in for a row that the
+    /// default pass now skips, so it can be tried with another model or resolution
+    /// ([`crate::models::ScanOverrides`]).
+    RetryFailed,
 }
 
 impl ScanMode {
@@ -102,6 +108,7 @@ impl ScanMode {
             "refresh" => Some(ScanMode::Refresh),
             "classify_only" | "classify-only" | "classify" => Some(ScanMode::ClassifyOnly),
             "backlog" | "process_backlog" | "process-backlog" => Some(ScanMode::Backlog),
+            "retry_failed" | "retry-failed" | "retry" => Some(ScanMode::RetryFailed),
             _ => None,
         }
     }
@@ -112,7 +119,13 @@ impl ScanMode {
             ScanMode::Refresh => "refresh",
             ScanMode::ClassifyOnly => "classify_only",
             ScanMode::Backlog => "backlog",
+            ScanMode::RetryFailed => "retry_failed",
         }
+    }
+
+    /// True for the modes that run the backlog pipeline (`Backlog`, `RetryFailed`).
+    pub fn uses_backlog_pipeline(&self) -> bool {
+        matches!(self, ScanMode::Backlog | ScanMode::RetryFailed)
     }
 
     pub fn skips_classification(&self) -> bool {
@@ -201,8 +214,16 @@ fn run_scan_job_impl(
     if mode == ScanMode::ClassifyOnly {
         return run_classify_only(ctx, &job, job_id, cancel_flag, started);
     }
-    if mode == ScanMode::Backlog {
-        return run_backlog_pipeline(ctx, &job, job_id, cancel_flag, started, on_backlog_tick);
+    if mode.uses_backlog_pipeline() {
+        return run_backlog_pipeline(
+            ctx,
+            &job,
+            job_id,
+            cancel_flag,
+            started,
+            on_backlog_tick,
+            mode == ScanMode::RetryFailed,
+        );
     }
 
     log::info!(
@@ -1181,6 +1202,86 @@ struct BacklogCounters {
     /// pointers that only a `stat` can reveal.
     thumbs_needed: AtomicU64,
     failed: AtomicU64,
+    /// Rows whose context window is bigger than the one this block runs at. They
+    /// get a block of their own on the next pass, now that the size is recorded.
+    deferred: AtomicU64,
+    /// Rows the producer could not open or prepare. Kept apart from `failed` on
+    /// purpose: this is a local/index problem, not a classification failure, and it
+    /// must not feed the circuit breaker (see [`is_permanent_failure`]).
+    unreadable: AtomicU64,
+}
+
+/// A group of backlog rows that resolve to the same context window.
+struct CtxBlock {
+    /// `num_ctx` this block runs at. Ollama treats it as part of the runner
+    /// identity, so the whole block shares one value.
+    ctx: u32,
+    /// True when the rows had no recorded dimensions and are measured on the fly:
+    /// the producer keeps only the rows that fit `ctx` and defers the rest.
+    probed: bool,
+    rows: Vec<db::BacklogRow>,
+}
+
+/// Split the backlog into blocks that each need one context window.
+///
+/// `num_ctx` is derived from the image size ([`classify::primary_ctx_for`]) and it
+/// is part of Ollama's runner identity: changing it tears the runner down and
+/// reloads the model (~2.1 s plus a 7.3 GiB graph per switch, §5.5 of
+/// `plans/pipeline-cpu-gpu-overlap.md`). Grouping by window means a pass pays at
+/// most one reload per block instead of one per file.
+///
+/// Ascending order, so the cheapest window runs first. Rows with no recorded
+/// dimensions come last: the producer probes their header (a few KB, no decode),
+/// stores the size, and keeps only the rows that fit the window already loaded —
+/// the rest are deferred to the next pass, where their size is known and they get
+/// their own block.
+fn ctx_blocks(rows: &[db::BacklogRow], ctx: &ScanContext) -> Vec<CtxBlock> {
+    let profile = ctx.vision_settings().prompt_profile;
+    let mut known: std::collections::BTreeMap<u32, Vec<db::BacklogRow>> =
+        std::collections::BTreeMap::new();
+    let mut probed: Vec<db::BacklogRow> = Vec::new();
+
+    for row in rows {
+        // Video and PDF go through the legacy path, which prepares its own frames
+        // or pages inside the consumer; nothing here can predict their window, so
+        // they ride with the probed block.
+        let legacy = matches!(row.media_type.as_str(), "video" | "pdf");
+        match (row.image_width, row.image_height) {
+            (Some(width), Some(height)) if !legacy => known
+                .entry(classify::primary_ctx_for(
+                    width,
+                    height,
+                    ctx.image_max_side,
+                    profile,
+                ))
+                .or_default()
+                .push(row.clone()),
+            _ => probed.push(row.clone()),
+        }
+    }
+
+    let mut blocks: Vec<CtxBlock> = known
+        .into_iter()
+        .map(|(ctx, rows)| CtxBlock {
+            ctx,
+            probed: false,
+            rows,
+        })
+        .collect();
+    if !probed.is_empty() {
+        // The last known window is the largest one, so a probed row that fits it
+        // can run without changing the runner identity.
+        let ctx = blocks
+            .last()
+            .map(|block| block.ctx)
+            .unwrap_or(crate::llm::MIN_NUM_CTX);
+        blocks.push(CtxBlock {
+            ctx,
+            probed: true,
+            rows: probed,
+        });
+    }
+    blocks
 }
 
 /// Producer half of the pipeline: decode once, thumbnail, prepare for the model.
@@ -1193,11 +1294,12 @@ fn produce_backlog_items(
     ctx: &ScanContext,
     root_id: i64,
     thumb_dir: &Path,
-    rows: &[db::BacklogRow],
+    block: &CtxBlock,
     cancel: Option<&AtomicBool>,
     counters: &BacklogCounters,
 ) {
-    for row in rows {
+    let profile = ctx.vision_settings().prompt_profile;
+    for row in &block.rows {
         if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             break;
         }
@@ -1218,8 +1320,55 @@ fn produce_backlog_items(
         }
 
         let abs = Path::new(&row.abs_path);
+
+        // Which context window will this row need? The answer has to be known
+        // *before* the decode: preparing an image for a window we are not going to
+        // send wastes the work, and sending it in the wrong window costs a model
+        // reload. Rows with a recorded size are already in the right block; the rest
+        // are measured now (header only) and get their block on the next pass.
+        if row.needs_classification {
+            let dims = match (row.image_width, row.image_height) {
+                (Some(width), Some(height)) => Some((width, height)),
+                _ => match vision_prep::image_dimensions(abs) {
+                    Ok((width, height)) => {
+                        // Cache it so the next pass groups this row without even
+                        // opening the file.
+                        if let Err(e) =
+                            db::set_image_dimensions(&ctx.db_path, row.id, width, height)
+                        {
+                            log::debug!(
+                                "Backlog: could not record dimensions for {}: {e}",
+                                row.rel_path
+                            );
+                        }
+                        Some((width, height))
+                    }
+                    Err(e) => {
+                        log::debug!(
+                            "Backlog: cannot read the size of {} ({e}); sending it anyway",
+                            row.rel_path
+                        );
+                        None
+                    }
+                },
+            };
+            if let Some((width, height)) = dims {
+                let needed = classify::primary_ctx_for(width, height, ctx.image_max_side, profile);
+                if needed > block.ctx {
+                    // Another window owns this row. Sending it here would either
+                    // 400 (too big for the loaded window) or reload the model,
+                    // which is what the blocks exist to avoid.
+                    counters.deferred.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            }
+        }
+
         let Some(decoded) = thumbnail::decode_source(abs) else {
-            counters.failed.fetch_add(1, Ordering::Relaxed);
+            // Not counted toward the circuit breaker and not persisted: a file the
+            // NAS no longer has (or an unmounted share) says nothing about Ollama,
+            // and hiding the row would need a rescan to undo.
+            counters.unreadable.fetch_add(1, Ordering::Relaxed);
             let item = BacklogItem {
                 row: row.clone(),
                 prepared: None,
@@ -1288,7 +1437,7 @@ fn produce_backlog_items(
                         "Backlog: cannot prepare {} for the model: {e}",
                         row.rel_path
                     );
-                    counters.failed.fetch_add(1, Ordering::Relaxed);
+                    counters.unreadable.fetch_add(1, Ordering::Relaxed);
                     None
                 }
             }
@@ -1313,6 +1462,40 @@ fn produce_backlog_items(
     }
 }
 
+/// Failure kinds worth persisting on the row.
+///
+/// Only the ones that are a property of **this file with this model**: a repetition
+/// loop, a context overflow, a body that does not parse after four attempts. Those
+/// would fail again the same way, so re-sending them every pass is pure waste.
+///
+/// The environmental ones (`io`, `timeout`, `empty_frame`, `no_response`, `decode`,
+/// `prepare`, and an empty `unknown`) are deliberately **not** persisted: an
+/// unmounted share, a wedged runner or a row whose file was deleted on the NAS would
+/// otherwise be hidden from the backlog forever. That is not hypothetical — on
+/// 2026-10-26 a pass marked 44 rows as failed because their files no longer existed,
+/// and the same 44 fed the circuit breaker until the job aborted. Those rows belong
+/// back in the queue, where the next discovery can drop or heal them.
+fn is_permanent_failure(kind: &str) -> bool {
+    matches!(kind, "repeat_limit" | "ctx_overflow" | "parse")
+}
+
+/// Persist why a row produced nothing, so the next pass does not send it again.
+///
+/// Without this the row came back on every pass — 63 of 886 files, 3–4 requests
+/// each, measured on 2026-10-25 — so a backlog could never converge and the reason
+/// existed only as a `WARN` in a log the next start truncates. `Retry failed` is the
+/// explicit way back in ([`db::list_failed_rows`]).
+fn mark_failed(ctx: &ScanContext, file_id: i64, kind: &str, detail: &str) {
+    if !is_permanent_failure(kind) {
+        log::debug!("Not marking file {file_id} as failed: '{kind}' is environmental");
+        return;
+    }
+    let detail: String = detail.chars().take(400).collect();
+    if let Err(e) = db::mark_file_failed(&ctx.db_path, file_id, kind, &detail) {
+        log::error!("Could not record the failure for file {file_id}: {e}");
+    }
+}
+
 /// Classify `file_id` from an already prepared image and persist the result.
 fn classify_prepared_and_update(
     ctx: &ScanContext,
@@ -1329,7 +1512,11 @@ fn classify_prepared_and_update(
         ctx.vision_settings(),
     );
     if classify::is_empty_result(&classification) {
-        log::warn!("Classifying {abs_path} produced nothing usable; row left untouched");
+        log::warn!(
+            "Classifying {abs_path} produced nothing usable ({}); row marked failed",
+            classification.failure_kind
+        );
+        mark_failed(ctx, file_id, &classification.failure_kind, "");
         return false;
     }
     match db::update_file_classification(
@@ -1368,15 +1555,34 @@ fn run_backlog_pipeline(
     cancel_flag: Option<&AtomicBool>,
     started: Instant,
     on_tick: &(dyn Fn(BacklogTick) + Sync),
+    only_failed: bool,
 ) -> AppResult<ScanSummary> {
     let db_path = &ctx.db_path;
     let root_path = canonical_root_path(&job.root_path)?;
     let thumb_dir = ctx.thumb_dir_for(&thumbnail::root_key(&job.root_path));
-    let rows = db::list_backlog_rows(db_path, job.root_id)?;
+    // `only_failed` is the "Retry failed" pass: the default selection skips rows
+    // that already burned every attempt, so this is the only way back in for them.
+    let rows = if only_failed {
+        db::list_failed_rows(db_path, job.root_id)?
+    } else {
+        db::list_backlog_rows(db_path, job.root_id)?
+    };
     let total = rows.len() as u64;
+    // The phase is what the sidebar uses to resume in the right mode, so a retry
+    // must not be recorded as a backlog pass.
+    let phase = if only_failed {
+        "retry_failed"
+    } else {
+        "backlog"
+    };
 
     log::info!(
-        "Scan job {job_id}: backlog pass for {} ({total} file(s) need work)",
+        "Scan job {job_id}: {} pass for {} ({total} file(s))",
+        if only_failed {
+            "retry-failed"
+        } else {
+            "backlog"
+        },
         root_path.display()
     );
     // Two stage-specific denominators: most rows need only one of the two, and
@@ -1394,7 +1600,7 @@ fn run_backlog_pipeline(
     db::checkpoint_scan_job(
         db_path,
         job_id,
-        "backlog",
+        phase,
         total,
         0,
         None,
@@ -1416,138 +1622,174 @@ fn run_backlog_pipeline(
     let mut consecutive_failures: u32 = 0;
     let mut aborted_by_breaker = false;
 
+    // A change of `num_ctx` reloads the model, so the pass runs one block per
+    // window instead of one window per file (see [`ctx_blocks`]).
+    let blocks = ctx_blocks(&rows, ctx);
+    if blocks.len() > 1 {
+        log::info!(
+            "Scan job {job_id}: {} context block(s) — {}",
+            blocks.len(),
+            blocks
+                .iter()
+                .map(|block| format!("num_ctx {} ({} file(s))", block.ctx, block.rows.len()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
     // Four is enough to keep the consumer busy while bounding the prepared JPEGs
     // on disk to a handful.
     const QUEUE_DEPTH: usize = 4;
-    let (tx, rx) = std::sync::mpsc::sync_channel::<BacklogItem>(QUEUE_DEPTH);
-
-    let rows_ref: &[db::BacklogRow] = &rows;
     let thumb_dir_ref: &Path = &thumb_dir;
     let counters_ref = &counters;
     let root_id = job.root_id;
     let ctx_ref = ctx;
 
-    std::thread::scope(|scope| -> AppResult<()> {
-        let producer = scope.spawn(move || {
-            produce_backlog_items(
-                tx,
-                ctx_ref,
-                root_id,
-                thumb_dir_ref,
-                rows_ref,
-                cancel_flag,
-                counters_ref,
-            );
-        });
-
-        for item in rx.iter() {
-            if cancelled() {
-                break;
+    for (block_index, block) in blocks.iter().enumerate() {
+        if cancelled() {
+            break;
+        }
+        let block_ref: &CtxBlock = block;
+        let block_ctx = block.ctx;
+        log::info!(
+            "Scan job {job_id}: block {}/{} — {} file(s) at num_ctx {block_ctx}{}",
+            block_index + 1,
+            blocks.len(),
+            block.rows.len(),
+            if block.probed {
+                " (sizes measured now; rows that need more are deferred)"
+            } else {
+                ""
             }
+        );
+        let (tx, rx) = std::sync::mpsc::sync_channel::<BacklogItem>(QUEUE_DEPTH);
 
-            let item_ok = if item.legacy {
-                classify_and_update(ctx, item.row.id, &item.row.abs_path);
-                classified += 1;
-                true
-            } else if item.failed {
-                // The producer already counted it.
-                false
-            } else if let Some(prepared) = item.prepared.as_ref() {
-                let representative = item
-                    .dhash
-                    .and_then(|dhash| dedupe.representative_for_hash(dhash));
-                match representative {
-                    Some(representative) => {
-                        if db::copy_classification(db_path, item.row.id, representative).is_ok() {
-                            deduped += 1;
-                            true
-                        } else if classify_prepared_and_update(
-                            ctx,
-                            item.row.id,
-                            &item.row.abs_path,
-                            prepared,
-                        ) {
-                            classified += 1;
-                            true
-                        } else {
-                            counters.failed.fetch_add(1, Ordering::Relaxed);
-                            false
-                        }
-                    }
-                    None => {
-                        if classify_prepared_and_update(
-                            ctx,
-                            item.row.id,
-                            &item.row.abs_path,
-                            prepared,
-                        ) {
-                            classified += 1;
-                            if let Some(dhash) = item.dhash {
-                                dedupe.insert(dhash, item.row.id);
-                            }
-                            true
-                        } else {
-                            counters.failed.fetch_add(1, Ordering::Relaxed);
-                            false
-                        }
-                    }
-                }
-            } else {
-                // Thumbnail-only row: nothing left that can fail here.
-                true
-            };
+        std::thread::scope(|scope| -> AppResult<()> {
+            let producer = scope.spawn(move || {
+                produce_backlog_items(
+                    tx,
+                    ctx_ref,
+                    root_id,
+                    thumb_dir_ref,
+                    block_ref,
+                    cancel_flag,
+                    counters_ref,
+                );
+            });
 
-            if item_ok {
-                consecutive_failures = 0;
-            } else {
-                consecutive_failures += 1;
-                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                    log::error!(
-                        "Backlog: {consecutive_failures} consecutive failures; aborting. \
-                         Ollama is either down or its runner keeps crashing (VRAM)."
-                    );
-                    aborted_by_breaker = true;
+            for item in rx.iter() {
+                if cancelled() {
                     break;
                 }
-            }
 
-            processed += 1;
-            let thumbs_needed = counters.thumbs_needed.load(Ordering::Relaxed);
-            on_tick(BacklogTick {
-                total,
-                processed,
-                thumbnailed: counters.thumbnailed.load(Ordering::Relaxed),
-                // A dead pointer discovered by the producer widens the denominator.
-                thumbs_total: thumbless.max(thumbs_needed),
-                classified,
-                classify_total,
-                deduped,
-                failed: counters.failed.load(Ordering::Relaxed),
-            });
-            if processed % 25 == 0 {
-                db::checkpoint_scan_job(
-                    db_path,
-                    job_id,
-                    "backlog",
+                let item_ok = if item.legacy {
+                    classify_and_update(ctx, item.row.id, &item.row.abs_path);
+                    classified += 1;
+                    true
+                } else if item.failed {
+                    // The producer already counted it in `unreadable`. Returning `true`
+                    // keeps it out of the circuit breaker: a batch of deleted files is
+                    // not evidence that the runner keeps crashing, and counting it as
+                    // such aborted a whole pass on 2026-10-26.
+                    true
+                } else if let Some(prepared) = item.prepared.as_ref() {
+                    let representative = item
+                        .dhash
+                        .and_then(|dhash| dedupe.representative_for_hash(dhash));
+                    match representative {
+                        Some(representative) => {
+                            if db::copy_classification(db_path, item.row.id, representative).is_ok()
+                            {
+                                deduped += 1;
+                                true
+                            } else if classify_prepared_and_update(
+                                ctx,
+                                item.row.id,
+                                &item.row.abs_path,
+                                prepared,
+                            ) {
+                                classified += 1;
+                                true
+                            } else {
+                                counters.failed.fetch_add(1, Ordering::Relaxed);
+                                false
+                            }
+                        }
+                        None => {
+                            if classify_prepared_and_update(
+                                ctx,
+                                item.row.id,
+                                &item.row.abs_path,
+                                prepared,
+                            ) {
+                                classified += 1;
+                                if let Some(dhash) = item.dhash {
+                                    dedupe.insert(dhash, item.row.id);
+                                }
+                                true
+                            } else {
+                                counters.failed.fetch_add(1, Ordering::Relaxed);
+                                false
+                            }
+                        }
+                    }
+                } else {
+                    // Thumbnail-only row: nothing left that can fail here.
+                    true
+                };
+
+                if item_ok {
+                    consecutive_failures = 0;
+                } else {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                        log::error!(
+                            "Backlog: {consecutive_failures} consecutive failures; aborting. \
+                         Ollama is either down or its runner keeps crashing (VRAM)."
+                        );
+                        aborted_by_breaker = true;
+                        break;
+                    }
+                }
+
+                processed += 1;
+                let thumbs_needed = counters.thumbs_needed.load(Ordering::Relaxed);
+                on_tick(BacklogTick {
                     total,
                     processed,
-                    None,
-                    job.added,
-                    job.modified,
-                    job.moved,
-                    job.unchanged,
-                )?;
+                    thumbnailed: counters.thumbnailed.load(Ordering::Relaxed),
+                    // A dead pointer discovered by the producer widens the denominator.
+                    thumbs_total: thumbless.max(thumbs_needed),
+                    classified,
+                    classify_total,
+                    deduped,
+                    failed: counters.failed.load(Ordering::Relaxed),
+                });
+                if processed % 25 == 0 {
+                    db::checkpoint_scan_job(
+                        db_path,
+                        job_id,
+                        phase,
+                        total,
+                        processed,
+                        None,
+                        job.added,
+                        job.modified,
+                        job.moved,
+                        job.unchanged,
+                    )?;
+                }
             }
-        }
 
-        // Closing the receiver unblocks a producer parked on `send`; without it a
-        // cancel would deadlock the join below.
-        drop(rx);
-        if producer.join().is_err() {
-            log::error!("Backlog: producer thread panicked");
-        }
-        Ok(())
-    })?;
+            // Closing the receiver unblocks a producer parked on `send`; without it a
+            // cancel would deadlock the join below.
+            drop(rx);
+            if producer.join().is_err() {
+                log::error!("Backlog: producer thread panicked");
+            }
+            Ok(())
+        })?;
+    }
 
     if aborted_by_breaker {
         let message = format!(
@@ -1559,6 +1801,8 @@ fn run_backlog_pipeline(
     }
 
     let failed = counters.failed.load(Ordering::Relaxed);
+    let deferred = counters.deferred.load(Ordering::Relaxed);
+    let unreadable = counters.unreadable.load(Ordering::Relaxed);
     let summary = ScanSummary {
         root_id: job.root_id,
         root_path: root_path.display().to_string(),
@@ -1580,10 +1824,18 @@ fn run_backlog_pipeline(
         db::complete_scan_job_by_id(db_path, job_id, &summary, None)?;
     }
     log::info!(
-        "Backlog: {processed} processed, {classified} classified ({deduped} deduped), \
-         {} thumbnailed, {failed} failed",
+        "Backlog{}: {processed} processed, {classified} classified ({deduped} deduped), \
+         {} thumbnailed, {failed} failed, {deferred} deferred to the next pass, \
+         {unreadable} unreadable",
+        if only_failed { " (retry failed)" } else { "" },
         summary.healed
     );
+    if unreadable > 0 {
+        log::warn!(
+            "Backlog: {unreadable} file(s) could not be opened; if they no longer exist \
+             on disk, run Refresh so the index drops them"
+        );
+    }
     Ok(summary)
 }
 
@@ -1914,7 +2166,11 @@ fn classify_and_update(ctx: &ScanContext, file_id: i64, abs_path: &str) -> bool 
     };
 
     if classify::is_empty_result(&classification) {
-        log::warn!("Classifying {abs_path} produced nothing usable; row left untouched");
+        log::warn!(
+            "Classifying {abs_path} produced nothing usable ({}); row marked failed",
+            classification.failure_kind
+        );
+        mark_failed(ctx, file_id, &classification.failure_kind, "");
         return false;
     }
     match db::update_file_classification(
@@ -2522,7 +2778,15 @@ mod tests {
         let thumb_dir = ctx.thumb_dir_for(&thumbnail::root_key(&root_path));
         let (tx, rx) = std::sync::mpsc::sync_channel::<BacklogItem>(4);
 
-        produce_backlog_items(tx, &ctx, root_id, &thumb_dir, &rows, None, &counters);
+        produce_backlog_items(
+            tx,
+            &ctx,
+            root_id,
+            &thumb_dir,
+            &block_of(rows, crate::llm::MIN_NUM_CTX),
+            None,
+            &counters,
+        );
 
         let item = rx.try_recv().expect("one item for one row");
         assert!(!item.failed);
@@ -2569,7 +2833,7 @@ mod tests {
             &ctx,
             root_id,
             &thumb_dir,
-            &rows,
+            &block_of(rows, crate::llm::MIN_NUM_CTX),
             Some(&cancel),
             &counters,
         );
@@ -2585,6 +2849,136 @@ mod tests {
             "a.png",
         );
         assert!(!thumb_path.exists(), "cancelled producer must not write");
+    }
+
+    /// Rows are grouped by the window their prepared image will need, cheapest
+    /// first, and the ones with no recorded size come last so they cannot change
+    /// the runner identity in the middle of a known block.
+    #[test]
+    fn backlog_rows_are_grouped_by_context_window() {
+        let (mut ctx, root_id, _root_path, _dirs) = backlog_fixture();
+        // 1280 px is the first prep size where a square image needs the next
+        // window; at 768 every still image resolves to 4096.
+        ctx.image_max_side = 1280;
+        let base = db::list_backlog_rows(&ctx.db_path, root_id)
+            .expect("backlog")
+            .remove(0);
+
+        let mut photo = base.clone();
+        photo.rel_path = "photo.jpg".to_string();
+        photo.image_width = Some(4000);
+        photo.image_height = Some(3000);
+
+        let mut square = base.clone();
+        square.rel_path = "square.jpg".to_string();
+        square.image_width = Some(3000);
+        square.image_height = Some(3000);
+
+        let mut unknown = base.clone();
+        unknown.rel_path = "unknown.jpg".to_string();
+        unknown.image_width = None;
+        unknown.image_height = None;
+
+        let blocks = ctx_blocks(&[square.clone(), unknown.clone(), photo.clone()], &ctx);
+        assert_eq!(blocks.len(), 3, "two windows plus the probed block");
+        assert_eq!(blocks[0].ctx, 4096);
+        assert!(!blocks[0].probed);
+        assert_eq!(blocks[0].rows[0].rel_path, "photo.jpg");
+        assert_eq!(blocks[1].ctx, 8192);
+        assert!(!blocks[1].probed);
+        assert_eq!(blocks[1].rows[0].rel_path, "square.jpg");
+        // A row without dimensions rides at the largest window already loaded.
+        assert_eq!(blocks[2].ctx, 8192);
+        assert!(blocks[2].probed);
+        assert_eq!(blocks[2].rows[0].rel_path, "unknown.jpg");
+
+        // Nothing measured at all: one probed block at the smallest window.
+        let blocks = ctx_blocks(&[unknown], &ctx);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].ctx, crate::llm::MIN_NUM_CTX);
+        assert!(blocks[0].probed);
+    }
+
+    /// A row that needs a bigger window than the block runs at must not be sent:
+    /// Ollama would answer 400 or rebuild the runner, which is what the blocks
+    /// exist to prevent.
+    #[test]
+    fn backlog_producer_defers_a_row_that_needs_a_bigger_window() {
+        let (mut ctx, root_id, root_path, _dirs) = backlog_fixture();
+        ctx.image_max_side = 1280;
+        let mut row = db::list_backlog_rows(&ctx.db_path, root_id)
+            .expect("backlog")
+            .remove(0);
+        // A recorded 3000x3000: at 1280 px it becomes 1280x1280 and needs 8192.
+        row.image_width = Some(3000);
+        row.image_height = Some(3000);
+
+        let counters = BacklogCounters::default();
+        let thumb_dir = ctx.thumb_dir_for(&thumbnail::root_key(&root_path));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<BacklogItem>(4);
+
+        produce_backlog_items(
+            tx,
+            &ctx,
+            root_id,
+            &thumb_dir,
+            &block_of(vec![row], 4096),
+            None,
+            &counters,
+        );
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a row for another window must not be sent"
+        );
+        assert_eq!(counters.deferred.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.failed.load(Ordering::Relaxed), 0);
+        let thumb_path = thumbnail::thumb_path_for(
+            &ctx.thumbnails_dir,
+            &thumbnail::root_key(&root_path),
+            "a.png",
+        );
+        assert!(
+            !thumb_path.exists(),
+            "a deferred row must not be decoded or thumbnailed"
+        );
+    }
+
+    /// The size has to be recorded when it is measured, otherwise every pass probes
+    /// the header of every row again and no row ever gets a block of its own.
+    #[test]
+    fn backlog_producer_records_the_dimensions_it_probed() {
+        let (ctx, root_id, root_path, _dirs) = backlog_fixture();
+        let rows = db::list_backlog_rows(&ctx.db_path, root_id).expect("backlog");
+        assert_eq!(
+            (rows[0].image_width, rows[0].image_height),
+            (None, None),
+            "the fixture has no size recorded yet"
+        );
+
+        let counters = BacklogCounters::default();
+        let thumb_dir = ctx.thumb_dir_for(&thumbnail::root_key(&root_path));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<BacklogItem>(4);
+        produce_backlog_items(
+            tx,
+            &ctx,
+            root_id,
+            &thumb_dir,
+            &block_of(rows, crate::llm::MIN_NUM_CTX),
+            None,
+            &counters,
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "a small image must fit the smallest window"
+        );
+        assert_eq!(counters.deferred.load(Ordering::Relaxed), 0);
+
+        let stored = db::list_backlog_rows(&ctx.db_path, root_id).expect("backlog");
+        assert!(
+            stored[0].image_width.is_some() && stored[0].image_height.is_some(),
+            "the probed size must be cached on the row"
+        );
     }
 
     /// The pipeline dedupes by raw hash, because it has no `UnclassifiedFile` —
@@ -2606,6 +3000,38 @@ mod tests {
         assert_eq!(index.representative_for_hash(0b1010), Some(7));
         assert_eq!(index.representative_for_hash(0b1011), Some(7));
         assert_eq!(index.representative_for_hash(u64::MAX), None);
+    }
+
+    /// A failure the file+model pair would repeat goes on the row; an environmental
+    /// one must not, or the row is hidden from the backlog until a rescan.
+    #[test]
+    fn only_deterministic_failures_are_persisted() {
+        assert!(is_permanent_failure("repeat_limit"));
+        assert!(is_permanent_failure("ctx_overflow"));
+        assert!(is_permanent_failure("parse"));
+        for kind in [
+            "io",
+            "timeout",
+            "empty_frame",
+            "no_response",
+            "decode",
+            "prepare",
+            "unknown",
+        ] {
+            assert!(
+                !is_permanent_failure(kind),
+                "{kind} is environmental and must not hide the row"
+            );
+        }
+    }
+
+    /// A block of rows that all run at `ctx`, for the producer tests.
+    fn block_of(rows: Vec<db::BacklogRow>, ctx: u32) -> CtxBlock {
+        CtxBlock {
+            ctx,
+            probed: false,
+            rows,
+        }
     }
 
     /// A root with one still image that is neither thumbnailed nor classified.

@@ -1,9 +1,10 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   cancelScan, compactDatabase, copyFilesToClipboard, deleteFiles, ensureDatabase,
-  getCliFolderPath, getFileMetadata, getFileProperties, getVisionSettings, listRoots,
+  getCliFolderPath, getFailedClassifications, getFileMetadata, getFileProperties,
+  getVisionSettings, listRoots,
   pendingScanSummary, relinkRoot, removeRoot, renameFile, reorderRoots,
   resetRootClassifications, startScan, updateFileMetadata,
 } from "./api";
@@ -155,6 +156,33 @@ export default function App() {
         .catch(() => {});
     },
   });
+
+  /**
+   * Rows of the selected root that the last attempts gave up on.
+   *
+   * It is a database fact, not a run counter: it survives restarts, so it is
+   * refetched when the selection changes and after every pass (the phase is in the
+   * dependency list for that).
+   */
+  const [failedCount, setFailedCount] = useState(0);
+  useEffect(() => {
+    if (selectedRootId == null) {
+      setFailedCount(0);
+      return;
+    }
+    let cancelled = false;
+    getFailedClassifications(selectedRootId)
+      .then((count) => {
+        if (!cancelled) setFailedCount(count);
+      })
+      .catch(() => {
+        if (!cancelled) setFailedCount(0);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedRootId, backlog.backlog?.phase]);
+
   const albumManager = useAlbumManager({ onNotice: setNotice, onError: setError });
   const smartFolderManager = useSmartFolderManager({ onNotice: setNotice, onError: setError });
   const duplicates = useDuplicatesManager({ onNotice: setNotice, onError: setError });
@@ -950,6 +978,19 @@ export default function App() {
           onCancelThumbRepair={thumbRepair.onCancelThumbRepair}
           backlog={backlog.backlog}
           onCancelBacklog={backlog.onCancelBacklog}
+          failedCount={failedCount}
+          onRetryFailed={readOnly ? undefined : (rootId) => {
+            const root = roots.find((r) => r.id === rootId);
+            if (!root) {
+              setError("Select a folder to retry its failed files.");
+              return;
+            }
+            void scanManager.startScanWithMode(
+              root.rootPath,
+              "retry_failed",
+              `Retrying failed files of ${root.rootName}`,
+            );
+          }}
           onProcessBacklog={readOnly ? undefined : (rootId) => {
             const root = roots.find((r) => r.id === rootId);
             if (!root) {

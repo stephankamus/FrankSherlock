@@ -308,6 +308,33 @@ describe("Sidebar", () => {
     expect(screen.getByRole("button", { name: /Process Backlog/ })).toBeDisabled();
   });
 
+  it("offers a retry only when failures are known", async () => {
+    const onRetryFailed = vi.fn();
+    const { rerender } = render(
+      <Sidebar
+        {...defaultProps}
+        onProcessBacklog={vi.fn()}
+        onRetryFailed={onRetryFailed}
+        failedCount={0}
+      />,
+    );
+    // Zero failures: nothing to retry, so the button is not there at all — a
+    // permanent "Retry 0 Failed" would read like a broken tool.
+    expect(screen.queryByRole("button", { name: /Retry/ })).not.toBeInTheDocument();
+
+    rerender(
+      <Sidebar
+        {...defaultProps}
+        onProcessBacklog={vi.fn()}
+        onRetryFailed={onRetryFailed}
+        failedCount={7}
+      />,
+    );
+    // No root selected → the caller decides which root to retry.
+    await userEvent.click(screen.getByRole("button", { name: /Retry 7 Failed/ }));
+    expect(onRetryFailed).toHaveBeenCalledWith(null);
+  });
+
   it("disables add button when setup not ready", () => {
     render(<Sidebar {...defaultProps} setupReady={false} />);
     const addBtn = screen.getByTitle("Add folder to scan");

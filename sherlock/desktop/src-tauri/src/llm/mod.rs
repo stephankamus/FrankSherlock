@@ -14,7 +14,7 @@ pub fn ollama_base() -> String {
 }
 
 pub use client::{
-    num_ctx_for, ollama_generate, parse_json_response, GenerateParams, OllamaTimings,
+    num_ctx_for, ollama_generate, parse_json_response, GenerateParams, OllamaTimings, MIN_NUM_CTX,
 };
 pub use management::{
     cleanup_loaded_models, list_installed_models, list_installed_models_with_sizes,

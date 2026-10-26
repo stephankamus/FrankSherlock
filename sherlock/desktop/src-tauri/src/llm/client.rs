@@ -89,7 +89,7 @@ impl GenerateParams {
 /// 2048 while the next photo stayed at 4096 — and each change of `num_ctx` makes
 /// Ollama rebuild the runner. 4096 costs ~144 MiB of KV cache, which is cheap
 /// next to a 7.3 GiB graph reallocation.
-const MIN_NUM_CTX: u32 = 4096;
+pub const MIN_NUM_CTX: u32 = 4096;
 
 /// Longest output any stage of the pipeline may ask for (the LLM OCR pass wants
 /// 1500 tokens).

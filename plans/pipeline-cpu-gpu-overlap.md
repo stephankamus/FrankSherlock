@@ -656,6 +656,77 @@ Opções para atacar a causa, em ordem de custo:
 
 Enquanto isso, `runner crashes > 0` no `measure-run.py` invalida o braço.
 
+### 5.8 A passada de 25/10 medida de verdade (886 arquivos, raiz `Fotos`)
+
+Primeira medida em que o resumo descreve **uma** execução. O que ele dizia antes:
+
+| | resumo antigo | janela real |
+|---|---|---|
+| wall | 4543h16m31s (189 dias) | **1h25m12s (5112 s)** |
+| requests | 35 124 (40,1 por arquivo) | **2045 (2,34 por arquivo)** |
+| model loads / spawns / crashes | 5875 / 41 649 / 251 | **0 / 0 / 0** |
+| `KvSize` | 16384, 2048, 4096, 8192 | **4096 em todas** |
+| `BatchSize` | 512 e 128 | **128 em todas** |
+
+Duas causas, as duas de contabilidade:
+
+1. `scan_jobs.started_at` era herdado na retomada ([`db.rs`](../sherlock/desktop/src-tauri/src/db.rs:575)). O job #2 nasceu em **abril** e foi retomado em 25/10, então o "wall" e a janela do journal cobriam seis meses de tráfego alheio. Correção: a retomada carimba `started_at` novo (com `CASE` para não mover o início de um job que já está rodando).
+2. `scripts/measure-run.py` usava essa coluna como janela ([`measure-run.py`](../scripts/measure-run.py:257)). Agora, quando o intervalo é impossível (> 24 h), ele busca 48 h de journal, deriva o início do último bloco contínuo de `/api/generate` e **recorta** as linhas fora dele.
+
+Números da passada, agora comparáveis com §8.1:
+
+| métrica | raiz `Fotos` (886 arq.) | pasta `2020` (191 arq.) |
+|---|---|---|
+| wall | 5112 s — **5,84 s/arquivo** | 423 s — 2,21 s/arquivo |
+| requests | 2045 (2,34/arquivo) | 303 (1,59/arquivo) |
+| 200 / 500 / 400 | 1840 / 186 / 19 | 276 / 26 / 1 |
+| p50 / p95 / máx | 1,29 / **12,64** / 13,83 s | 1,26 / 3,55 / 12,69 s |
+| tempo de GPU | 4792 s = **94 % do wall** | 414 s = 98 % |
+| deduped / failed | 104 / 63 | 24 / 9 |
+
+Três leituras:
+
+1. **O runner está estável.** Zero cargas, zero spawns, zero crashes, um único `KvSize` e um único `BatchSize` na passada inteira: as correções de §5.5–§5.7.5 valem. O aviso de "runner sendo retentado em loop" do resumo antigo era falso positivo.
+2. **O pipeline não tem mais CPU para esconder.** 94 % do wall já é requisição; a conclusão de §8.1 fica mais forte, não mais fraca.
+3. **A cauda não é falha, é OCR.** Os 133 requests acima de 12 s são todos **200** e somam 1741 s = **36 % do tempo de GPU**. Eles param no mesmo platô de ~13 s, que é `run_llm_ocr` com `NUM_PREDICT = 1500` ([`classify.rs`](../sherlock/desktop/src-tauri/src/classify.rs:736)) contra os 180 da classificação. ~15 % da biblioteca dispara enriquecimento de documento.
+
+E o que sobrou de falha real:
+
+- **186 respostas 500** (`prediction aborted, token repeat limit reached`): 8,5 % dos requests, 240 s. Barato em GPU, caro em linhas perdidas — 63 arquivos por passada voltavam para a fila.
+- **19 respostas 400**, **todas** no 4º chute, com o arquivo original. O `num_ctx` era calculado para a imagem preparada de 768 px (4096) e o original precisava de 4136–4201. Aquele chute não podia dar certo: é o que [`original_fits_window`](../sherlock/desktop/src-tauri/src/classify.rs:433) agora detecta antes de gastar o request.
+
+**Backlog real naquele momento:** 44 716 linhas sem descrição de 55 145, 9735 sem thumbnail, 45 543 com trabalho. A 5,84 s/arquivo são **~72 h contínuas**. Cortar o passe de OCR dos 15 % que o disparam é o maior ganho isolado que sobrou.
+
+### 5.9 Blocos de contexto (`num_ctx`) em vez de reload por arquivo
+
+`num_ctx` faz parte da identidade do runner: trocá-lo derruba o runner e recarrega o modelo (§5.5). A passada agora agrupa as linhas pela janela que **a imagem preparada vai precisar** e roda um bloco por janela ([`ctx_blocks`](../sherlock/desktop/src-tauri/src/scan.rs:1213)):
+
+- a janela é derivada de `files.image_width/image_height` (migration 14) mais `image_max_side` e o perfil de prompt — [`primary_ctx_for`](../sherlock/desktop/src-tauri/src/classify.rs:450) usa a **mesma** [`prepared_size`](../sherlock/desktop/src-tauri/src/vision_prep.rs:75) que o `prepare` executa, então a previsão não pode divergir do real;
+- blocos em ordem crescente, para o maior já estar carregado no fim;
+- linha sem dimensão medida: o producer lê o header (sem decode), grava na linha e **adia** a linha se ela precisar de janela maior — o bloco dela vem na passada seguinte.
+
+Com `image_max_side = 768` isso é **um bloco só** (é por isso que o journal de 25/10 tem um único `KvSize`). O agrupamento passa a valer com prep ≥ 1280 px ou quando a janela for elevada — e é ele que torna seguro dar um segundo chute aos arquivos que estouram 4096. Custo aceitável: a primeira passada depois da migration lê o header de cada linha sem dimensão (uma vez), e o producer continua decodificando só o que vai enviar.
+
+### 5.10 Falha persistente e `Retry failed`
+
+Antes, uma linha que queimava todas as tentativas voltava na passada seguinte: 63 de 886 arquivos, 3–4 requests cada, e o motivo só existia como `WARN` num log que o próximo start trunca. Agora:
+
+- migration 15 acrescenta `classify_state`, `failure_kind`, `failure_detail`, `classify_attempts` e `failed_at` — **nunca** derivados de `description`/`confidence` (a lição de §5.6);
+- [`failure_kind_from`](../sherlock/desktop/src-tauri/src/classify.rs:466) classifica a resposta em `repeat_limit`, `ctx_overflow`, `empty_frame`, `io`, `timeout`, `no_response`, `parse`; o producer distingue `decode` e `prepare` num contador separado;
+- **só falhas determinísticas são persistidas** ([`is_permanent_failure`](../sherlock/desktop/src-tauri/src/scan.rs:1440)): `repeat_limit`, `ctx_overflow` e `parse`. As ambientais (`io`, `timeout`, `empty_frame`, `no_response`, `decode`, `prepare`) ficam fora do banco de propósito;
+- [`list_backlog_rows`](../sherlock/desktop/src-tauri/src/db.rs:1183) **exclui** as linhas com `classify_state = 'failed'`, então a passada converge; [`list_failed_rows`](../sherlock/desktop/src-tauri/src/db.rs:1190) é a única porta de volta;
+- `ScanMode::RetryFailed` roda o mesmo pipeline só com essas linhas, e aceita [`ScanOverrides`](../sherlock/desktop/src-tauri/src/models.rs:432) (modelo, `image_max_side`, perfil, engine de OCR) para tentar diferente sem mudar o `settings.toml` da biblioteca inteira;
+- a barra lateral mostra **Retry N Failed** quando há falhas conhecidas, lendo `failed_classifications`.
+
+Uma classificação bem-sucedida limpa o estado (e mantém `classify_attempts`, que é histórico), então uma linha recuperada volta a ser uma linha normal.
+
+**Incidente de 26/10, e a regra que ele produziu.** A primeira passada com o recurso ligado durou 22 s e terminou em `failed`: 150 linhas, zero requests. A causa não era o Ollama — era o índice. Uma pasta de WhatsApp tinha 44 linhas apontando para arquivos que **não existem mais no NAS** (`No such file or directory`), sobra de uma varredura de abril. A primeira versão marcava essas linhas como falha permanente *e* contava cada uma no circuit breaker, que então abortou a passada com "Ollama is down ou o runner morre". Duas correções:
+
+1. falha de leitura local não é falha de classificação: não vai para o banco (senão a linha desaparece do backlog até um rescan) e tem contador próprio (`unreadable`), que não alimenta o breaker;
+2. o resumo ganhou a linha `N unreadable` e um aviso explícito: se o arquivo não existe mais, o caminho é **Refresh**, que faz a descoberta e derruba as linhas mortas.
+
+O que fica: `mark_failed` só grava o que um retry com outro modelo/resolução poderia realmente resolver — o resto é índice desatualizado, e esconder isso no banco seria transformar um problema de descoberta em um problema de classificação.
+
 ## 6. Riscos
 
 | Risco | Mitigação |

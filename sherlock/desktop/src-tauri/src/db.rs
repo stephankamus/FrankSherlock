@@ -304,6 +304,45 @@ fn run_migrations(conn: &mut Connection) -> AppResult<()> {
             ALTER TABLE roots ADD COLUMN last_error TEXT;
             "#,
         ),
+        // Migration 14: still-image dimensions.
+        //
+        // Why: `num_ctx` is derived from the image size, and a change of `num_ctx`
+        // between two requests makes Ollama tear the runner down and reload the
+        // model (~2.1 s + a 7.3 GiB graph, §5.5 of
+        // `plans/pipeline-cpu-gpu-overlap.md`). With the dimensions on the row the
+        // backlog pass can group rows by the window they will need **before**
+        // opening them, so one runner identity serves a whole block instead of
+        // being rebuilt per file.
+        //
+        // `NULL` means "not measured yet": the pipeline probes the header once and
+        // stores it. The value is only a prediction — every request is built from
+        // the dimensions of the image it actually sends.
+        M::up(
+            r#"
+            ALTER TABLE files ADD COLUMN image_width INTEGER;
+            ALTER TABLE files ADD COLUMN image_height INTEGER;
+            "#,
+        ),
+        // Migration 15: persistent classification failures.
+        //
+        // Why: a row that burned every attempt came back in the next pass and went to
+        // the GPU again — 63 of 886 files per pass on 2026-10-25, 3–4 requests each —
+        // so a backlog could never converge, and the reason only existed as a `WARN`
+        // in a log the next start truncates.
+        //
+        // `classify_state` is deliberately **not** derived from `description` or
+        // `confidence`: §5.6 of `plans/pipeline-cpu-gpu-overlap.md` is what happens
+        // when a number the model provides is used as a state machine.
+        M::up(
+            r#"
+            ALTER TABLE files ADD COLUMN classify_state TEXT NOT NULL DEFAULT '';
+            ALTER TABLE files ADD COLUMN failure_kind TEXT NOT NULL DEFAULT '';
+            ALTER TABLE files ADD COLUMN failure_detail TEXT NOT NULL DEFAULT '';
+            ALTER TABLE files ADD COLUMN classify_attempts INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE files ADD COLUMN failed_at INTEGER;
+            CREATE INDEX IF NOT EXISTS idx_files_classify_state ON files(classify_state);
+            "#,
+        ),
     ]);
 
     migrations
@@ -535,12 +574,25 @@ pub fn create_or_resume_scan_job(db_path: &Path, root_path: &str) -> AppResult<S
         .ok();
 
     if let Some(job_id) = maybe_job_id {
-        // Keep cursor_rel_path and counters so phase 2 can resume from the
-        // last checkpoint instead of re-processing every file.
+        // Keep cursor_rel_path and the counters so phase 2 can resume from the
+        // last checkpoint instead of re-processing every file — but **not**
+        // `started_at`, which is the start of *this* run.
+        //
+        // Keeping it made a job created in April and resumed in October report a
+        // 189-day wall, and `scripts/measure-run.py` used that column as both the
+        // wall and the Ollama journal window: one 85-minute pass was summarised
+        // with six months of unrelated traffic (35k generates, 5.8k model loads,
+        // four different `KvSize`). `CASE` keeps the value when the row is already
+        // running, so attaching to a live job does not move its start time.
+        //
+        // The counters are safe to keep: phase 2 and the backlog pass both
+        // overwrite `processed_files` from their own progress on the next
+        // checkpoint.
         tx.execute(
             "UPDATE scan_jobs
              SET status = 'running', error_text = NULL,
                  phase = 'discovering', discovered_files = 0,
+                 started_at = CASE WHEN status = 'running' THEN started_at ELSE ?2 END,
                  updated_at = ?2
              WHERE id = ?1",
             params![job_id, now],
@@ -1136,6 +1188,11 @@ pub struct BacklogRow {
     /// for the files it touches, and `repair_thumbnails` covers the rows it does
     /// not.
     pub thumb_path: Option<String>,
+    /// Pixel dimensions of a still image, when they have been measured. Only used
+    /// to predict the context window before the file is opened — a `None` here is
+    /// not an error, it just means the row has to be probed once.
+    pub image_width: Option<u32>,
+    pub image_height: Option<u32>,
 }
 
 /// Rows of `root_id` that still need a classification or have no thumbnail at all.
@@ -1143,14 +1200,62 @@ pub struct BacklogRow {
 /// Pure SQL: no filesystem access, so this is cheap even on a 53k-row index. The
 /// existence of a recorded thumbnail is verified by the pipeline producer, which
 /// is about to read the file anyway.
+///
+/// Rows marked failed are **excluded**: they already burned every attempt, and
+/// sending them again on every pass is what kept a backlog from ever converging.
+/// [`list_failed_rows`] is the way back in, through an explicit retry.
 pub fn list_backlog_rows(db_path: &Path, root_id: i64) -> AppResult<Vec<BacklogRow>> {
+    query_backlog_rows(db_path, root_id, "AND classify_state <> 'failed'")
+}
+
+/// Rows that gave up: every attempt failed. Used by `Retry failed`.
+pub fn list_failed_rows(db_path: &Path, root_id: i64) -> AppResult<Vec<BacklogRow>> {
+    query_backlog_rows(db_path, root_id, "AND classify_state = 'failed'")
+}
+
+/// How many rows of `root_id` are marked failed, for the sidebar counter.
+pub fn failed_classification_count(db_path: &Path, root_id: i64) -> AppResult<u64> {
+    let conn = open_conn(db_path)?;
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM files
+          WHERE root_id = ?1 AND deleted_at IS NULL AND classify_state = 'failed'",
+        params![root_id],
+        |row| row.get(0),
+    )?;
+    Ok(count as u64)
+}
+
+/// Record that every attempt for this row failed, and why.
+///
+/// `kind` is a short taxonomy (`repeat_limit`, `ctx_overflow`, `empty_frame`,
+/// `parse`, `io`, `prepare`, ...) so a retry can be aimed at it; `detail` keeps the
+/// text Ollama sent back, truncated by the caller.
+pub fn mark_file_failed(db_path: &Path, file_id: i64, kind: &str, detail: &str) -> AppResult<()> {
+    let conn = open_conn(db_path)?;
+    conn.execute(
+        "UPDATE files
+            SET classify_state = 'failed',
+                failure_kind = ?2,
+                failure_detail = ?3,
+                classify_attempts = classify_attempts + 1,
+                failed_at = ?4
+          WHERE id = ?1 AND deleted_at IS NULL",
+        params![file_id, kind, detail, now_epoch_secs()],
+    )?;
+    Ok(())
+}
+
+/// `filter` is one of our own `AND ...` clauses, never user input.
+fn query_backlog_rows(db_path: &Path, root_id: i64, filter: &str) -> AppResult<Vec<BacklogRow>> {
     let conn = open_conn(db_path)?;
     let sql = format!(
         "SELECT id, rel_path, abs_path, size_bytes, media_type,
-                {PENDING_CLASSIFICATION_SQL} AS pending, thumb_path
+                {PENDING_CLASSIFICATION_SQL} AS pending, thumb_path,
+                image_width, image_height
          FROM files
          WHERE deleted_at IS NULL AND root_id = ?1
            AND ({PENDING_CLASSIFICATION_SQL} OR thumb_path IS NULL)
+           {filter}
          ORDER BY rel_path"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -1163,6 +1268,8 @@ pub fn list_backlog_rows(db_path: &Path, root_id: i64) -> AppResult<Vec<BacklogR
             media_type: row.get(4)?,
             needs_classification: row.get::<_, i64>(5)? != 0,
             thumb_path: row.get(6)?,
+            image_width: row.get::<_, Option<i64>>(7)?.map(|v| v as u32),
+            image_height: row.get::<_, Option<i64>>(8)?.map(|v| v as u32),
         })
     })?;
     let mut out = Vec::new();
@@ -1170,6 +1277,26 @@ pub fn list_backlog_rows(db_path: &Path, root_id: i64) -> AppResult<Vec<BacklogR
         out.push(row?);
     }
     Ok(out)
+}
+
+/// Record a still image's pixel dimensions.
+///
+/// Written once per row and never again: the value is a cache that lets the next
+/// pass predict the context window without opening the file, so an unconditional
+/// `UPDATE` per visit would be a SQLite write per classified file for nothing.
+pub fn set_image_dimensions(
+    db_path: &Path,
+    file_id: i64,
+    width: u32,
+    height: u32,
+) -> AppResult<()> {
+    let conn = open_conn(db_path)?;
+    conn.execute(
+        "UPDATE files SET image_width = ?2, image_height = ?3
+         WHERE id = ?1 AND image_width IS NULL",
+        params![file_id, width as i64, height as i64],
+    )?;
+    Ok(())
 }
 
 /// `(fingerprint, dhash, thumb_path)` of rows that claim to have a thumbnail.
@@ -2343,8 +2470,12 @@ pub fn update_file_classification(
     let tx = conn.unchecked_transaction()?;
     let now = now_epoch_secs();
     tx.execute(
+        // A successful classification also clears any previous failure, so a row
+        // that recovered stops counting as "failed" for the sidebar and for the
+        // selection. `classify_attempts` is kept: it is history, not state.
         "UPDATE files SET media_type = ?2, description = ?3, extracted_text = ?4,
-                canonical_mentions = ?5, confidence = ?6, lang_hint = ?7, updated_at = ?8
+                canonical_mentions = ?5, confidence = ?6, lang_hint = ?7, updated_at = ?8,
+                classify_state = '', failure_kind = '', failure_detail = '', failed_at = NULL
          WHERE id = ?1 AND deleted_at IS NULL",
         params![
             file_id,
@@ -4668,6 +4799,80 @@ mod tests {
         assert_eq!(again.moved, 0);
     }
 
+    /// A failed row must leave the default selection: otherwise the next pass sends
+    /// it to the GPU again, forever — 63 of 886 files per pass, 3–4 requests each,
+    /// measured on 2026-10-25. `Retry failed` is the only way back in.
+    #[test]
+    fn failed_rows_leave_the_backlog_until_a_retry() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/failures").expect("root");
+        let failed =
+            upsert_file_record(&db_path, &sample_record(root_id, "a.jpg", "fp1")).expect("a");
+        upsert_file_record(&db_path, &sample_record(root_id, "b.jpg", "fp2")).expect("b");
+
+        assert_eq!(
+            list_backlog_rows(&db_path, root_id).expect("backlog").len(),
+            2
+        );
+
+        mark_file_failed(
+            &db_path,
+            failed,
+            "repeat_limit",
+            "token repeat limit reached",
+        )
+        .expect("mark");
+
+        let backlog = list_backlog_rows(&db_path, root_id).expect("backlog");
+        assert_eq!(
+            backlog.len(),
+            1,
+            "the failed row must leave the default pass"
+        );
+        assert_eq!(backlog[0].rel_path, "b.jpg");
+
+        let retry = list_failed_rows(&db_path, root_id).expect("failed");
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].rel_path, "a.jpg");
+        assert_eq!(
+            failed_classification_count(&db_path, root_id).expect("count"),
+            1
+        );
+
+        // The reason is stored, not just logged: it is what a retry can group by.
+        let conn = open_conn(&db_path).expect("open");
+        let (kind, attempts): (String, i64) = conn
+            .query_row(
+                "SELECT failure_kind, classify_attempts FROM files WHERE id = ?1",
+                params![failed],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(kind, "repeat_limit");
+        assert_eq!(attempts, 1);
+
+        // A successful classification clears the failure, so the row stops counting
+        // as failed without ever leaving the index.
+        update_file_classification(&db_path, failed, "photo", "a beach", "", "", 0.4, "en")
+            .expect("classify");
+        assert_eq!(
+            failed_classification_count(&db_path, root_id).expect("count"),
+            0
+        );
+        assert!(list_failed_rows(&db_path, root_id)
+            .expect("failed")
+            .is_empty());
+        // Both rows are still backlog work — the fixture has no thumbnails, and a row
+        // needing one belongs there by definition. What matters is that the recovered
+        // row is no longer pending a *classification*.
+        let backlog = list_backlog_rows(&db_path, root_id).expect("backlog");
+        assert!(backlog
+            .iter()
+            .find(|row| row.rel_path == "a.jpg")
+            .is_some_and(|row| !row.needs_classification));
+    }
+
     #[test]
     fn copy_classification_copies_fields_but_clears_text() {
         let (_dir, db_path) = test_db_path();
@@ -5024,12 +5229,30 @@ mod tests {
         .expect("ckpt");
         fail_scan_job(&db_path, job.id, "failure").expect("fail");
 
+        // Age the row the way a job interrupted weeks ago looks: `started_at` far
+        // in the past. A resume must not inherit it, or every summary of that job
+        // covers the whole gap (189 days in the pass measured on 2026-10-25).
+        {
+            let conn = open_conn(&db_path).expect("open");
+            conn.execute(
+                "UPDATE scan_jobs SET started_at = ?2 WHERE id = ?1",
+                params![job.id, 1_000_000i64],
+            )
+            .expect("age");
+        }
+
         let resumed = create_or_resume_scan_job(&db_path, "/tmp/demo").expect("resume");
         assert_eq!(resumed.id, job.id);
         assert_eq!(resumed.status, "running");
         // Cursor and counters must survive resume so phase 2 can skip
         // already-processed files instead of re-classifying everything.
         assert_eq!(resumed.processed_files, 7);
+        assert!(
+            resumed.started_at > 1_000_000,
+            "resume must stamp the start of the new run instead of inheriting the \
+             old one (got {})",
+            resumed.started_at
+        );
         assert_eq!(
             resumed.cursor_rel_path,
             Some("a.jpg".to_string()),
@@ -5601,11 +5824,11 @@ mod tests {
         init_database(&db_path).expect("init");
 
         let conn = open_conn(&db_path).expect("open");
-        // Verify user_version is set (14 migrations applied → version 14)
+        // Verify user_version is set (16 migrations applied → version 16)
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 14);
+        assert_eq!(version, 16);
 
         // Migration 13 adds the non-destructive root availability columns.
         let root_columns: Vec<String> = {
@@ -5664,8 +5887,8 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        // We have 14 migrations (indices 0..13), so user_version should be 14
-        assert_eq!(version, 14);
+        // We have 16 migrations (indices 0..15), so user_version should be 16
+        assert_eq!(version, 16);
     }
 
     #[test]

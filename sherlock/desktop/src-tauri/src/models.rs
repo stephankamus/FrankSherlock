@@ -423,6 +423,57 @@ pub struct ClassificationResult {
     pub canonical_mentions: String,
     pub confidence: f32,
     pub lang_hint: String,
+    /// Why nothing usable came back, as a short taxonomy (`repeat_limit`,
+    /// `ctx_overflow`, `empty_frame`, `parse`, `io`, `prepare`, ...). Empty on
+    /// success. Persisted as `files.failure_kind` so a retry can be aimed at the
+    /// files that failed for the same reason.
+    pub failure_kind: String,
+}
+
+/// Per-run overrides for a retry of failed classifications.
+///
+/// `None` means "use `settings.toml`". The point is to re-try a known-bad set with
+/// another model or resolution without changing what the rest of the library uses.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanOverrides {
+    /// Empty or `None` keeps the configured/selected model.
+    pub model: Option<String>,
+    pub image_max_side: Option<u32>,
+    /// `concise` | `detailed`.
+    pub prompt_profile: Option<String>,
+    /// `off` | `llm` | `surya`.
+    pub ocr_engine: Option<String>,
+}
+
+impl ScanOverrides {
+    /// Apply onto a scan context. Unparsable values are ignored: the command that
+    /// creates the overrides validates them first, and a typo must not turn a
+    /// retry into a failure.
+    pub fn apply(&self, ctx: &mut ScanContext) {
+        if let Some(model) = self.model.as_deref().map(str::trim) {
+            if !model.is_empty() {
+                ctx.model = model.to_string();
+            }
+        }
+        if let Some(max_side) = self.image_max_side {
+            ctx.image_max_side = crate::config::RuntimeSettings::normalize_image_max_side(max_side);
+        }
+        if let Some(profile) = self
+            .prompt_profile
+            .as_deref()
+            .and_then(crate::config::PromptProfile::parse)
+        {
+            ctx.prompt_profile = profile;
+        }
+        if let Some(engine) = self
+            .ocr_engine
+            .as_deref()
+            .and_then(crate::config::OcrEngine::parse)
+        {
+            ctx.ocr_engine = engine;
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

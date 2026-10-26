@@ -25,6 +25,7 @@ import type {
   RuntimeStatus,
   ScanJobStatus,
   ScanMode,
+  ScanOverrides,
   StartupScanSetting,
   SetupDownloadStatus,
   SetupStatus,
@@ -62,6 +63,28 @@ export async function startScan(
   mode: ScanMode = "full",
 ): Promise<ScanJobStatus> {
   return invoke<ScanJobStatus>("start_scan", { rootPath, mode });
+}
+
+/**
+ * Retry only the rows the previous attempts gave up on.
+ *
+ * The default `backlog` pass skips marked failures — otherwise they would go to the
+ * GPU on every pass forever — so this is the way back in, with optional overrides
+ * (another model, another resolution) for exactly those files.
+ */
+export async function retryFailed(
+  rootPath: string,
+  overrides?: ScanOverrides,
+): Promise<ScanJobStatus> {
+  return invoke<ScanJobStatus>("retry_failed", {
+    rootPath,
+    overrides: overrides ?? null,
+  });
+}
+
+/** How many rows of a root are waiting for `retryFailed`. */
+export async function getFailedClassifications(rootId: number): Promise<number> {
+  return invoke<number>("failed_classifications", { rootId });
 }
 
 /** Indexed state of a root, for the startup prompt. `null` when not indexed. */

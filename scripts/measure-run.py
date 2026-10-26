@@ -19,6 +19,19 @@ What it reports:
   or any abort means the GPU side is not stable;
 - the `Classifying:` lines that survived in the log.
 
+Two bookkeeping traps are worked around here, because both of them made the
+summary describe something other than the run:
+
+- `started_at` is the start of the *run* only if the job was never resumed. The
+  column used to be inherited across a resume, so a job created in April and
+  resumed in October reported a 189-day wall — and the journal window was derived
+  from it, mixing six months of unrelated requests (35k generates, 5.8k model
+  loads, four different `KvSize`) into "one run". When the span is impossible the
+  window is derived from the last contiguous block of `/api/generate` instead.
+- `processed_files` is a checkpoint written every 25 files, so it lags what the
+  run actually did (886 came out as 875). The file count printed here is the
+  larger of the counter and the distinct files in the log.
+
 Usage:
     scripts/measure-run.py                 # last job, 300 log lines
     scripts/measure-run.py --job 4         # a specific job
@@ -34,7 +47,7 @@ import re
 import sqlite3
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 DEFAULT_LOG = os.path.expanduser(
     "~/.local/share/dev.frank.sherlock/logs/frank_sherlock.log"
@@ -52,6 +65,16 @@ RUNNER_START = "starting runner"
 RUNNER_CRASH = "SIGABRT"
 
 UNIT_SECONDS = {"ns": 1e-9, "µs": 1e-6, "us": 1e-6, "ms": 1e-3, "s": 1.0, "m": 60.0, "h": 3600.0}
+
+# No single run lasts a day. A bigger span means `started_at` belongs to a
+# previous run of the same job row, so neither the wall nor the journal window
+# can be derived from it.
+MAX_TRUSTED_WALL = 24 * 3600
+# A quiet stretch this long between two `/api/generate` requests separates two
+# runs (the longest single request measured is 57 s, preparation included).
+RUN_GAP_SECONDS = 600
+# How far back to look for the real window when `started_at` cannot be trusted.
+STALE_LOOKBACK = 48 * 3600
 
 
 # --------------------------------------------------------------------------- index
@@ -129,6 +152,10 @@ def journal_window(start: datetime, end: datetime) -> list[str]:
             "--until",
             f"@{int(end.timestamp()) + 1}",
             "--no-pager",
+            # Timestamps have to be machine-readable and timezone-free: the default
+            # short format prints the month name in the system locale ("out 25").
+            "--output=short-iso",
+            "--utc",
         ],
         capture_output=True,
         text=True,
@@ -181,22 +208,76 @@ def journal_stats(lines: list[str]) -> dict:
 # ----------------------------------------------------------------------------- log
 
 
-def classify_stamps(path: str) -> list[datetime]:
-    stamps: list[datetime] = []
+def classify_entries(path: str) -> list[tuple[datetime, str]]:
+    """Every `Classifying:` line as (timestamp, file path)."""
+    entries: list[tuple[datetime, str]] = []
     if not os.path.exists(path):
-        return stamps
+        return entries
     with open(path, encoding="utf-8", errors="replace") as handle:
         for raw in handle:
             match = CLASSIFY.match(raw.strip())
             if match is None:
                 continue
-            day, clock, _ = match.groups()
-            stamps.append(
-                datetime.strptime(f"{day} {clock}", "%Y-%m-%d %H:%M:%S").replace(
-                    tzinfo=timezone.utc
+            day, clock, file_path = match.groups()
+            entries.append(
+                (
+                    datetime.strptime(f"{day} {clock}", "%Y-%m-%d %H:%M:%S").replace(
+                        tzinfo=timezone.utc
+                    ),
+                    file_path.strip(),
                 )
             )
-    return stamps
+    return entries
+
+
+def line_stamp(line: str) -> datetime | None:
+    """Timestamp of a `--output=short-iso --utc` journal line (`2026-10-25T21:47:40+0000`)."""
+    try:
+        return datetime.strptime(line[:19], "%Y-%m-%dT%H:%M:%S").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return None
+
+
+def clip_lines(lines: list[str], start: datetime) -> list[str]:
+    """Drop what the fetch had to reach past the real start of the run.
+
+    The fetch window is deliberately wider than the run (48 h) so a stale
+    `started_at` can be replaced by evidence; the statistics have to be computed
+    on the clipped block, or the summary counts requests from other runs again.
+    """
+    return [
+        line
+        for line in lines
+        if (stamp := line_stamp(line)) is not None and stamp >= start
+    ]
+
+
+def run_window_from_journal(lines: list[str], end: datetime) -> datetime | None:
+    """Start of the last contiguous block of `/api/generate` requests.
+
+    Used when `started_at` predates the run (a resumed job). The journal is the
+    only source that knows when the GPU actually started working: `/api/ps` and
+    `/api/tags` cannot be used, because the UI polls both the whole time the app
+    is open, whether a pass is running or not.
+    """
+    stamps = [
+        stamp
+        for line in lines
+        if "/api/generate" in line
+        for stamp in [line_stamp(line)]
+        if stamp is not None
+    ]
+    if not stamps:
+        return None
+    stamps.sort()
+    start = stamps[-1]
+    for stamp in reversed(stamps[:-1]):
+        if (start - stamp).total_seconds() > RUN_GAP_SECONDS:
+            break
+        start = stamp
+    return start
 
 
 # ------------------------------------------------------------------------- helpers
@@ -246,25 +327,48 @@ def main() -> int:
 
     started = job.get("started_at") or 0
     finished = job.get("completed_at") or job.get("updated_at") or started
-    start_dt = datetime.fromtimestamp(started, timezone.utc)
     end_dt = datetime.fromtimestamp(finished, timezone.utc)
-    wall = max(0, finished - started)
-    processed = job.get("processed_files") or 0
+    reported_start = datetime.fromtimestamp(started, timezone.utc)
+    stale_start = finished - started > MAX_TRUSTED_WALL or finished < started
+    lookback = STALE_LOOKBACK if stale_start else max(0, finished - started)
+    lines = journal_window(end_dt - timedelta(seconds=lookback), end_dt)
+    if stale_start:
+        start_dt = run_window_from_journal(lines, end_dt) or end_dt
+        lines = clip_lines(lines, start_dt)
+    else:
+        start_dt = reported_start
+    wall = max(0.0, (end_dt - start_dt).total_seconds())
 
-    stats = journal_stats(journal_window(start_dt, end_dt))
+    stats = journal_stats(lines)
     durations = stats["durations"]
+    entries = classify_entries(args.log)
+    in_window = [(stamp, path) for stamp, path in entries if start_dt <= stamp <= end_dt]
+    logged_files = len({path for _, path in in_window})
+    counted = job.get("processed_files") or 0
+    processed = max(counted, logged_files)
     pending = pending_rows(con, job["root_id"])
     total = total_rows(con, job["root_id"])
     low_conf = low_confidence_rows(con, job["root_id"])
 
     print(f"job #{job['id']}            : {job.get('phase')}  {job.get('status')}")
     print(f"root                : #{job['root_id']}  {os.path.basename(job.get('root_path') or '')}")
-    print(f"window (UTC)        : {start_dt:%H:%M:%S} -> {end_dt:%H:%M:%S}")
-    print(f"files               : {processed} / {job.get('total_files') or 0} processed")
-    print(f"wall                : {format_duration(wall)}  ({wall} s)")
+    window = f"{start_dt:%H:%M:%S} -> {end_dt:%H:%M:%S}"
+    if stale_start:
+        window += "   (derived from the journal)"
+    print(f"window (UTC)        : {window}")
+    files = f"{processed} / {job.get('total_files') or 0} processed"
+    if processed != counted:
+        files += f"   (job counter {counted}, log {logged_files})"
+    print(f"files               : {files}")
+    print(f"wall                : {format_duration(wall)}  ({int(wall)} s)")
     if processed > 0:
         print(f"per file (wall)     : {wall / processed:.2f} s")
         print(f"requests per file   : {len(durations) / processed:.2f}")
+    if stale_start:
+        print(
+            f"  note: scan_jobs.started_at is {reported_start:%Y-%m-%d %H:%M:%S} UTC and belongs"
+            " to an earlier run of this job; the window above comes from the journal"
+        )
 
     print()
     print(f"pending now         : {pending} of {total} rows still have no description")
@@ -290,29 +394,33 @@ def main() -> int:
     print(f"model loads         : {stats['loads']}")
     print(f"runner spawns       : {stats['runner_starts']}")
     print(f"runner crashes      : {stats['crashes']}")
-    print(f"KvSize              : {table(stats['kv_sizes'])}   (more than one = reloads)")
-    print(f"BatchSize           : {table(stats['batches'])}   (512 is Ollama's default)")
+    if stats["loads"] == 0:
+        # A pass that never loads a model is the healthy case: the runner was
+        # already up and never changed identity. Printing "-" for KvSize read like
+        # missing data instead of "nothing changed".
+        print("KvSize              : not loaded again in this run (runner kept its identity)")
+        print("BatchSize           : not loaded again in this run")
+    else:
+        print(f"KvSize              : {table(stats['kv_sizes'])}   (more than one = reloads)")
+        print(f"BatchSize           : {table(stats['batches'])}   (512 is Ollama's default)")
     if stats["loads"] and stats["runner_starts"] > stats["loads"] * 2:
         print(
             f"  note: {stats['runner_starts']} spawns for {stats['loads']} loads — the runner is"
             " being retried in a loop after crashing"
         )
 
-    stamps = classify_stamps(args.log)
-    in_window = [s for s in stamps if start_dt <= s <= end_dt]
     print()
-    print(f"log lines           : {len(stamps)} total, {len(in_window)} inside this run")
-    if in_window and len(in_window) > 1:
-        deltas = [
-            (b - a).total_seconds() for a, b in zip(in_window, in_window[1:])
-        ]
+    print(f"log lines           : {len(entries)} total, {len(in_window)} inside this run")
+    stamps = [stamp for stamp, _ in in_window]
+    if len(stamps) > 1:
+        deltas = [(b - a).total_seconds() for a, b in zip(stamps, stamps[1:])]
         print(
             "per file (log)      : "
             f"mean {sum(deltas) / len(deltas):.2f} s, "
             f"p50/p95 {percentile(deltas, 0.5):.2f}/{percentile(deltas, 0.95):.2f} s, "
             f"max {max(deltas):.2f} s"
         )
-    if len(in_window) < 2 and stamps:
+    if len(stamps) < 2 and entries:
         print("  note: the log keeps no lines from this run — it is truncated on start")
     elif processed and len(in_window) < processed // 2:
         print(

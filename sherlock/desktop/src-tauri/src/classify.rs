@@ -414,7 +414,88 @@ fn first_frame_if_gif(image_path: &Path, tmp_dir: &Path) -> PathBuf {
 // Stage 1: Primary classification
 // ---------------------------------------------------------------------------
 
-fn classify_primary(model: &str, prepared: &PreparedImage, profile: PromptProfile) -> Value {
+/// Whether the original file still fits the window the prepared image resolved to.
+///
+/// Ollama counts the tokens of the file that is actually sent, and the original is
+/// not the 768 px JPEG the window was computed for: a 12 MP photo needs several
+/// times the 4096 tokens of the prepared one. Sending it anyway answered `400
+/// request (4136 tokens) exceeds the available context size (4096 tokens)` **25
+/// times on 2026-10-25**, always on the original-file attempt — a request spent and
+/// the file stranded anyway.
+///
+/// Asking for a bigger window here would be worse than dropping the attempt: the
+/// next file goes back to the prepared window, so every rescued file would cost two
+/// model reloads (§5.5 of `plans/pipeline-cpu-gpu-overlap.md`). Those files belong
+/// in a block of their own, with one window for the whole block.
+///
+/// `None` when the dimensions cannot be read (an exotic format): the attempt is
+/// kept, because refusing to try would be a regression for small originals.
+fn original_fits_window(
+    path: &Path,
+    num_ctx: u32,
+    prompt_chars: usize,
+    num_predict: u32,
+) -> Option<bool> {
+    let (width, height) = image::image_dimensions(path).ok()?;
+    Some(num_ctx_for(width, height, prompt_chars, num_predict) <= num_ctx)
+}
+
+/// Context window a still image of `width × height` will need once prepared.
+///
+/// The backlog pipeline groups rows by this value before opening them, so one
+/// runner identity serves a whole block instead of being rebuilt per file. The
+/// classifier itself keeps deriving `num_ctx` from the prepared image it really
+/// sends ([`num_ctx_for`]); [`vision_prep::prepared_size`] is what keeps the two
+/// numbers identical.
+pub fn primary_ctx_for(width: u32, height: u32, max_side: u32, profile: PromptProfile) -> u32 {
+    let (prepared_w, prepared_h) = vision_prep::prepared_size(width, height, max_side);
+    num_ctx_for(
+        prepared_w,
+        prepared_h,
+        primary_prompt(profile).len(),
+        primary_num_predict(profile),
+    )
+}
+
+/// What the first pass produced, and why it produced nothing when it did not.
+///
+/// The value alone cannot tell a good classification from a default object built
+/// after four failures, and the reason is exactly what a retry has to be aimed at —
+/// so the first pass reports it instead of only logging it.
+type PrimaryOutcome = (Value, Option<&'static str>);
+
+/// Why a request produced nothing, as a short taxonomy.
+///
+/// These strings are what `files.failure_kind` stores (migration 15) and what the
+/// "Retry failed" grouping can key on. They are derived from the text Ollama answers
+/// with, because that is all the reason we get: `400 … exceeds the available context
+/// size`, `500 … token repeat limit reached`, the zero-value frame, a 200 whose body
+/// does not parse, and the transport errors.
+fn failure_kind_from(raw: &str) -> &'static str {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("exceeds the available context size") {
+        "ctx_overflow"
+    } else if lower.contains("token repeat limit") {
+        "repeat_limit"
+    } else if lower.contains("connection refused") || lower.contains("io: ") {
+        "io"
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        "timeout"
+    } else if lower.contains("\"model\":\"\"") || lower.contains("done=false") {
+        // The Go zero-value frame: the runner never saw the request (§5.7.5).
+        "empty_frame"
+    } else if raw.trim().is_empty() {
+        "no_response"
+    } else {
+        "parse"
+    }
+}
+
+fn classify_primary(
+    model: &str,
+    prepared: &PreparedImage,
+    profile: PromptProfile,
+) -> PrimaryOutcome {
     let prompt = primary_prompt(profile);
     let num_predict = primary_num_predict(profile);
     let num_ctx = num_ctx_for(prepared.width, prepared.height, prompt.len(), num_predict);
@@ -436,7 +517,7 @@ fn classify_primary(model: &str, prepared: &PreparedImage, profile: PromptProfil
     if resp1.ok {
         if let Some(v) = parse_json_response(&resp1.raw) {
             if v.get("media_type").and_then(|v| v.as_str()).is_some() {
-                return v;
+                return (v, None);
             }
         }
         // A 200 with an unusable body is a different failure from a 500, and it was
@@ -470,7 +551,7 @@ fn classify_primary(model: &str, prepared: &PreparedImage, profile: PromptProfil
     if resp2.ok {
         if let Some(v) = parse_json_response(&resp2.raw) {
             if v.get("media_type").and_then(|v| v.as_str()).is_some() {
-                return v;
+                return (v, None);
             }
         }
         log::warn!(
@@ -505,7 +586,7 @@ fn classify_primary(model: &str, prepared: &PreparedImage, profile: PromptProfil
                     "primary recovered on the third attempt for {}",
                     prepared.path.display()
                 );
-                return v;
+                return (v, None);
             }
         }
         log::warn!(
@@ -523,43 +604,55 @@ fn classify_primary(model: &str, prepared: &PreparedImage, profile: PromptProfil
 
     // Attempt 4: the **original** file. Every attempt so far sent a re-encoded 768 px
     // JPEG; if all three loop on that, give the bytes the camera wrote a chance. Only
-    // when the prepared image is a temp copy (a passthrough already *is* the original).
+    // when the prepared image is a temp copy (a passthrough already *is* the original)
+    // and only when those bytes fit the window already requested — see
+    // [`original_fits_window`].
     let mut resp4_raw = String::new();
-    if prepared.source != prepared.path {
-        let params4 = GenerateParams {
-            json_mode: false,
-            temperature: 0.3,
-            ..GenerateParams::vision(num_predict.max(260), Some(num_ctx))
-        };
-        let resp4 = ollama_generate(model, prompt, Some(&prepared.source), &params4);
-        if resp4.ok {
-            if let Some(v) = parse_json_response(&resp4.raw) {
-                if v.get("media_type").and_then(|v| v.as_str()).is_some() {
-                    log::info!(
-                        "primary recovered from the original file for {}",
-                        prepared.source.display()
-                    );
-                    return v;
+    let original_fits = (prepared.source != prepared.path)
+        .then(|| original_fits_window(&prepared.source, num_ctx, prompt.len(), num_predict));
+    match original_fits {
+        Some(Some(false)) => log::info!(
+            "primary: not sending the original file for {} — it needs more than the \
+             {num_ctx}-token window the prepared image uses",
+            prepared.source.display()
+        ),
+        Some(_) => {
+            let params4 = GenerateParams {
+                json_mode: false,
+                temperature: 0.3,
+                ..GenerateParams::vision(num_predict.max(260), Some(num_ctx))
+            };
+            let resp4 = ollama_generate(model, prompt, Some(&prepared.source), &params4);
+            if resp4.ok {
+                if let Some(v) = parse_json_response(&resp4.raw) {
+                    if v.get("media_type").and_then(|v| v.as_str()).is_some() {
+                        log::info!(
+                            "primary recovered from the original file for {}",
+                            prepared.source.display()
+                        );
+                        return (v, None);
+                    }
                 }
+                log::warn!(
+                    "primary (original file) returned unparseable output for {}: {}",
+                    prepared.source.display(),
+                    truncate_chars(&resp4.raw, 200)
+                );
+            } else {
+                log::warn!(
+                    "primary (original file) failed for {}: {}",
+                    prepared.source.display(),
+                    truncate_chars(&resp4.raw, 300)
+                );
             }
-            log::warn!(
-                "primary (original file) returned unparseable output for {}: {}",
-                prepared.source.display(),
-                truncate_chars(&resp4.raw, 200)
-            );
-        } else {
-            log::warn!(
-                "primary (original file) failed for {}: {}",
-                prepared.source.display(),
-                truncate_chars(&resp4.raw, 300)
-            );
+            resp4_raw = resp4.raw;
         }
-        resp4_raw = resp4.raw;
+        None => {}
     }
 
     let combined = format!("{}\n{}\n{}\n{}", resp1.raw, resp2.raw, resp3.raw, resp4_raw);
     if let Some(v) = salvage_primary_from_raw(&combined) {
-        return v;
+        return (v, None);
     }
     // Nothing worked: keep the exact image we sent (it is deleted by `Drop`, and
     // without it there is no way to reproduce the failure outside the app).
@@ -588,17 +681,20 @@ fn classify_primary(model: &str, prepared: &PreparedImage, profile: PromptProfil
         ),
     }
 
-    // Safe default
-    serde_json::json!({
-        "media_type": "other",
-        "contains_text": false,
-        "is_anime_related": false,
-        "is_document_like": false,
-        "description": "",
-        "series_candidates": [],
-        "character_candidates": [],
-        "confidence": 0.0,
-    })
+    // Safe default, plus the reason the caller persists on the row.
+    (
+        serde_json::json!({
+            "media_type": "other",
+            "contains_text": false,
+            "is_anime_related": false,
+            "is_document_like": false,
+            "description": "",
+            "series_candidates": [],
+            "character_candidates": [],
+            "confidence": 0.0,
+        }),
+        Some(failure_kind_from(&combined)),
+    )
 }
 
 /// Result of one real first-pass request, used to calibrate the pre-scan estimate.
@@ -950,6 +1046,7 @@ pub fn classify_image(
                 canonical_mentions: String::new(),
                 confidence: 0.0,
                 lang_hint: String::new(),
+                failure_kind: "prepare".to_string(),
             };
         }
     };
@@ -980,7 +1077,7 @@ pub fn classify_image_prepared(
 ) -> ClassificationResult {
     log::info!("Classifying: {}", image_path.display());
 
-    let primary = classify_primary(model, prepared, vision.prompt_profile);
+    let (primary, primary_failure) = classify_primary(model, prepared, vision.prompt_profile);
 
     let media_type = primary
         .get("media_type")
@@ -1067,6 +1164,7 @@ pub fn classify_image_prepared(
         canonical_mentions,
         confidence,
         lang_hint,
+        failure_kind: primary_failure.unwrap_or_default().to_string(),
     }
 }
 
@@ -1121,6 +1219,8 @@ pub fn classify_video(
             canonical_mentions: String::new(),
             confidence: 0.1,
             lang_hint: String::new(),
+            // A degraded but usable answer, not a failure.
+            failure_kind: String::new(),
         };
     }
 
@@ -1304,6 +1404,7 @@ pub fn classify_video(
         canonical_mentions,
         confidence: final_confidence,
         lang_hint,
+        failure_kind: String::new(),
     }
 }
 
@@ -1334,6 +1435,7 @@ pub fn classify_pdf(
             canonical_mentions: String::new(),
             confidence: 0.0,
             lang_hint: String::new(),
+            failure_kind: String::new(),
         };
     }
 
@@ -1388,7 +1490,7 @@ pub fn classify_pdf(
 
     let primary = prepared_page
         .as_ref()
-        .map(|prepared| classify_primary(model, prepared, vision.prompt_profile));
+        .map(|prepared| classify_primary(model, prepared, vision.prompt_profile).0);
 
     // Use vision model results as the base, fall back to generic PDF description
     let media_type = primary
@@ -1513,6 +1615,7 @@ pub fn classify_pdf(
         canonical_mentions,
         confidence,
         lang_hint,
+        failure_kind: String::new(),
     }
 }
 
@@ -1551,6 +1654,110 @@ fn detect_lang_hint(text: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The original-file attempt used to be sent with the window computed for the
+    /// prepared image. On 2026-10-25 that answered `400 request (4136 tokens)
+    /// exceeds the available context size (4096 tokens)` 25 times — always on this
+    /// attempt, which existed to rescue the file and could never succeed.
+    #[test]
+    fn a_twelve_megapixel_original_is_not_sent_with_the_prepared_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("big.jpg");
+        let img = image::RgbImage::from_fn(4000, 3000, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 90])
+        });
+        img.save(&path).expect("save");
+
+        let prepared_ctx = num_ctx_for(768, 576, 1600, 180);
+        assert_eq!(
+            prepared_ctx, 4096,
+            "a prepared 768 px image resolves to 4096"
+        );
+        assert_eq!(
+            original_fits_window(&path, prepared_ctx, 1600, 180),
+            Some(false),
+            "a 4000x3000 original needs a bigger window than the prepared image"
+        );
+    }
+
+    #[test]
+    fn a_small_original_still_gets_its_attempt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("small.jpg");
+        let img = image::RgbImage::from_fn(640, 480, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 120])
+        });
+        img.save(&path).expect("save");
+
+        assert_eq!(original_fits_window(&path, 4096, 1600, 180), Some(true));
+    }
+
+    #[test]
+    fn an_unreadable_header_keeps_the_attempt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("broken.jpg");
+        std::fs::write(&path, b"not an image").expect("write");
+        assert_eq!(
+            original_fits_window(&path, 4096, 1600, 180),
+            None,
+            "an unknown header must not silently drop the last attempt"
+        );
+    }
+
+    /// A 768 px library resolves every still image to one window — which is why the
+    /// journal shows a single `KvSize` — and a bigger `image_max_side` splits the
+    /// library into two groups (square-ish images need the next window). That split
+    /// is what the backlog pass turns into two blocks instead of per-file reloads.
+    #[test]
+    fn primary_ctx_splits_the_library_only_when_the_prep_size_grows() {
+        for (w, h) in [(4000, 3000), (768, 1024), (640, 480), (12, 12)] {
+            assert_eq!(
+                primary_ctx_for(w, h, 768, PromptProfile::Concise),
+                4096,
+                "{w}x{h} at 768 px must stay in the single 4096 window"
+            );
+        }
+
+        // At 1280 px the prepared sides are 1280x960 (4:3) and 1280x1280.
+        assert_eq!(
+            primary_ctx_for(4000, 3000, 1280, PromptProfile::Concise),
+            4096,
+            "4:3 at 1280 px still fits 4096"
+        );
+        assert_eq!(
+            primary_ctx_for(3000, 3000, 1280, PromptProfile::Concise),
+            8192,
+            "a 1280x1280 square needs the next window"
+        );
+    }
+
+    /// The taxonomy is what a retry is aimed at, so it has to be recognised from the
+    /// answer Ollama actually gives — that is all the reason we get.
+    #[test]
+    fn failure_kinds_come_from_the_answer_ollama_gave() {
+        assert_eq!(
+            failure_kind_from("status 500: prediction aborted, token repeat limit reached"),
+            "repeat_limit"
+        );
+        assert_eq!(
+            failure_kind_from(
+                "status 400: request (4136 tokens) exceeds the available context size (4096 tokens)"
+            ),
+            "ctx_overflow"
+        );
+        assert_eq!(
+            failure_kind_from(
+                r#"{"model":"","created_at":"0001-01-01T00:00:00Z","response":"","done":false}"#
+            ),
+            "empty_frame"
+        );
+        assert_eq!(
+            failure_kind_from("http_error: io: Connection refused"),
+            "io"
+        );
+        assert_eq!(failure_kind_from("   "), "no_response");
+        assert_eq!(failure_kind_from("{\"media_type\":"), "parse");
+    }
+
     #[test]
     fn salvage_primary_with_all_fields() {
         let raw = r#"blah "media_type": "anime", "contains_text": true, "is_anime_related": true, "is_document_like": false, "description": "A girl", "confidence": 0.85, "series_candidates": ["Ranma"], "character_candidates": ["Akane"] blah"#;
@@ -1586,6 +1793,7 @@ mod tests {
             canonical_mentions: String::new(),
             confidence: 0.0,
             lang_hint: String::new(),
+            failure_kind: "repeat_limit".to_string(),
         };
         assert!(is_empty_result(&failed));
 

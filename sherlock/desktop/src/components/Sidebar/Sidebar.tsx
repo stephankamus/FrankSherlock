@@ -42,6 +42,14 @@ type SidebarProps = {
   /** Live counters of that pass: thumbnails and classifications are separate. */
   backlog?: BacklogProgress | null;
   onCancelBacklog?: () => void;
+  /**
+   * Rows of the selected root the last attempts gave up on.
+   *
+   * The default pass skips them (otherwise they would go to the GPU on every pass
+   * forever), so the count is what tells the user there is something left to retry.
+   */
+  failedCount?: number;
+  onRetryFailed?: (rootId?: number | null) => void;
   onDetectFaces: (root: RootInfo) => void;
   onCancelFaceDetect: () => void;
   onCancelScan: (scan: ScanJobStatus) => void;
@@ -71,7 +79,7 @@ export default function Sidebar({
   onSelectRoot, onDeleteRoot, onRescanRoot, onRefreshRoot, onCopyRootPath, onPickAndScan,
   onRelinkRoot, onReclassifyRoot, onCompactDatabase, compacting,
   thumbRepair, onRepairThumbnails, onCancelThumbRepair, onProcessBacklog,
-  backlog, onCancelBacklog,
+  backlog, onCancelBacklog, failedCount, onRetryFailed,
   onDetectFaces, onCancelFaceDetect,
   onCancelScan, onResumeScan,
   onSelectAlbum, onDeleteAlbum, onSelectSmartFolder, onDeleteSmartFolder,
@@ -283,6 +291,17 @@ export default function Sidebar({
                     ? "Counting backlog…"
                     : "Processing backlog…"
                   : "Process Backlog"}
+              </button>
+            )}
+            {onRetryFailed && !backlogRunning && (failedCount ?? 0) > 0 && (
+              <button
+                type="button"
+                className="sidebar-tool-btn"
+                onClick={() => onRetryFailed(selectedRootId)}
+                disabled={!setupReady}
+                title="Try the files that failed again, with the current model settings"
+              >
+                Retry {failedCount?.toLocaleString()} Failed
               </button>
             )}
             {backlogRunning && backlog && (

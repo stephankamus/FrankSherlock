@@ -65,6 +65,26 @@ pub fn image_dimensions(path: &Path) -> AppResult<(u32, u32)> {
     })
 }
 
+/// Size [`prepare_from_decoded`] will produce for a source of `width × height`.
+///
+/// Extracted so the pipeline can predict the context window of a row **without**
+/// decoding it: `num_ctx` is derived from the prepared size, and getting it wrong
+/// is what makes Ollama rebuild the runner between two files (§5.5 of
+/// `plans/pipeline-cpu-gpu-overlap.md`). `prepare_from_decoded` calls this same
+/// function, so the prediction cannot drift from the real output.
+pub fn prepared_size(width: u32, height: u32, max_side: u32) -> (u32, u32) {
+    let max_side = RuntimeSettings::normalize_image_max_side(max_side);
+    let largest = width.max(height);
+    if max_side == 0 || largest <= max_side {
+        return (width, height);
+    }
+    let scale = max_side as f64 / largest as f64;
+    (
+        ((width as f64 * scale).round() as u32).max(1),
+        ((height as f64 * scale).round() as u32).max(1),
+    )
+}
+
 /// Prepare `source` for the vision model with the default kernel policy.
 ///
 /// Callers that carry [`crate::models::VisionSettings`] use [`prepare_with`] so
@@ -200,10 +220,10 @@ pub fn prepare_from_decoded(
 
     let box_filter = prefers_box(source, filter);
     let resize_started = Instant::now();
-    let resized = if w.max(h) > max_side {
-        let scale = max_side as f64 / w.max(h) as f64;
-        let new_w = ((w as f64 * scale).round() as u32).max(1);
-        let new_h = ((h as f64 * scale).round() as u32).max(1);
+    // Same function the pipeline uses to predict the context window (see
+    // [`prepared_size`]); the resize below must stay exactly this.
+    let (new_w, new_h) = prepared_size(w, h, max_side);
+    let resized = if (new_w, new_h) != (w, h) {
         if box_filter {
             image::DynamicImage::ImageRgba8(image::imageops::thumbnail(decoded, new_w, new_h))
         } else {
@@ -454,6 +474,35 @@ mod tests {
         let t1024 = estimated_image_tokens(1024, 1024);
         assert!((1400..=1900).contains(&t1024), "got {t1024}");
         assert!(estimated_image_tokens(1280, 1280) > t1024);
+    }
+
+    /// The pipeline predicts the context window from `prepared_size`; if that ever
+    /// disagrees with what `prepare` produces, the prediction silently starts
+    /// requesting the wrong `num_ctx` and Ollama reloads the model between files.
+    #[test]
+    fn prepared_size_matches_what_prepare_produces() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tmp = dir.path().join("tmp");
+
+        let wide = dir.path().join("wide.jpg");
+        write_jpeg(&wide, 2000, 1000);
+        let prepared = prepare(&wide, 1024, &tmp).expect("prepare");
+        assert_eq!(
+            prepared_size(2000, 1000, 1024),
+            (prepared.width, prepared.height)
+        );
+
+        let tall = dir.path().join("tall.jpg");
+        write_jpeg(&tall, 700, 1500);
+        let prepared = prepare(&tall, 1024, &tmp).expect("prepare");
+        assert_eq!(
+            prepared_size(700, 1500, 1024),
+            (prepared.width, prepared.height)
+        );
+
+        // Already small enough, and `max_side = 0` (originals): untouched.
+        assert_eq!(prepared_size(640, 480, 1024), (640, 480));
+        assert_eq!(prepared_size(4000, 3000, 0), (4000, 3000));
     }
 
     #[test]
