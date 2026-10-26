@@ -836,7 +836,23 @@ fn run_scan_job_impl(
     }
 
     // Phase 3: Classification loop — LLM classify all unclassified files
-    let unclassified = if mode.skips_classification() {
+    //
+    // Skipped when the backlog pass is going to run right after this scan
+    // (`chain_backlog`): it is the same classification, but in the pipeline that overlaps
+    // the next file's CPU work with this one's GPU work — and it is where the context
+    // blocks live. Running both classified everything twice, because the chained pass
+    // then found nothing left to do.
+    let delegate_classification = mode == ScanMode::Full
+        && crate::config::load_runtime_settings()
+            .map(|settings| settings.chain_backlog)
+            .unwrap_or(true);
+    if delegate_classification {
+        log::info!(
+            "Scan job {}: classification delegated to the chained backlog pass",
+            job_id
+        );
+    }
+    let unclassified = if mode.skips_classification() || delegate_classification {
         vec![]
     } else {
         db::list_unclassified_files(db_path, job.root_id, job.scan_marker)?
