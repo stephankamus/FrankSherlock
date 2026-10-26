@@ -388,6 +388,26 @@ fn begin_scan(
         }
     }
 
+    // A backlog over a half-written index reports "completed" over a fraction of the
+    // folder: discovery only fills the file list in memory and the rows are written by
+    // the thumbnail phase. Measured on 2026-10-26 — a pass over 925 rows of a 50k
+    // folder finished as "925/925 processed". Refuse and point at the resume instead
+    // of producing a number that looks like success.
+    if mode.uses_backlog_pipeline() {
+        let canonical = config::canonical_root_path(&root_path)
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| root_path.clone());
+        if let Some((job_id, phase, processed, total)) =
+            db::incomplete_scan_for_path(&state.paths.db_file, &canonical)
+                .map_err(|e| e.to_string())?
+        {
+            return Err(format!(
+                "The index of this folder is incomplete ({phase}: {processed} of {total} files written). \
+                 Resume scan job {job_id} or run Refresh first — the backlog would only see part of the folder."
+            ));
+        }
+    }
+
     let job = scan::start_or_resume_scan_job(&state.paths.db_file, &root_path)
         .map_err(|e| e.to_string())?;
     // If this root is a child of an existing parent root, adopt files from parent

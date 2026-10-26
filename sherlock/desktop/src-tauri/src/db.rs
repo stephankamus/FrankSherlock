@@ -465,6 +465,18 @@ fn disambiguated_name(root_path: &str) -> String {
     }
 }
 
+/// Absolute path a row should carry, given the root it belongs to and its rel_path.
+///
+/// `abs_path` is **stored**, not derived, so every operation that changes `root_id`
+/// or `rel_path` has to recompute it. Both moves below used to update only
+/// `rel_path`, which silently pointed every row at the old tree: removing
+/// `…/fotos/Fotos` from an index rooted at `…/fotos` left 55 120 rows answering "no
+/// such file" while their files were untouched (2026-10-26).
+fn abs_path_for(root_path: &str, rel_path: &str) -> String {
+    let base = root_path.trim_end_matches('/');
+    format!("{base}/{}", rel_path.trim_start_matches('/'))
+}
+
 /// After inserting a new child root, reassign files from a parent root whose
 /// `rel_path` falls under the child's subtree.
 pub fn adopt_child_files(
@@ -499,6 +511,15 @@ pub fn adopt_child_files(
             continue;
         }
 
+        // The row has to carry the child's canonical path, not the argument: the
+        // caller passes whatever the job holds, and the roots table has the
+        // normalized form that `upsert_root` stored.
+        let child_root: String = conn.query_row(
+            "SELECT root_path FROM roots WHERE id = ?1",
+            params![child_root_id],
+            |r| r.get(0),
+        )?;
+
         let tx = conn.unchecked_transaction()?;
 
         // Find files in parent root under the child's subtree
@@ -520,10 +541,16 @@ pub fn adopt_child_files(
                 .unwrap_or(old_rel_path)
                 .to_string();
 
-            // Update file record
+            // Update file record. `abs_path` too: it is what every reader opens,
+            // and leaving it behind is what broke a 55k-row index.
             tx.execute(
-                "UPDATE files SET root_id = ?1, rel_path = ?2 WHERE id = ?3",
-                params![child_root_id, new_rel_path, file_id],
+                "UPDATE files SET root_id = ?1, rel_path = ?2, abs_path = ?3 WHERE id = ?4",
+                params![
+                    child_root_id,
+                    new_rel_path,
+                    abs_path_for(&child_root, &new_rel_path),
+                    file_id
+                ],
             )?;
 
             // Update FTS: delete old and re-insert with new rel_path
@@ -1819,9 +1846,17 @@ pub fn reassign_to_parent_root(db_path: &Path, child_root_id: i64) -> AppResult<
     for (file_id, old_rel_path) in &file_rows {
         let new_rel_path = format!("{}{}", prefix_with_slash, old_rel_path);
 
+        // `abs_path` must follow the move: the row keeps a stored absolute path, and
+        // rewriting only `rel_path` is how a whole index ended up pointing one
+        // directory short of the files.
         tx.execute(
-            "UPDATE files SET root_id = ?1, rel_path = ?2 WHERE id = ?3",
-            params![parent_id, new_rel_path, file_id],
+            "UPDATE files SET root_id = ?1, rel_path = ?2, abs_path = ?3 WHERE id = ?4",
+            params![
+                parent_id,
+                new_rel_path,
+                abs_path_for(&parent_path, &new_rel_path),
+                file_id
+            ],
         )?;
 
         // Update FTS
@@ -1847,6 +1882,47 @@ pub fn reassign_to_parent_root(db_path: &Path, child_root_id: i64) -> AppResult<
 
     tx.commit()?;
     Ok(Some(parent_id))
+}
+
+/// An interrupted scan that has not finished writing this root's index.
+///
+/// Discovery only builds the file list **in memory**; the rows are written by the
+/// thumbnail phase, one file at a time. Cancelling before that phase ends leaves an
+/// index that is a prefix of the folder — and a backlog pass over it reports
+/// "completed" over a fraction of the files. Measured on 2026-10-26: 925 rows of a
+/// 50k folder, presented as a finished backlog, because `upsert_file_record` had
+/// only been called 925 times when the scan was paused.
+///
+/// Returns `(job_id, phase, processed, total)` when there is work left to write.
+pub fn incomplete_scan_for_path(
+    db_path: &Path,
+    root_path: &str,
+) -> AppResult<Option<(i64, String, u64, u64)>> {
+    let conn = open_conn(db_path)?;
+    let found: Option<(i64, String, u64, u64)> = conn
+        .query_row(
+            "SELECT j.id, j.phase, j.processed_files, j.total_files
+               FROM scan_jobs j
+               JOIN roots r ON r.id = j.root_id
+              WHERE r.root_path = ?1
+                AND j.status IN ('running', 'pending', 'interrupted')
+                AND j.phase IN ('discovering', 'thumbnailing', 'processing')
+              ORDER BY j.id DESC
+              LIMIT 1",
+            params![root_path],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? as u64,
+                    row.get::<_, i64>(3)? as u64,
+                ))
+            },
+        )
+        .ok();
+    // `discovering` is incomplete by definition: the walk knows the folder but has
+    // written nothing yet, so nothing can be trusted about the size either.
+    Ok(found.filter(|(_, phase, processed, total)| phase == "discovering" || processed < total))
 }
 
 pub fn purge_root(db_path: &Path, root_id: i64) -> AppResult<PurgeResult> {
@@ -6459,15 +6535,19 @@ mod tests {
 
         // Verify the file was reassigned
         let conn = open_conn(&db_path).expect("open");
-        let (rid, rp): (i64, String) = conn
+        let (rid, rp, ap): (i64, String, String) = conn
             .query_row(
-                "SELECT root_id, rel_path FROM files WHERE fingerprint = 'fp-vac'",
+                "SELECT root_id, rel_path, abs_path FROM files WHERE fingerprint = 'fp-vac'",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .expect("query");
         assert_eq!(rid, child_id);
         assert_eq!(rp, "vacation.jpg");
+        assert_eq!(
+            ap, "/home/Pictures/Photos/vacation.jpg",
+            "adopting a child must rewrite the absolute path too"
+        );
 
         // The other file stays with parent
         let (rid2, rp2): (i64, String) = conn
@@ -6499,15 +6579,19 @@ mod tests {
 
         // Verify file is now under parent with prefix
         let conn = open_conn(&db_path).expect("open");
-        let (rid, rp): (i64, String) = conn
+        let (rid, rp, ap): (i64, String, String) = conn
             .query_row(
-                "SELECT root_id, rel_path FROM files WHERE fingerprint = 'fp-vac'",
+                "SELECT root_id, rel_path, abs_path FROM files WHERE fingerprint = 'fp-vac'",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .expect("query");
         assert_eq!(rid, parent_id);
         assert_eq!(rp, "Photos/vacation.jpg");
+        assert_eq!(
+            ap, "/home/Pictures/Photos/vacation.jpg",
+            "abs_path must follow the move: it is what every reader opens"
+        );
 
         // Child root should be deleted
         let root_count: i64 = conn
@@ -6518,6 +6602,62 @@ mod tests {
             )
             .expect("count");
         assert_eq!(root_count, 0);
+    }
+
+    /// Discovery only fills the file list **in memory**; the rows are written by the
+    /// thumbnail phase. A cancelled scan therefore leaves an index that is a prefix of
+    /// the folder, and a backlog over it reports "completed" over a fraction of the
+    /// files — 925 of 50k on 2026-10-26.
+    #[test]
+    fn an_interrupted_discovery_is_reported_before_a_backlog() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let job = create_or_resume_scan_job(&db_path, "/tmp/half-written").expect("job");
+
+        // Nothing written yet: the size is not even known.
+        assert_eq!(
+            incomplete_scan_for_path(&db_path, "/tmp/half-written").expect("check"),
+            Some((job.id, "discovering".to_string(), 0, 0))
+        );
+
+        // The shape of that pass: 50k discovered, 925 rows written, then cancelled.
+        checkpoint_scan_job(
+            &db_path,
+            job.id,
+            "thumbnailing",
+            50_000,
+            925,
+            None,
+            0,
+            0,
+            0,
+            0,
+        )
+        .expect("ckpt");
+        cancel_scan_job(&db_path, job.id).expect("cancel");
+        assert_eq!(
+            incomplete_scan_for_path(&db_path, "/tmp/half-written").expect("check"),
+            Some((job.id, "thumbnailing".to_string(), 925, 50_000))
+        );
+
+        // Writing the last row clears the warning, even if the job never completes.
+        checkpoint_scan_job(
+            &db_path,
+            job.id,
+            "processing",
+            50_000,
+            50_000,
+            None,
+            0,
+            0,
+            0,
+            0,
+        )
+        .expect("ckpt2");
+        assert_eq!(
+            incomplete_scan_for_path(&db_path, "/tmp/half-written").expect("check"),
+            None
+        );
     }
 
     #[test]
