@@ -763,6 +763,35 @@ sinal de documento (valor + data, ou moeda). O custo de recall é explícito: um
 *fotografado* também é cena e para ali — a saída é um retry com overrides numa pasta que se
 sabe ser de comprovantes.
 
+### 5.12 Em andamento: `full` = descoberta + pipeline
+
+Estado: a **descoberta já escreve as linhas** (`insert_pending_rows`, uma transação,
+`ON CONFLICT DO NOTHING`, sem I/O além do walk). É o que impede o índice pela metade — um
+scan cancelado agora deixa um índice completo com trabalho pendente, não um "925 de 50 000"
+que parece concluído. A fase 3 também já não roda quando o backlog vai ser encadeado.
+
+Falta o corte: o produtor do pipeline completar a linha e a fase 2 ficar só no `refresh`.
+O alvo, e o que **não** pode regredir:
+
+| o que a fase 2 faz | para onde vai |
+|---|---|
+| `fingerprint` (janela de 64 KB) | produtor, quando `files.fingerprint` está vazio |
+| `location_text` (EXIF/GPS) | produtor, da mesma abertura do arquivo |
+| `scan_marker` | produtor carimba toda linha que visita — **sem isso a limpeza do fim do scan trata a linha como sumida e faz soft-delete** |
+| thumbnail + dhash | já é do produtor (é o objetivo do corte) |
+| metadados de vídeo (ffprobe) | produtor, no ramo legado de vídeo |
+| `moved` (fingerprint igual, caminho novo) | **o item mais delicado**: hoje é a fase 2 que casa o caminho novo com a linha antiga e move id + descrição. Sem isso, um arquivo renomeado vira linha nova pendente e a antiga é soft-deletada |
+
+Dois testes são obrigatórios antes de o corte entrar: cancelar no meio do pipeline não pode
+soft-deletar nada (as linhas não visitadas ficam pendentes com `thumb_path` NULL), e um
+`full` numa pasta mista (novos + existentes + renomeados) tem de continuar acertando
+`unchanged`/`moved`. É o mesmo terreno do bug de §5.7.6, onde a limpeza apagou uma pasta
+inteira.
+
+Ganho esperado quando fechar: os 58 743 arquivos deixam de pagar um passe mono-thread de
+thumbnails (~4 h a 250 ms/arquivo) e passam a fazer thumb + classificação na mesma passada
+do pipeline.
+
 ## 6. Riscos
 
 | Risco | Mitigação |
