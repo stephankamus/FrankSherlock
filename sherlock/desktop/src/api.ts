@@ -18,6 +18,10 @@ import type {
   PersonInfo,
   ProtectedPdfInfo,
   PurgeResult,
+  RawConversion,
+  RawJobStatus,
+  RawScanReport,
+  RawSupport,
   ReclassifyResult,
   ReclusterProgress,
   RenameFileResult,
@@ -124,6 +128,68 @@ export async function resetRootClassifications(
 
 export async function setStartupScan(value: StartupScanSetting): Promise<VisionSettings> {
   return invoke<VisionSettings>("set_startup_scan", { value });
+}
+
+/* ── HEIC/NEF conversion (opt-in) ───────────────────────────────── */
+
+/**
+ * Count the HEIC/NEF files of a root, per directory, before anything is written.
+ *
+ * Deliberately takes no options: the counts do not depend on them, and the estimates are
+ * computed in the UI (`utils/rawEstimate.ts`) so changing a select never re-walks the
+ * folder. The command runs off the main thread — a synchronous one froze the window while
+ * the walk ran.
+ */
+export async function scanRawCandidates(
+  rootId: number,
+  force = false,
+): Promise<RawScanReport> {
+  return invoke<RawScanReport>("raw_scan_candidates", { rootId, force });
+}
+
+export async function getRawSupportStatus(): Promise<RawSupport> {
+  return invoke<RawSupport>("raw_support_status");
+}
+
+/** Install the dedicated conversion venv (`pillow-heif` + `rawpy`) on demand. */
+export async function provisionRawSupport(): Promise<void> {
+  return invoke<void>("provision_raw_support");
+}
+
+/**
+ * Starts the job and returns its id; poll it with `getRawConversionStatus`.
+ *
+ * `dirs` is the checked folder list (`undefined` = all). An empty array is rejected by the
+ * backend on purpose: unchecking everything must not convert the whole root.
+ */
+export async function startRawConversion(
+  rootId: number,
+  options: { maxSide: number; quality: number; nefMode: string },
+  dirs?: string[],
+): Promise<number> {
+  return invoke<number>("start_raw_conversion", { rootId, options, dirs: dirs ?? null });
+}
+
+export async function cancelRawConversion(jobId: number): Promise<boolean> {
+  return invoke<boolean>("cancel_raw_conversion", { jobId });
+}
+
+export async function getRawConversionStatus(jobId: number): Promise<RawJobStatus> {
+  return invoke<RawJobStatus>("raw_conversion_status", { jobId });
+}
+
+export async function listRawConversions(rootId: number): Promise<RawConversion[]> {
+  return invoke<RawConversion[]>("list_raw_conversions", { rootId });
+}
+
+/**
+ * Id of the job already converting this root, or null.
+ *
+ * A reopened modal uses this to reattach to a job that kept running after it was closed,
+ * instead of showing a fresh scan and hiding the work in progress.
+ */
+export async function getRawRunningJob(rootId: number): Promise<number | null> {
+  return invoke<number | null>("raw_running_job", { rootId });
 }
 
 export async function getScanJob(jobId: number): Promise<ScanJobStatus | null> {

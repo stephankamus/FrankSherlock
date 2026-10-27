@@ -22,12 +22,19 @@ type RootCardProps = {
   onToggleFaceDetection?: () => void;
   /** Clear the classification of this folder so it can be sent to the model again. */
   onReclassify?: () => void;
+  /**
+   * Convert the HEIC/NEF files of this folder into JPEG copies.
+   *
+   * Absent in read-only mode on purpose: the copies live next to the originals, and a
+   * read-only session has no place to write them.
+   */
+  onConvertRaw?: () => void;
   onCancelScan?: () => void;
   onResumeScan?: () => void;
   onCancelFaceDetect?: () => void;
 };
 
-export default function RootCard({ root, isSelected, scan, readOnly, faceProgress, backlogProgress, onSelect, onDelete, onRescan, onRefresh, onCopyPath, onRelink, onDetectFaces, faceDetection, onToggleFaceDetection, onReclassify, onCancelScan, onResumeScan, onCancelFaceDetect }: RootCardProps) {
+export default function RootCard({ root, isSelected, scan, readOnly, faceProgress, backlogProgress, onSelect, onDelete, onRescan, onRefresh, onCopyPath, onRelink, onDetectFaces, faceDetection, onToggleFaceDetection, onReclassify, onConvertRaw, onCancelScan, onResumeScan, onCancelFaceDetect }: RootCardProps) {
   const [showMenu, setShowMenu] = useState(false);
   const [menuPos, setMenuPos] = useState({ x: 0, y: 0 });
   const menuRef = useRef<HTMLDivElement>(null);
@@ -285,6 +292,14 @@ export default function RootCard({ root, isSelected, scan, readOnly, faceProgres
           )}
           {onReclassify && (
             <button role="menuitem" onClick={(e) => { e.stopPropagation(); onReclassify(); setShowMenu(false); }}>Reclassify</button>
+          )}
+          {onConvertRaw && (
+            <button
+              role="menuitem"
+              onClick={(e) => { e.stopPropagation(); onConvertRaw(); setShowMenu(false); }}
+            >
+              Convert HEIC/NEF…
+            </button>
           )}
           <button role="menuitem" className="danger" onClick={(e) => { e.stopPropagation(); onDelete(); setShowMenu(false); }}>Remove</button>
         </div>

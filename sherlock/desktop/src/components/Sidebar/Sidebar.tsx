@@ -31,6 +31,8 @@ type SidebarProps = {
   onRelinkRoot?: (root: RootInfo) => void;
   /** Drop the classification of a root so its files can be classified again. */
   onReclassifyRoot?: (root: RootInfo) => void;
+  /** Convert the HEIC/NEF files of a root into JPEG copies. */
+  onConvertRawRoot?: (root: RootInfo) => void;
   onCompactDatabase?: () => void;
   compacting?: boolean;
   /** Live progress of the "Repair Thumbnails" tool. */
@@ -82,7 +84,7 @@ export default function Sidebar({
   setupReady, albums, smartFolders, activeAlbumName, activeSmartFolderId,
   selectedSubdir, faceProgress, onSelectSubdir,
   onSelectRoot, onDeleteRoot, onRescanRoot, onRefreshRoot, onCopyRootPath, onPickAndScan,
-  onRelinkRoot, onReclassifyRoot, onCompactDatabase, compacting,
+  onRelinkRoot, onReclassifyRoot, onConvertRawRoot, onCompactDatabase, compacting,
   thumbRepair, onRepairThumbnails, onCancelThumbRepair, onProcessBacklog,
   backlog, onCancelBacklog, failedCount, onRetryFailed,
   onDetectFaces, onCancelFaceDetect,
@@ -179,6 +181,9 @@ export default function Sidebar({
                   }
                   onReclassify={
                     !readOnly && onReclassifyRoot ? () => onReclassifyRoot(root) : undefined
+                  }
+                  onConvertRaw={
+                    !readOnly && onConvertRawRoot ? () => onConvertRawRoot(root) : undefined
                   }
                   onCancelScan={scan?.status === "running" ? () => onCancelScan(scan) : undefined}
                   onResumeScan={scan?.status === "interrupted" ? () => onResumeScan(scan) : undefined}

@@ -55,6 +55,17 @@ export default function ImageTile({ item, index, isSelected, isFocused, onClick,
         {isVideo && (
           <span className="tile-video-badge" aria-label="Video">&#9654;</span>
         )}
+        {item.sourceFormat && (
+          // A JPEG copy made from a HEIC/NEF file: the grid shows a normal photo, and
+          // this chip is what tells the user (and the duplicate view) where it came
+          // from. `title` carries the original path for the full story.
+          <span
+            className="tile-source-badge"
+            title={`Converted from ${item.sourceRelPath ?? item.sourceFormat.toUpperCase()}`}
+          >
+            {item.sourceFormat.toUpperCase()}
+          </span>
+        )}
         {item.faceCount != null && item.faceCount > 0 && (
           <span className="tile-face-badge" aria-label={`${item.faceCount} face${item.faceCount > 1 ? "s" : ""}`}>
             {item.faceCount}

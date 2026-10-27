@@ -87,6 +87,12 @@ pub struct SearchItem {
     pub size_bytes: i64,
     pub thumbnail_path: Option<String>,
     pub face_count: Option<i64>,
+    /// `heic` or `nef` when this row is a JPEG copy made by the conversion job.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_format: Option<String>,
+    /// Original file that produced the copy, relative to the root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_rel_path: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -212,6 +218,29 @@ pub struct UnclassifiedFile {
     pub dhash: Option<i64>,
 }
 
+/// A HEIC/NEF file that was converted into a JPEG copy.
+///
+/// The copy is an ordinary `files` row; this only records where it came from, so the
+/// grid can badge it and the duplicate view can refuse to pick it as the keeper.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawConversion {
+    pub id: i64,
+    pub root_id: i64,
+    pub source_rel_path: String,
+    /// Lowercase, without the dot: `heic` or `nef`.
+    pub source_ext: String,
+    pub output_rel_path: String,
+    pub source_size_bytes: i64,
+    pub source_mtime_ns: i64,
+    pub output_size_bytes: Option<i64>,
+    pub max_side: u32,
+    pub quality: u8,
+    /// `heic`, `preview` or `demosaic`.
+    pub mode: String,
+    pub created_at: i64,
+}
+
 /// What the startup prompt needs to know about an already-indexed root.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -275,6 +304,10 @@ pub struct SetupStatus {
     pub system_python_found: bool,
     pub venv_provision: VenvProvisionStatus,
     pub ffmpeg_available: bool,
+    /// The HEIC/NEF conversion venv (`pillow-heif` + `rawpy`) is usable.
+    pub raw_conversion_ready: bool,
+    /// Why it is not usable, or a short confirmation when it is.
+    pub raw_conversion_message: String,
 }
 
 #[derive(Debug, Clone)]

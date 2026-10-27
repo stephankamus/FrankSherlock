@@ -38,6 +38,7 @@
     "targets": "all",
     "resources": {
       "scripts/surya_ocr.py": "scripts/surya_ocr.py",
+      "scripts/convert_raw_images.py": "scripts/convert_raw_images.py",
       "lib/*": "lib/"
     },
     "icon": [

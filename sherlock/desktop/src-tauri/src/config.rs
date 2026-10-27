@@ -15,6 +15,12 @@ pub struct AppPaths {
     pub thumbnails_dir: PathBuf,
     pub scans_dir: PathBuf,
     pub surya_venv_dir: PathBuf,
+    /// Dedicated venv for HEIC/NEF conversion (`pillow-heif` + `rawpy`).
+    ///
+    /// Deliberately separate from `surya_venv_dir`: wanting to convert raw photos must
+    /// not require installing an OCR stack, and a broken `pip` in one venv must not take
+    /// the other down with it.
+    pub raw_venv_dir: PathBuf,
     pub tmp_dir: PathBuf,
     pub models_dir: PathBuf,
     pub face_crops_dir: PathBuf,
@@ -50,6 +56,7 @@ pub fn resolve_paths() -> AppResult<AppPaths> {
     let thumbnails_dir = cache_dir.join("thumbnails");
     let scans_dir = cache_dir.join("scans");
     let surya_venv_dir = base_dir.join("surya_venv");
+    let raw_venv_dir = base_dir.join("raw_venv");
     let tmp_dir = cache_dir.join("tmp");
     let db_file = db_dir.join("index.sqlite");
     let models_dir = base_dir.join("models");
@@ -64,6 +71,7 @@ pub fn resolve_paths() -> AppResult<AppPaths> {
         thumbnails_dir,
         scans_dir,
         surya_venv_dir,
+        raw_venv_dir,
         tmp_dir,
         models_dir,
         face_crops_dir,
@@ -78,6 +86,7 @@ pub fn prepare_dirs(paths: &AppPaths) -> AppResult<()> {
     std::fs::create_dir_all(&paths.thumbnails_dir)?;
     std::fs::create_dir_all(&paths.scans_dir)?;
     std::fs::create_dir_all(&paths.surya_venv_dir)?;
+    std::fs::create_dir_all(&paths.raw_venv_dir)?;
     std::fs::create_dir_all(&paths.tmp_dir)?;
     std::fs::create_dir_all(&paths.models_dir)?;
     std::fs::create_dir_all(&paths.face_crops_dir)?;

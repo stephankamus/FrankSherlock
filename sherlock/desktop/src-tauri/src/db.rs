@@ -9,7 +9,7 @@ use crate::error::{AppError, AppResult};
 use crate::models::{
     Album, CompactResult, DbStats, DuplicateFile, DuplicateGroup, DuplicatesResponse, ExistingFile,
     FileMetadata, FileProperties, FileRecordUpsert, HealthCheckOutcome, ParsedQuery, PdfPassword,
-    ProtectedPdfInfo, PurgeResult, RootInfo, ScanJobState, ScanJobStatus, SearchItem,
+    ProtectedPdfInfo, PurgeResult, RawConversion, RootInfo, ScanJobState, ScanJobStatus, SearchItem,
     SearchRequest, SearchResponse, SmartFolder, SortField, SortOrder, SubdirEntry,
 };
 use crate::query_parser::parse_query;
@@ -399,6 +399,37 @@ fn run_migrations(conn: &mut Connection) -> AppResult<()> {
             CREATE INDEX IF NOT EXISTS idx_files_faces_scanned_at ON files(faces_scanned_at);
             UPDATE files SET faces_scanned_at = updated_at WHERE face_count <> 0;
             UPDATE files SET face_count = 0 WHERE face_count < 0;
+            "#,
+        ),
+        // Migration 19: where a converted HEIC/NEF copy came from.
+        //
+        // Why a separate table instead of columns on `files`: `upsert_file_record`
+        // rewrites every column of the row on each scan, so a provenance column there
+        // would be silently reset by the very scan that indexes the copy. The copy
+        // itself is an ordinary JPEG row; this table only answers "which raw produced
+        // it", which is what the badge, the properties dialog and the duplicate view
+        // need. A UNIQUE on the source makes the conversion job idempotent by
+        // construction.
+        M::up(
+            r#"
+            CREATE TABLE IF NOT EXISTS raw_conversions (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                root_id           INTEGER NOT NULL,
+                source_rel_path   TEXT NOT NULL,
+                source_ext        TEXT NOT NULL,
+                output_rel_path   TEXT NOT NULL,
+                source_size_bytes INTEGER NOT NULL,
+                source_mtime_ns   INTEGER NOT NULL,
+                output_size_bytes INTEGER,
+                max_side          INTEGER NOT NULL DEFAULT 0,
+                quality           INTEGER NOT NULL DEFAULT 90,
+                mode              TEXT NOT NULL DEFAULT '',
+                created_at        INTEGER NOT NULL,
+                UNIQUE (root_id, source_rel_path),
+                FOREIGN KEY (root_id) REFERENCES roots(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_raw_conversions_output
+                ON raw_conversions(root_id, output_rel_path);
             "#,
         ),
     ]);
@@ -1188,6 +1219,162 @@ pub fn clear_thumb_path(db_path: &Path, file_id: i64) -> AppResult<()> {
         "UPDATE files SET thumb_path = NULL WHERE id = ?1",
         params![file_id],
     )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// HEIC/NEF conversion provenance
+// ---------------------------------------------------------------------------
+
+/// What the conversion job reports for one finished file.
+#[derive(Debug, Clone)]
+pub struct RawConversionRecord<'a> {
+    pub root_id: i64,
+    pub source_rel_path: &'a str,
+    pub source_ext: &'a str,
+    pub output_rel_path: &'a str,
+    pub source_size_bytes: i64,
+    pub source_mtime_ns: i64,
+    pub output_size_bytes: Option<i64>,
+    pub max_side: u32,
+    pub quality: u8,
+    pub mode: &'a str,
+}
+
+/// Record that `output_rel_path` was produced from `source_rel_path`.
+///
+/// The `UNIQUE (root_id, source_rel_path)` conflict target is what makes the job
+/// idempotent: re-running with the same source updates the row instead of adding a
+/// second one, so "already converted" is a single lookup and never a duplicate.
+pub fn upsert_raw_conversion(db_path: &Path, record: &RawConversionRecord<'_>) -> AppResult<()> {
+    let conn = open_conn(db_path)?;
+    conn.execute(
+        "INSERT INTO raw_conversions (
+             root_id, source_rel_path, source_ext, output_rel_path,
+             source_size_bytes, source_mtime_ns, output_size_bytes,
+             max_side, quality, mode, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(root_id, source_rel_path) DO UPDATE SET
+             source_ext = excluded.source_ext,
+             output_rel_path = excluded.output_rel_path,
+             source_size_bytes = excluded.source_size_bytes,
+             source_mtime_ns = excluded.source_mtime_ns,
+             output_size_bytes = excluded.output_size_bytes,
+             max_side = excluded.max_side,
+             quality = excluded.quality,
+             mode = excluded.mode,
+             created_at = excluded.created_at",
+        params![
+            record.root_id,
+            record.source_rel_path,
+            record.source_ext,
+            record.output_rel_path,
+            record.source_size_bytes,
+            record.source_mtime_ns,
+            record.output_size_bytes,
+            record.max_side as i64,
+            record.quality as i64,
+            record.mode,
+            now_epoch_secs(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Every conversion recorded for a root, ordered by source path.
+///
+/// The job uses this both to decide what to skip and to know which outputs it owns;
+/// the UI uses it to explain what a copy in the grid actually is.
+pub fn list_raw_conversions(db_path: &Path, root_id: i64) -> AppResult<Vec<RawConversion>> {
+    let conn = open_conn(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, root_id, source_rel_path, source_ext, output_rel_path,
+                source_size_bytes, source_mtime_ns, output_size_bytes,
+                max_side, quality, mode, created_at
+         FROM raw_conversions
+         WHERE root_id = ?1
+         ORDER BY source_rel_path",
+    )?;
+    let rows = stmt.query_map(params![root_id], |row| {
+        Ok(RawConversion {
+            id: row.get(0)?,
+            root_id: row.get(1)?,
+            source_rel_path: row.get(2)?,
+            source_ext: row.get(3)?,
+            output_rel_path: row.get(4)?,
+            source_size_bytes: row.get(5)?,
+            source_mtime_ns: row.get(6)?,
+            output_size_bytes: row.get(7)?,
+            max_side: row.get::<_, i64>(8)? as u32,
+            quality: row.get::<_, i64>(9)? as u8,
+            mode: row.get(10)?,
+            created_at: row.get(11)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Provenance of one `files` row, by its indexed path.
+#[allow(dead_code)] // used by the properties dialog as soon as it shows provenance
+pub fn raw_conversion_for_output(
+    db_path: &Path,
+    root_id: i64,
+    output_rel_path: &str,
+) -> AppResult<Option<RawConversion>> {
+    Ok(list_raw_conversions(db_path, root_id)?
+        .into_iter()
+        .find(|conversion| conversion.output_rel_path == output_rel_path))
+}
+
+/// Drop the provenance of a conversion whose output no longer exists.
+#[allow(dead_code)] // kept for the explicit "forget this conversion" action
+pub fn delete_raw_conversion(db_path: &Path, root_id: i64, source_rel_path: &str) -> AppResult<()> {
+    let conn = open_conn(db_path)?;
+    conn.execute(
+        "DELETE FROM raw_conversions WHERE root_id = ?1 AND source_rel_path = ?2",
+        params![root_id, source_rel_path],
+    )?;
+    Ok(())
+}
+
+/// Fill `source_format`/`source_rel_path` on a page of search results.
+///
+/// Done after the page is fetched instead of as a `LEFT JOIN` inside the search query:
+/// that SQL is assembled from several optional fragments (FTS, people, albums) and a
+/// join would have to be threaded through the count query and the grouping too. One
+/// extra query per distinct root of a 200-row page is cheaper than that risk, and
+/// `raw_conversions` has one row per converted raw, not per file.
+pub fn attach_raw_provenance(db_path: &Path, items: &mut [SearchItem]) -> AppResult<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let mut root_ids: Vec<i64> = items.iter().map(|item| item.root_id).collect();
+    root_ids.sort_unstable();
+    root_ids.dedup();
+
+    let mut provenance: std::collections::HashMap<(i64, String), (String, String)> =
+        std::collections::HashMap::new();
+    for root_id in root_ids {
+        for conversion in list_raw_conversions(db_path, root_id)? {
+            provenance.insert(
+                (root_id, conversion.output_rel_path),
+                (conversion.source_ext, conversion.source_rel_path),
+            );
+        }
+    }
+    if provenance.is_empty() {
+        return Ok(());
+    }
+    for item in items.iter_mut() {
+        if let Some((ext, source)) = provenance.get(&(item.root_id, item.rel_path.clone())) {
+            item.source_format = Some(ext.clone());
+            item.source_rel_path = Some(source.clone());
+        }
+    }
     Ok(())
 }
 
@@ -3495,6 +3682,8 @@ fn search_images_normalized(
             size_bytes: row.get(8)?,
             thumbnail_path: row.get(9)?,
             face_count: row.get::<_, Option<i64>>(10)?.filter(|&c| c > 0),
+            source_format: None,
+            source_rel_path: None,
         })
     })?;
 
@@ -3511,6 +3700,7 @@ fn search_images_normalized(
         }
         items.push(item);
     }
+    attach_raw_provenance(db_path, &mut items)?;
 
     Ok(SearchResponse {
         total: total as u64,
@@ -3644,6 +3834,8 @@ fn search_like_fallback(
             size_bytes: row.get(8)?,
             thumbnail_path: row.get(9)?,
             face_count: row.get::<_, Option<i64>>(10)?.filter(|&c| c > 0),
+            source_format: None,
+            source_rel_path: None,
         })
     })?;
 
@@ -4345,6 +4537,8 @@ pub fn list_files_with_faces(
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(scope_params.iter()), |row| {
         Ok(crate::models::SearchItem {
+            source_format: None,
+            source_rel_path: None,
             id: row.get(0)?,
             root_id: row.get(1)?,
             rel_path: row.get(2)?,
@@ -5305,8 +5499,46 @@ pub fn find_duplicates(
     })
 }
 
+/// `(root_id, output_rel_path)` of every converted copy, so the duplicate view can tell
+/// a JPEG copy of a raw from a photo the user actually owns.
+type ConvertedCopies = std::collections::HashSet<(i64, String)>;
+
+fn converted_copies(db_path: &Path) -> AppResult<ConvertedCopies> {
+    let conn = open_conn(db_path)?;
+    let mut stmt = conn.prepare("SELECT root_id, output_rel_path FROM raw_conversions")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut set = ConvertedCopies::new();
+    for row in rows {
+        set.insert(row?);
+    }
+    Ok(set)
+}
+
+/// Move a file that is **not** a converted copy to the front of the group.
+///
+/// The copy is usually larger than the native JPEG of the same photo (quality 90 at
+/// full resolution), and the keeper heuristic prefers the largest file — so without
+/// this the view would keep the copy and offer the original for deletion.
+fn prefer_native_keeper(files: &mut [DuplicateFile], converted: &ConvertedCopies) {
+    if files.len() < 2 {
+        return;
+    }
+    let Some(position) = files
+        .iter()
+        .position(|file| !converted.contains(&(file.root_id, file.rel_path.clone())))
+    else {
+        return;
+    };
+    if position > 0 {
+        files[..=position].rotate_right(1);
+    }
+}
+
 fn find_exact_duplicates(db_path: &Path, root_scope: &[i64]) -> AppResult<Vec<DuplicateGroup>> {
     let conn = open_conn(db_path)?;
+    let converted = converted_copies(db_path)?;
 
     let mut sql = String::from(
         "SELECT f.id, f.root_id, f.rel_path, f.abs_path, r.root_path, \
@@ -5382,7 +5614,7 @@ fn find_exact_duplicates(db_path: &Path, root_scope: &[i64]) -> AppResult<Vec<Du
 
         if fingerprint != current_fp {
             if !current_files.is_empty() {
-                groups.push(build_exact_group(&current_fp, &mut current_files));
+                groups.push(build_exact_group(&current_fp, &mut current_files, &converted));
             }
             current_fp = fingerprint;
             current_files.clear();
@@ -5407,7 +5639,7 @@ fn find_exact_duplicates(db_path: &Path, root_scope: &[i64]) -> AppResult<Vec<Du
     }
 
     if !current_files.is_empty() {
-        groups.push(build_exact_group(&current_fp, &mut current_files));
+        groups.push(build_exact_group(&current_fp, &mut current_files, &converted));
     }
 
     Ok(groups)
@@ -5439,6 +5671,7 @@ fn find_near_duplicates(
     use crate::similarity;
 
     let conn = open_conn(db_path)?;
+    let converted = converted_copies(db_path)?;
 
     // Collect fingerprints already covered by exact groups to filter them
     let exact_fps: std::collections::HashSet<&str> = exact_groups
@@ -5547,6 +5780,7 @@ fn find_near_duplicates(
                 .then(a.mtime_ns.cmp(&b.mtime_ns))
                 .then(a.rel_path.len().cmp(&b.rel_path.len()))
         });
+        prefer_native_keeper(&mut files, &converted);
         if !files.is_empty() {
             files[0].is_keeper = true;
         }
@@ -5616,8 +5850,14 @@ fn find_near_duplicates(
     Ok(groups)
 }
 
-fn build_exact_group(fingerprint: &str, files: &mut [DuplicateFile]) -> DuplicateGroup {
-    // Mark the keeper: first file is already the oldest (ORDER BY mtime_ns ASC, path length ASC)
+fn build_exact_group(
+    fingerprint: &str,
+    files: &mut [DuplicateFile],
+    converted: &ConvertedCopies,
+) -> DuplicateGroup {
+    // Mark the keeper: first file is already the oldest (ORDER BY mtime_ns ASC, path
+    // length ASC), unless the oldest is a converted copy of a raw.
+    prefer_native_keeper(files, converted);
     if !files.is_empty() {
         files[0].is_keeper = true;
     }
@@ -7154,11 +7394,34 @@ mod tests {
         init_database(&db_path).expect("init");
 
         let conn = open_conn(&db_path).expect("open");
-        // Verify user_version is set (19 migrations applied → version 19)
+        // Verify user_version is set (20 migrations applied → version 20)
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 19);
+        assert_eq!(version, 20);
+
+        // Migration 19 records where a converted HEIC/NEF copy came from.
+        let conversion_columns: Vec<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(raw_conversions)")
+                .expect("prepare");
+            stmt.query_map([], |r| r.get::<_, String>(1))
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect")
+        };
+        for column in [
+            "source_rel_path",
+            "source_ext",
+            "output_rel_path",
+            "source_size_bytes",
+            "source_mtime_ns",
+        ] {
+            assert!(
+                conversion_columns.contains(&column.to_string()),
+                "raw_conversions.{column} is missing"
+            );
+        }
 
         // Migration 17 records the language each description was written in.
         let columns: Vec<String> = conn
@@ -7227,8 +7490,118 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        // We have 19 migrations (indices 0..18), so user_version should be 19
-        assert_eq!(version, 19);
+        // We have 20 migrations (indices 0..19), so user_version should be 20
+        assert_eq!(version, 20);
+    }
+
+    #[test]
+    fn raw_conversion_roundtrip_is_idempotent_per_source() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/raw").expect("root");
+
+        let record = RawConversionRecord {
+            root_id,
+            source_rel_path: "Trip/IMG_1.HEIC",
+            source_ext: "heic",
+            output_rel_path: "Trip/FrankSherlock-JPG/IMG_1__heic.jpg",
+            source_size_bytes: 3_831_990,
+            source_mtime_ns: 1_700_000_000_000_000_000,
+            output_size_bytes: Some(3_517_543),
+            max_side: 0,
+            quality: 90,
+            mode: "heic",
+        };
+        upsert_raw_conversion(&db_path, &record).expect("insert");
+
+        let rows = list_raw_conversions(&db_path, root_id).expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source_ext, "heic");
+        assert_eq!(rows[0].mode, "heic");
+        assert_eq!(rows[0].quality, 90);
+
+        // Same source converted again (new mtime, new options): one row, updated.
+        let updated = RawConversionRecord {
+            source_mtime_ns: 1_700_000_111_000_000_000,
+            max_side: 2048,
+            ..record
+        };
+        upsert_raw_conversion(&db_path, &updated).expect("update");
+
+        let rows = list_raw_conversions(&db_path, root_id).expect("list");
+        assert_eq!(rows.len(), 1, "the source path is the natural key");
+        assert_eq!(rows[0].source_mtime_ns, 1_700_000_111_000_000_000);
+        assert_eq!(rows[0].max_side, 2048);
+
+        delete_raw_conversion(&db_path, root_id, "Trip/IMG_1.HEIC").expect("delete");
+        assert!(
+            list_raw_conversions(&db_path, root_id)
+                .expect("list")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn provenance_is_attached_to_search_items() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/raw-prov").expect("root");
+
+        let output_rel = "FrankSherlock-JPG/IMG_1__heic.jpg";
+        upsert_raw_conversion(
+            &db_path,
+            &RawConversionRecord {
+                root_id,
+                source_rel_path: "IMG_1.HEIC",
+                source_ext: "heic",
+                output_rel_path: output_rel,
+                source_size_bytes: 10,
+                source_mtime_ns: 20,
+                output_size_bytes: Some(5),
+                max_side: 0,
+                quality: 90,
+                mode: "heic",
+            },
+        )
+        .expect("insert");
+
+        let mut items = vec![
+            SearchItem {
+                id: 1,
+                root_id,
+                rel_path: output_rel.to_string(),
+                abs_path: "/tmp/raw-prov/FrankSherlock-JPG/IMG_1__heic.jpg".to_string(),
+                media_type: "photo".to_string(),
+                description: String::new(),
+                confidence: 0.0,
+                mtime_ns: 0,
+                size_bytes: 5,
+                thumbnail_path: None,
+                face_count: None,
+                source_format: None,
+                source_rel_path: None,
+            },
+            SearchItem {
+                id: 2,
+                root_id,
+                rel_path: "ordinary.jpg".to_string(),
+                abs_path: "/tmp/raw-prov/ordinary.jpg".to_string(),
+                media_type: "photo".to_string(),
+                description: String::new(),
+                confidence: 0.0,
+                mtime_ns: 0,
+                size_bytes: 5,
+                thumbnail_path: None,
+                face_count: None,
+                source_format: None,
+                source_rel_path: None,
+            },
+        ];
+
+        attach_raw_provenance(&db_path, &mut items).expect("attach");
+        assert_eq!(items[0].source_format.as_deref(), Some("heic"));
+        assert_eq!(items[0].source_rel_path.as_deref(), Some("IMG_1.HEIC"));
+        assert!(items[1].source_format.is_none());
     }
 
     #[test]
@@ -8083,6 +8456,50 @@ mod tests {
     }
 
     // ── Duplicates tests ────────────────────────────────────────────
+
+    #[test]
+    fn converted_copies_are_never_the_keeper_when_a_native_file_exists() {
+        fn file(root_id: i64, rel_path: &str, size: i64) -> DuplicateFile {
+            DuplicateFile {
+                id: size,
+                root_id,
+                rel_path: rel_path.to_string(),
+                abs_path: format!("/root/{rel_path}"),
+                root_path: "/root".to_string(),
+                media_type: "photo".to_string(),
+                description: String::new(),
+                confidence: 0.9,
+                mtime_ns: 0,
+                size_bytes: size,
+                thumbnail_path: None,
+                is_keeper: false,
+                similarity_score: None,
+                group_type: "near".to_string(),
+            }
+        }
+
+        let mut converted = ConvertedCopies::new();
+        converted.insert((1, "FrankSherlock-JPG/IMG_1__heic.jpg".to_string()));
+
+        // The copy is bigger (full-resolution q90 JPEG), which is exactly what the
+        // size-based heuristic would pick; it must still lose to the native file.
+        let mut files = vec![
+            file(1, "FrankSherlock-JPG/IMG_1__heic.jpg", 3_500_000),
+            file(1, "IMG_1.jpg", 1_100_000),
+        ];
+        prefer_native_keeper(&mut files, &converted);
+        assert_eq!(files[0].rel_path, "IMG_1.jpg");
+
+        // A group made only of copies keeps the original heuristic order.
+        let mut both_copies = converted.clone();
+        both_copies.insert((1, "FrankSherlock-JPG/IMG_1__nef.jpg".to_string()));
+        let mut only_copies = vec![
+            file(1, "FrankSherlock-JPG/IMG_1__heic.jpg", 3),
+            file(1, "FrankSherlock-JPG/IMG_1__nef.jpg", 2),
+        ];
+        prefer_native_keeper(&mut only_copies, &both_copies);
+        assert_eq!(only_copies[0].size_bytes, 3);
+    }
 
     #[test]
     fn find_duplicates_empty_db() {

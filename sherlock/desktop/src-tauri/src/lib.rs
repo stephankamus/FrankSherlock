@@ -10,6 +10,7 @@ mod models;
 mod pdf;
 mod platform;
 mod query_parser;
+mod raw;
 mod runtime;
 mod scan;
 mod similarity;
@@ -54,6 +55,42 @@ struct ModelSelection {
     settings_error: Option<String>,
 }
 
+/// The candidate list the modal already walked, kept so the job does not traverse the
+/// share a second time. Short-lived on purpose: a window where a file added or removed in
+/// between is handled by `needs_conversion` (per file) and by the sidecar ("source not
+/// found"), so staleness costs at most one skipped file in the next run.
+struct RawScanCache {
+    root_id: i64,
+    at_ms: i64,
+    candidates: Vec<raw::RawCandidate>,
+}
+
+/// One running (or finished) HEIC/NEF conversion job.
+#[derive(Default)]
+struct RawJobSlot {
+    /// Root the job belongs to: two jobs over the same root would convert the same
+    /// files concurrently and could produce a half-written JPEG.
+    root_id: i64,
+    cancel: Arc<AtomicBool>,
+    status: raw::RawJobStatus,
+}
+
+/// Id of the job already converting this root, if any.
+fn running_raw_job_for_root(jobs: &HashMap<i64, RawJobSlot>, root_id: i64) -> Option<i64> {
+    jobs.iter()
+        .find(|(_, slot)| slot.root_id == root_id && slot.status.running)
+        .map(|(id, _)| *id)
+}
+
+/// Update the phase of a running job so the modal can tell "walking" from "converting".
+fn set_raw_phase(state: &AppState, job_id: i64, phase: &str) {
+    if let Ok(mut jobs) = state.raw_jobs.lock() {
+        if let Some(slot) = jobs.get_mut(&job_id) {
+            slot.status.phase = phase.to_string();
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     paths: AppPaths,
@@ -74,6 +111,10 @@ struct AppState {
     /// settings screen.
     description_language_progress: Arc<Mutex<Option<models::DescriptionLanguageProgress>>>,
     description_language_cancel: Arc<AtomicBool>,
+    /// HEIC/NEF conversion jobs by id, polled by the conversion modal.
+    raw_jobs: Arc<Mutex<HashMap<i64, RawJobSlot>>>,
+    /// Candidate list of the last scan, so the job does not walk the folder again.
+    raw_scan_cache: Arc<Mutex<Option<RawScanCache>>>,
     /// Live counters of the producer/consumer pipeline (backlog, retry and the
     /// pipeline half of a `full`), polled by the sidebar.
     backlog_progress: Arc<Mutex<Option<models::BacklogProgress>>>,
@@ -569,6 +610,375 @@ fn cancel_scan(job_id: i64, state: State<'_, AppState>) -> Result<bool, String> 
     } else {
         Ok(false)
     }
+}
+
+// ---------------------------------------------------------------------------
+// HEIC/NEF conversion (opt-in)
+//
+// The only feature allowed to write inside a scanned directory, and only into
+// `FrankSherlock-JPG/` next to the originals, with explicit consent in the modal.
+// See `plans/heic-nef-conversion.md`.
+// ---------------------------------------------------------------------------
+
+static NEXT_RAW_JOB_ID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+
+fn next_raw_job_id() -> i64 {
+    NEXT_RAW_JOB_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
+/// Indexed path of a root, by id.
+fn root_path_by_id(state: &AppState, root_id: i64) -> Result<String, String> {
+    let roots = db::list_roots(&state.paths.db_file).map_err(|e| e.to_string())?;
+    roots
+        .into_iter()
+        .find(|root| root.id == root_id)
+        .map(|root| root.root_path)
+        .ok_or_else(|| format!("root {root_id} not found"))
+}
+
+/// Counts of HEIC/NEF files per directory, for the modal that opens before anything is
+/// written.
+///
+/// `async` on purpose: a synchronous Tauri command runs on the main thread, and walking a
+/// large (or networked) root there freezes the window for as long as the walk takes. The
+/// same reasoning applies to the readiness check: it is a `stat`, not a Python spawn, so
+/// the modal paints immediately; the job does the real import test off-thread.
+///
+/// The walk itself is cached for the lifetime of the app — new HEIC/NEF files do not
+/// appear often enough to justify re-traversing a share every time the modal opens. The
+/// modal's "Rescan" button passes `force = true`, and the refreshed list also becomes the
+/// one the job uses.
+#[tauri::command]
+async fn raw_scan_candidates(
+    root_id: i64,
+    force: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<raw::RawScanReport, String> {
+    let db_path = state.paths.db_file.clone();
+    let venv_dir = state.paths.raw_venv_dir.clone();
+    let root_path = root_path_by_id(state.inner(), root_id)?;
+    let cached = if force.unwrap_or(false) {
+        None
+    } else {
+        state.raw_scan_cache.lock().ok().and_then(|cache| {
+            cache
+                .as_ref()
+                .filter(|cache| cache.root_id == root_id)
+                .map(|cache| cache.candidates.clone())
+        })
+    };
+
+    let scanned = tauri::async_runtime::spawn_blocking(
+        move || -> Result<(raw::RawScanReport, Vec<raw::RawCandidate>, bool), String> {
+            let root = config::canonical_root_path(&root_path).map_err(|e| e.to_string())?;
+            let (candidates, reused) = match cached {
+                Some(candidates) => (candidates, true),
+                None => (raw::list_candidates(&root, None), false),
+            };
+            log::info!(
+                "raw scan: {} candidate(s) {} under {}",
+                candidates.len(),
+                if reused { "from cache" } else { "walked" },
+                root.display()
+            );
+            let conversions =
+                db::list_raw_conversions(&db_path, root_id).map_err(|e| e.to_string())?;
+            let mut report = raw::build_report(&root, &candidates, &conversions);
+            let present = raw::venv_present(&venv_dir);
+            report.conversion_ready = present;
+            report.conversion_message = if present {
+                "conversion venv installed".to_string()
+            } else {
+                "conversion venv not installed".to_string()
+            };
+            Ok((report, candidates, reused))
+        },
+    )
+    .await
+    .map_err(|e| format!("could not scan the folder: {e}"))??;
+
+    let (report, candidates, reused) = scanned;
+    if !reused {
+        // Hand the walk to the job: opening the modal and clicking Convert is the normal
+        // flow, and doing the traversal twice is what kept the job invisible for minutes.
+        if let Ok(mut cache) = state.raw_scan_cache.lock() {
+            *cache = Some(RawScanCache {
+                root_id,
+                at_ms: unix_now_ms(),
+                candidates,
+            });
+        }
+    }
+    Ok(report)
+}
+
+/// Whether the dedicated conversion venv can decode HEIC and NEF.
+///
+/// Spawns the interpreter, hence off the main thread.
+#[tauri::command]
+async fn raw_support_status(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<raw::RawSupport, String> {
+    let venv_dir = state.paths.raw_venv_dir.clone();
+    let script = resolve_script(&app_handle, "convert_raw_images.py");
+    tauri::async_runtime::spawn_blocking(move || {
+        raw::support(&platform::python::python_venv_binary(&venv_dir), &script)
+    })
+    .await
+    .map_err(|e| format!("could not check the conversion support: {e}"))
+}
+
+/// A job report that carries one preparation failure, so the modal shows it like any
+/// other conversion error instead of a promise that never resolves.
+fn failed_raw_report(error: String) -> raw::RawJobReport {
+    let mut report = raw::RawJobReport::default();
+    report.failed = 1;
+    report.failures.push(error);
+    report
+}
+
+/// Install the conversion venv on demand (`Setup conversion support`).
+///
+/// Shares `venv_provision` with the Surya flow: it is the same "one setup runs at a
+/// time" spinner, and two concurrent `pip install` runs would fight over the CPU.
+#[tauri::command]
+async fn provision_raw_support(state: State<'_, AppState>) -> Result<(), String> {
+    require_writable(state.inner())?;
+    let system_python = state
+        .system_python()
+        .map(|path| path.to_path_buf())
+        .ok_or_else(|| {
+            "Python 3 not found. Install Python 3 and relaunch before converting HEIC/NEF."
+                .to_string()
+        })?;
+    let provision_state = state.venv_provision.clone();
+    let venv_dir = state.paths.raw_venv_dir.clone();
+    tauri::async_runtime::spawn(async move {
+        platform::python::run_raw_venv_provision(provision_state, system_python, venv_dir).await;
+    });
+    Ok(())
+}
+
+/// Start the conversion job and return its id; the modal polls `raw_conversion_status`.
+///
+/// `dirs` is the set of folders the user left checked (`None` = all of them). An explicit
+/// empty list is rejected instead of being read as "everything": unchecking every box and
+/// pressing Convert must not start a full conversion.
+#[tauri::command]
+fn start_raw_conversion(
+    root_id: i64,
+    options: Option<raw::ConversionOptions>,
+    dirs: Option<Vec<String>>,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<i64, String> {
+    require_writable(state.inner())?;
+    if dirs.as_ref().is_some_and(|selected| selected.is_empty()) {
+        return Err("No folder selected: check at least one to convert.".to_string());
+    }
+    let selected_dirs = dirs;
+    let root_path = root_path_by_id(state.inner(), root_id)?;
+    let root = config::canonical_root_path(&root_path).map_err(|e| e.to_string())?;
+
+    // Reserve the job *before* the expensive part (walk + report), under the same lock
+    // that answers "is one already running". A double click, a second window or a CLI
+    // invocation then cannot start two jobs over the same files: two `python` processes
+    // writing the same output path is how a half-written JPEG happens. Idempotency at
+    // the file level (`needs_conversion`) protects the second *run*, not two runs at
+    // the same time.
+    let job_id = next_raw_job_id();
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut jobs = state.raw_jobs.lock().expect("raw jobs mutex poisoned");
+        if let Some(running) = running_raw_job_for_root(&jobs, root_id) {
+            return Err(format!(
+                "A conversion is already running for this folder (job {running}). \
+                 Wait for it to finish or cancel it first."
+            ));
+        }
+        jobs.insert(
+            job_id,
+            RawJobSlot {
+                root_id,
+                cancel: cancel.clone(),
+                status: raw::RawJobStatus {
+                    running: true,
+                    started_at_ms: unix_now_ms(),
+                    ..raw::RawJobStatus::default()
+                },
+            },
+        );
+    }
+
+    // Everything else — the Python support check, the folder walk, the conversion — runs
+    // in the worker thread. A synchronous Tauri command executes on the main thread, and
+    // doing any of that there froze the window: the walk alone touches every directory of
+    // the root, and `support()` spawns an interpreter.
+    let options = options.unwrap_or_default().normalized();
+    let state_clone = state.inner().clone();
+    std::thread::spawn(move || {
+        let db_path = state_clone.paths.db_file.clone();
+        let script = resolve_script(&app_handle, "convert_raw_images.py");
+        let python = platform::python::python_venv_binary(&state_clone.paths.raw_venv_dir);
+        set_raw_phase(&state_clone, job_id, raw::PHASE_SCANNING);
+
+        // Reuse the walk the modal already did (cached for the app's lifetime). Without
+        // this the job re-traversed the share and the modal sat at `0 / ?` for minutes.
+        let prewalked = state_clone.raw_scan_cache.lock().ok().and_then(|cache| {
+            cache
+                .as_ref()
+                .filter(|cached| cached.root_id == root_id)
+                .map(|cached| {
+                    log::info!(
+                        "raw conversion: reusing the scan from {}s ago ({} candidates)",
+                        (unix_now_ms() - cached.at_ms) / 1000,
+                        cached.candidates.len()
+                    );
+                    cached.candidates.clone()
+                })
+        });
+
+        let prepared = (|| -> Result<Vec<raw::RawCandidate>, String> {
+            let support = raw::support(&python, &script);
+            if !support.ready {
+                return Err(format!(
+                    "HEIC/NEF conversion is not available: {}",
+                    support.message
+                ));
+            }
+            let conversions =
+                db::list_raw_conversions(&db_path, root_id).map_err(|e| e.to_string())?;
+            let mut candidates = match &prewalked {
+                Some(candidates) => candidates.clone(),
+                None => raw::list_candidates(&root, Some(&cancel)),
+            };
+            if cancel.load(Ordering::Relaxed) {
+                return Err("cancelled while scanning the folder".to_string());
+            }
+            // Only the folders the user left checked.
+            if let Some(selected) = &selected_dirs {
+                raw::filter_candidates_by_dirs(&mut candidates, selected);
+            }
+            let scan = raw::build_report(&root, &candidates, &conversions);
+            if scan.pending == 0 {
+                return Err(
+                    "Nothing to convert in the selected folders: they already have their copies."
+                        .to_string(),
+                );
+            }
+            if let Ok(mut jobs) = state_clone.raw_jobs.lock() {
+                if let Some(slot) = jobs.get_mut(&job_id) {
+                    slot.status.total = scan.pending;
+                    slot.status.phase = raw::PHASE_CONVERTING.to_string();
+                }
+            }
+            Ok(candidates)
+        })();
+
+        let report = match prepared {
+            Err(error) => {
+                // A cancel during the walk is not a failure: the user asked for it.
+                let mut report = failed_raw_report(error);
+                if cancel.load(Ordering::Relaxed) {
+                    report.failed = 0;
+                    report.cancelled = true;
+                    report.failures.clear();
+                }
+                report
+            }
+            Ok(candidates) => {
+                // The filtered list is handed over so the job does not walk or filter
+                // again; `total` comes from it directly.
+                let result = raw::run_conversion(
+                    &db_path,
+                    root_id,
+                    &root,
+                    &python,
+                    &script,
+                    &options,
+                    Some(&cancel),
+                    Some(candidates),
+                    |progress, done, total, current| {
+                        if let Ok(mut jobs) = state_clone.raw_jobs.lock() {
+                            if let Some(slot) = jobs.get_mut(&job_id) {
+                                slot.status.done = done;
+                                slot.status.total = total.max(slot.status.total);
+                                slot.status.current = current.to_string();
+                                slot.status.report = progress.clone();
+                            }
+                        }
+                    },
+                );
+                result.unwrap_or_else(|error| failed_raw_report(error.to_string()))
+            }
+        };
+
+        if let Ok(mut jobs) = state_clone.raw_jobs.lock() {
+            if let Some(slot) = jobs.get_mut(&job_id) {
+                slot.status.running = false;
+                slot.status.phase = raw::PHASE_DONE.to_string();
+                slot.status.report = report.clone();
+            }
+        }
+        log::info!(
+            "raw conversion job {job_id} finished: {} converted, {} skipped, {} failed{}",
+            report.converted,
+            report.skipped,
+            report.failed,
+            if report.cancelled { " (cancelled)" } else { "" }
+        );
+    });
+
+    Ok(job_id)
+}
+
+#[tauri::command]
+fn cancel_raw_conversion(job_id: i64, state: State<'_, AppState>) -> Result<bool, String> {
+    require_writable(state.inner())?;
+    let jobs = state.raw_jobs.lock().expect("raw jobs mutex poisoned");
+    if let Some(slot) = jobs.get(&job_id) {
+        slot.cancel.store(true, Ordering::Relaxed);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+#[tauri::command]
+fn raw_conversion_status(
+    job_id: i64,
+    state: State<'_, AppState>,
+) -> Result<raw::RawJobStatus, String> {
+    let jobs = state.raw_jobs.lock().expect("raw jobs mutex poisoned");
+    Ok(jobs
+        .get(&job_id)
+        .map(|slot| slot.status.clone())
+        .unwrap_or_default())
+}
+
+/// Id of the job already converting this root, so a reopened modal can reattach to it
+/// instead of showing a fresh scan while a job is running in the background.
+#[tauri::command]
+fn raw_running_job(root_id: i64, state: State<'_, AppState>) -> Result<Option<i64>, String> {
+    let jobs = state.raw_jobs.lock().expect("raw jobs mutex poisoned");
+    Ok(running_raw_job_for_root(&jobs, root_id))
+}
+
+/// Provenance of the copies of a root, for the badge and the properties dialog.
+#[tauri::command]
+fn list_raw_conversions(
+    root_id: i64,
+    state: State<'_, AppState>,
+) -> Result<Vec<models::RawConversion>, String> {
+    db::list_raw_conversions(&state.paths.db_file, root_id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2221,6 +2631,17 @@ fn compute_setup_status(app_state: &AppState) -> SetupStatus {
         );
     }
 
+    // HEIC/NEF conversion is opt-in and needs its own venv. Showing the hint only when
+    // it is missing keeps the setup screen honest without blocking anything.
+    let raw_support = raw::venv_ready(&app_state.paths.raw_venv_dir);
+    if !raw_support.ready {
+        instructions.push(
+            "HEIC/NEF (optional): conversion support not installed. Right-click a folder and \
+             choose \"Converter NEF/HEIC\" to install it on demand."
+                .to_string(),
+        );
+    }
+
     SetupStatus {
         is_ready: ollama_available && missing_models.is_empty() && download.status != "running",
         ollama_available,
@@ -2237,13 +2658,20 @@ fn compute_setup_status(app_state: &AppState) -> SetupStatus {
         system_python_found,
         venv_provision,
         ffmpeg_available,
+        raw_conversion_ready: raw_support.ready,
+        raw_conversion_message: raw_support.message,
     }
 }
 
 fn resolve_surya_script(app_handle: &tauri::AppHandle) -> std::path::PathBuf {
-    // In production builds, surya_ocr.py is bundled as a Tauri resource.
+    resolve_script(app_handle, "surya_ocr.py")
+}
+
+/// Locate a bundled Python helper: resource dir first, checkout second.
+fn resolve_script(app_handle: &tauri::AppHandle, file_name: &str) -> std::path::PathBuf {
+    // In production builds, the helpers are bundled as Tauri resources.
     if let Ok(resource_dir) = app_handle.path().resource_dir() {
-        let bundled = resource_dir.join("scripts").join("surya_ocr.py");
+        let bundled = resource_dir.join("scripts").join(file_name);
         if bundled.exists() {
             return bundled;
         }
@@ -2251,7 +2679,7 @@ fn resolve_surya_script(app_handle: &tauri::AppHandle) -> std::path::PathBuf {
     // Dev fallback: use CARGO_MANIFEST_DIR (set at compile time)
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("scripts")
-        .join("surya_ocr.py")
+        .join(file_name)
 }
 
 fn resolve_pdfium_lib(app_handle: &tauri::AppHandle) -> std::path::PathBuf {
@@ -2710,6 +3138,8 @@ pub fn run() {
         thumb_repair_cancel: Arc::new(AtomicBool::new(false)),
         description_language_progress: Arc::new(Mutex::new(None)),
         description_language_cancel: Arc::new(AtomicBool::new(false)),
+        raw_jobs: Arc::new(Mutex::new(HashMap::new())),
+        raw_scan_cache: Arc::new(Mutex::new(None)),
         backlog_progress: Arc::new(Mutex::new(None)),
     };
 
@@ -2759,6 +3189,14 @@ pub fn run() {
             list_vision_models,
             estimate_vision_scan,
             cancel_scan,
+            raw_scan_candidates,
+            raw_support_status,
+            provision_raw_support,
+            start_raw_conversion,
+            cancel_raw_conversion,
+            raw_conversion_status,
+            raw_running_job,
+            list_raw_conversions,
             remove_root,
             reset_root_classifications,
             list_roots,
@@ -2871,5 +3309,44 @@ mod tests {
             "error should name the failing step, got: {:?}",
             state.error
         );
+    }
+
+    // ── HEIC/NEF conversion job registry ────────────────────────────
+    //
+    // A double click on "Convert" used to start two workers over the same files: both
+    // computed the pending list before either wrote a `raw_conversions` row, so both
+    // converted the same inputs and two `python` processes wrote the same output path.
+    // The file-level idempotency protects the next *run*, not two runs at the same time.
+
+    fn raw_slot(root_id: i64, running: bool) -> RawJobSlot {
+        RawJobSlot {
+            root_id,
+            cancel: Arc::new(AtomicBool::new(false)),
+            status: raw::RawJobStatus {
+                running,
+                ..raw::RawJobStatus::default()
+            },
+        }
+    }
+
+    #[test]
+    fn a_running_job_blocks_a_second_one_for_the_same_root() {
+        let mut jobs: HashMap<i64, RawJobSlot> = HashMap::new();
+        jobs.insert(1, raw_slot(7, true));
+        assert_eq!(running_raw_job_for_root(&jobs, 7), Some(1));
+    }
+
+    #[test]
+    fn a_finished_job_does_not_block_a_retry() {
+        let mut jobs: HashMap<i64, RawJobSlot> = HashMap::new();
+        jobs.insert(1, raw_slot(7, false));
+        assert_eq!(running_raw_job_for_root(&jobs, 7), None);
+    }
+
+    #[test]
+    fn another_root_is_not_blocked() {
+        let mut jobs: HashMap<i64, RawJobSlot> = HashMap::new();
+        jobs.insert(1, raw_slot(7, true));
+        assert_eq!(running_raw_job_for_root(&jobs, 8), None);
     }
 }

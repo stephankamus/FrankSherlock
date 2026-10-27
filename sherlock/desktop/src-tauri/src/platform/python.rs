@@ -183,11 +183,51 @@ impl VenvProvisionState {
     }
 }
 
-/// Provision a Surya OCR venv: create venv, install surya-ocr, verify import.
+/// Provision the Surya OCR venv: create venv, install surya-ocr, verify import.
 pub async fn run_venv_provision(
     state: Arc<Mutex<VenvProvisionState>>,
     system_python: PathBuf,
     venv_dir: PathBuf,
+) {
+    provision_venv(
+        state,
+        system_python,
+        venv_dir,
+        &["surya-ocr"],
+        "import surya",
+        "Surya OCR",
+    )
+    .await;
+}
+
+/// Provision the HEIC/NEF conversion venv: `pillow-heif` + `rawpy`.
+///
+/// A separate venv on purpose: converting raw photos must not require the OCR stack,
+/// and a broken `pip` in one must not take the other down.
+pub async fn run_raw_venv_provision(
+    state: Arc<Mutex<VenvProvisionState>>,
+    system_python: PathBuf,
+    venv_dir: PathBuf,
+) {
+    provision_venv(
+        state,
+        system_python,
+        venv_dir,
+        &["pillow-heif", "rawpy"],
+        "import pillow_heif, rawpy",
+        "HEIC/NEF conversion",
+    )
+    .await;
+}
+
+/// Create a venv, install `packages` and verify `verify_imports` inside it.
+async fn provision_venv(
+    state: Arc<Mutex<VenvProvisionState>>,
+    system_python: PathBuf,
+    venv_dir: PathBuf,
+    packages: &'static [&'static str],
+    verify_imports: &'static str,
+    label: &'static str,
 ) {
     // Step 1: Create venv
     {
@@ -220,17 +260,22 @@ pub async fn run_venv_provision(
         }
     }
 
-    // Step 2: Install surya-ocr
+    // Step 2: Install the packages
     {
         let mut s = state.lock().expect("venv provision mutex poisoned");
-        s.step = "installing_surya".to_string();
+        s.step = "installing_packages".to_string();
         s.progress_pct = 10.0;
-        s.message = "Installing surya-ocr (this may take a few minutes)...".to_string();
+        s.message = format!(
+            "Installing {} ({})...",
+            packages.join(", "),
+            label
+        );
     }
 
     let pip = pip_venv_binary(&venv_dir);
     let child = silent_command(&pip)
-        .args(["install", "surya-ocr"])
+        .arg("install")
+        .args(packages)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn();
@@ -296,12 +341,12 @@ pub async fn run_venv_provision(
         let mut s = state.lock().expect("venv provision mutex poisoned");
         s.step = "verifying".to_string();
         s.progress_pct = 95.0;
-        s.message = "Verifying surya-ocr installation...".to_string();
+        s.message = format!("Verifying {label} installation...");
     }
 
     let venv_python = python_venv_binary(&venv_dir);
     let verify = silent_command(&venv_python)
-        .args(["-c", "import surya"])
+        .args(["-c", verify_imports])
         .output();
 
     match verify {
@@ -309,18 +354,18 @@ pub async fn run_venv_provision(
             let mut s = state.lock().expect("venv provision mutex poisoned");
             s.status = "completed".to_string();
             s.progress_pct = 100.0;
-            s.message = "Surya OCR installed successfully.".to_string();
+            s.message = format!("{label} installed successfully.");
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let mut s = state.lock().expect("venv provision mutex poisoned");
             s.status = "failed".to_string();
-            s.message = format!("Surya installed but import failed: {}", stderr.trim());
+            s.message = format!("{label} installed but import failed: {}", stderr.trim());
         }
         Err(e) => {
             let mut s = state.lock().expect("venv provision mutex poisoned");
             s.status = "failed".to_string();
-            s.message = format!("Failed to verify surya import: {e}");
+            s.message = format!("Failed to verify {label} import: {e}");
         }
     }
 }

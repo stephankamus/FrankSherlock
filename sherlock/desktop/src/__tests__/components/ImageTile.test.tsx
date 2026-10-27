@@ -29,6 +29,26 @@ describe("ImageTile", () => {
     expect(container.querySelector(".tile-thumb-placeholder .badge")).toHaveTextContent("photo");
   });
 
+  it("badges a tile that is a JPEG copy of a HEIC/NEF file", () => {
+    const converted = {
+      ...mockItem,
+      sourceFormat: "heic",
+      sourceRelPath: "photos/beach.HEIC",
+    };
+    render(
+      <ImageTile item={converted} index={0} isSelected={false} isFocused={false} onClick={() => {}} onDoubleClick={() => {}} onContextMenu={() => {}} />
+    );
+    const badge = screen.getByText("HEIC");
+    expect(badge).toHaveAttribute("title", "Converted from photos/beach.HEIC");
+  });
+
+  it("shows no origin badge on an ordinary photo", () => {
+    const { container } = render(
+      <ImageTile item={mockItem} index={0} isSelected={false} isFocused={false} onClick={() => {}} onDoubleClick={() => {}} onContextMenu={() => {}} />
+    );
+    expect(container.querySelector(".tile-source-badge")).toBeNull();
+  });
+
   it("applies selected class", () => {
     const { container } = render(
       <ImageTile item={mockItem} index={0} isSelected={true} isFocused={false} onClick={() => {}} onDoubleClick={() => {}} onContextMenu={() => {}} />

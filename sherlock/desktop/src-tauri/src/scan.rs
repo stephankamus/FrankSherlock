@@ -3617,6 +3617,20 @@ mod tests {
     use super::*;
     use crate::db;
 
+    /// The conversion strategy rests on this: raws never enter the index, and the
+    /// copies are ordinary JPEGs the walk already understands.
+    #[test]
+    fn raw_formats_stay_out_of_the_index_while_copies_are_indexable() {
+        assert!(!is_supported_file(Path::new("photo.heic")));
+        assert!(!is_supported_file(Path::new("photo.HEIC")));
+        assert!(!is_supported_file(Path::new("photo.nef")));
+        assert!(!is_supported_file(Path::new("photo.NEF")));
+        assert!(is_supported_file(Path::new("FrankSherlock-JPG/photo__heic.jpg")));
+        assert!(is_supported_file(Path::new(
+            "Trip/FrankSherlock-JPG/photo__nef.jpg"
+        )));
+    }
+
     /// Write a dummy file large enough to pass MIN_IMAGE_SIZE_BYTES.
     fn write_test_image(path: &std::path::Path, seed: u8) {
         let mut f = File::create(path).expect("create test image");

@@ -10,6 +10,82 @@ export type SearchItem = {
   sizeBytes: number;
   thumbnailPath?: string | null;
   faceCount?: number;
+  /** "heic" | "nef" when this row is a JPEG copy made by the conversion job. */
+  sourceFormat?: string | null;
+  /** Original file that produced the copy, relative to the root. */
+  sourceRelPath?: string | null;
+};
+
+/** One directory that has convertible files, as reported before a job starts. */
+export type RawDirCount = {
+  relPath: string;
+  heic: number;
+  nef: number;
+  sourceBytes: number;
+  alreadyConverted: number;
+};
+
+export type RawScanReport = {
+  dirs: RawDirCount[];
+  totalFiles: number;
+  heic: number;
+  nef: number;
+  /** Files with no recorded conversion yet. */
+  pending: number;
+  sourceBytes: number;
+  /** Whether the conversion interpreter exists (`stat`, not a Python spawn). */
+  conversionReady: boolean;
+  conversionMessage: string;
+};
+
+export type ConversionOptions = {
+  /** Longest side of the copy; 0 keeps the original resolution. */
+  maxSide: number;
+  quality: number;
+  /** "auto" | "preview" | "demosaic" */
+  nefMode: string;
+};
+
+export type RawJobReport = {
+  converted: number;
+  skipped: number;
+  failed: number;
+  bytesOut: number;
+  cancelled: boolean;
+  failures: string[];
+};
+
+export type RawJobStatus = {
+  running: boolean;
+  /** "scanning" while the folder walk runs, "converting" after that, "done" at the end. */
+  phase: string;
+  done: number;
+  total: number;
+  current: string;
+  /** Unix milliseconds when the job was accepted. */
+  startedAtMs: number;
+  report: RawJobReport;
+};
+
+export type RawSupport = {
+  ready: boolean;
+  message: string;
+};
+
+/** Provenance of a converted copy. */
+export type RawConversion = {
+  id: number;
+  rootId: number;
+  sourceRelPath: string;
+  sourceExt: string;
+  outputRelPath: string;
+  sourceSizeBytes: number;
+  sourceMtimeNs: number;
+  outputSizeBytes?: number | null;
+  maxSide: number;
+  quality: number;
+  mode: string;
+  createdAt: number;
 };
 
 export type ParsedQuery = {

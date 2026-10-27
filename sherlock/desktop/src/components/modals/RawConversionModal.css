@@ -1,0 +1,228 @@
+.raw-modal {
+  max-width: 640px;
+  max-height: 86vh;
+  overflow-y: auto;
+}
+
+.raw-loading {
+  color: var(--text-secondary);
+}
+
+/* Counts grid: six numbers the decision depends on. */
+.raw-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0 0 12px;
+}
+
+.raw-summary div {
+  background: var(--bg-input);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-sm);
+  padding: 6px 8px;
+}
+
+.raw-summary dt {
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+}
+
+.raw-summary dd {
+  margin: 2px 0 0;
+  font-size: 1.05rem;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.raw-dir-list {
+  margin-bottom: 12px;
+}
+
+/* Header with the "select all" checkbox and the rescan button. */
+.raw-dir-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 2px 4px;
+}
+
+.raw-dir-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.raw-dir-title input,
+.raw-dir-row input {
+  accent-color: var(--accent-primary);
+  margin: 0;
+}
+
+.raw-rescan {
+  background: var(--bg-input);
+  color: var(--text-primary);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-sm);
+  padding: 3px 10px;
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+}
+
+.raw-rescan:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* One line per directory, each with its own checkbox. */
+.raw-dirs {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 132px;
+  overflow-y: auto;
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-sm);
+}
+
+.raw-dir-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.raw-dir-off code {
+  color: var(--text-secondary);
+  text-decoration: line-through;
+}
+
+.raw-dirs li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 4px 8px;
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-primary);
+}
+
+.raw-dirs li:last-child {
+  border-bottom: none;
+}
+
+.raw-dirs code {
+  color: var(--text-primary);
+  word-break: break-all;
+}
+
+.raw-dir-blocked span {
+  color: #d18616;
+}
+
+.raw-options {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.raw-options label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+}
+
+.raw-options select {
+  background: var(--bg-input);
+  color: var(--text-primary);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-sm);
+  padding: 5px 6px;
+  font: inherit;
+}
+
+.raw-support {
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  margin-bottom: 12px;
+}
+
+.raw-support button {
+  background: var(--bg-input);
+  color: var(--text-primary);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-sm);
+  padding: 5px 12px;
+  cursor: pointer;
+}
+
+.raw-warning {
+  color: #d18616;
+  font-size: var(--font-size-sm);
+}
+
+.raw-error {
+  color: #f14c4c;
+  font-size: var(--font-size-sm);
+  word-break: break-word;
+}
+
+.raw-progress progress {
+  width: 100%;
+  height: 8px;
+}
+
+.raw-progress-line {
+  margin: 6px 0 0;
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.raw-progress-elapsed {
+  color: var(--text-secondary);
+}
+
+.raw-progress-current {
+  margin: 2px 0 0;
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+  word-break: break-all;
+}
+
+.raw-result {
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  margin-bottom: 8px;
+}
+
+.raw-failures {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  font-size: var(--font-size-sm);
+  color: #f14c4c;
+  max-height: 120px;
+  overflow-y: auto;
+  word-break: break-word;
+}
+
+.raw-modal .primary-btn {
+  background: var(--border-focus);
+  border-color: var(--border-focus);
+  color: #ffffff;
+}
+
+.raw-modal .primary-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}

@@ -40,6 +40,7 @@ import ScanSummaryModal from "./components/modals/ScanSummaryModal";
 import PreviewModal from "./components/modals/PreviewModal";
 import ConfirmDeleteModal from "./components/modals/ConfirmDeleteModal";
 import ConfirmReclassifyModal from "./components/modals/ConfirmReclassifyModal";
+import RawConversionModal from "./components/modals/RawConversionModal";
 import ConfirmFileDeleteModal from "./components/modals/ConfirmFileDeleteModal";
 import RenameModal from "./components/modals/RenameModal";
 import HelpModal from "./components/modals/HelpModal";
@@ -87,6 +88,8 @@ export default function App() {
   const [showResumeModal, setShowResumeModal] = useState(false);
   const [confirmDeleteRoot, setConfirmDeleteRoot] = useState<RootInfo | null>(null);
   const [confirmReclassifyRoot, setConfirmReclassifyRoot] = useState<RootInfo | null>(null);
+  /** Root whose HEIC/NEF files are being converted into JPEG copies. */
+  const [rawConvertRoot, setRawConvertRoot] = useState<RootInfo | null>(null);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
@@ -901,6 +904,20 @@ export default function App() {
           onConfirm={onReclassifyRoot}
         />
       )}
+      {rawConvertRoot && (
+        <RawConversionModal
+          root={rawConvertRoot}
+          readOnly={readOnly}
+          onCancel={() => setRawConvertRoot(null)}
+          onScanNow={() => {
+            const root = rawConvertRoot;
+            setRawConvertRoot(null);
+            // The copies are ordinary files inside the root: a rescan is all that is
+            // needed to index them, generate thumbnails and send them to the model.
+            scanManager.onRescanRoot(root, setup, readOnly);
+          }}
+        />
+      )}
       {confirmDeleteRoot && (
         <ConfirmDeleteModal
           root={confirmDeleteRoot}
@@ -1020,6 +1037,7 @@ export default function App() {
           }}
           onDeleteRoot={(root) => setConfirmDeleteRoot(root)}
           onReclassifyRoot={(root) => setConfirmReclassifyRoot(root)}
+          onConvertRawRoot={(root) => setRawConvertRoot(root)}
           onOpenSettings={() => setShowSettings(true)}
           onRescanRoot={(root) => scanManager.onRescanRoot(root, setup, readOnly)}
           onRefreshRoot={(root) => scanManager.onRefreshRoot(root, readOnly)}

@@ -208,6 +208,22 @@
   line-height: 1;
 }
 
+/* Origin badge: this tile is a JPEG copy of a HEIC/NEF file */
+.tile-source-badge {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  background: rgba(160, 110, 20, 0.85);
+  color: #fff;
+  font-size: 0.6rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 2px 4px;
+  border-radius: 3px;
+  pointer-events: none;
+  line-height: 1;
+}
+
 /* Face count badge overlay */
 .tile-face-badge {
   position: absolute;
