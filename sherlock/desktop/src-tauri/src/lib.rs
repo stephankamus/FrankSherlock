@@ -2172,18 +2172,6 @@ fn spawn_scan_worker_if_needed(
         }
     };
 
-    // A `full` scan chains into the backlog pass. The root path has to be captured now
-    // (the scan context does not carry it) and the setting is read once, before the
-    // user can change anything mid-run.
-    let chain_root = db::get_scan_job(&app_state.paths.db_file, job_id)
-        .ok()
-        .flatten()
-        .map(|job| job.root_path);
-    let chain_backlog_enabled = config::load_runtime_settings()
-        .map(|settings| settings.chain_backlog)
-        .unwrap_or(true);
-    let chain_handle = app_handle.clone();
-
     tauri::async_runtime::spawn(async move {
         let flag = cancel_flag;
         let cancel_watch = flag.clone();
@@ -2240,30 +2228,6 @@ fn spawn_scan_worker_if_needed(
             let backup_path = app_state_for_task.paths.db_dir.join("index.sqlite.bak");
             if let Err(e) = db::backup_database(&app_state_for_task.paths.db_file, &backup_path) {
                 log::warn!("Post-scan backup failed: {e}");
-            }
-        }
-
-        // One action, both halves: `full` is the only mode that discovers and cleans the
-        // index, and the backlog pass is what classifies with the producer/consumer
-        // overlap — it is also the only moment a fresh folder gives the producer real
-        // CPU work to hide from the GPU. Chained only after a scan that finished on its
-        // own: a cancel means "stop", not "continue differently".
-        if mode == scan::ScanMode::Full
-            && result.is_ok()
-            && !cancel_watch.load(Ordering::Relaxed)
-            && chain_backlog_enabled
-        {
-            if let Some(root) = chain_root.as_deref() {
-                log::info!("Full scan finished; chaining the backlog pass for {root}");
-                if let Err(err) = start_scan_job(
-                    &app_state_for_task,
-                    &chain_handle,
-                    root,
-                    scan::ScanMode::Backlog,
-                    None,
-                ) {
-                    log::warn!("Could not chain the backlog pass for {root}: {err}");
-                }
             }
         }
 

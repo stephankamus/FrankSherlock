@@ -4,8 +4,9 @@
 > ponta que confirma (ou derruba) o teto de 26 % medido na Fase 0.
 >
 > Entregue: bench de custo (§5), filtro `image_filter` (−33 % no `prepare`, §5.3),
-> decode compartilhado (−46 % nos dois estágios de CPU, §5.4) e o modo `backlog`
-> com produtor/consumidor (§4.3) e botão na sidebar.
+> decode compartilhado (−46 % nos dois estágios de CPU, §5.4), o modo `backlog`
+> com produtor/consumidor (§4.3) e botão na sidebar, e o corte de §5.12 (`full` =
+> descoberta + pipeline, com a fase 2 restrita ao `refresh`).
 >
 > Complementa [`vision-classification-speed.md`](./vision-classification-speed.md)
 > (que otimizou o *request*, não a duplicação descrita aqui) e
@@ -763,15 +764,24 @@ sinal de documento (valor + data, ou moeda). O custo de recall é explícito: um
 *fotografado* também é cena e para ali — a saída é um retry com overrides numa pasta que se
 sabe ser de comprovantes.
 
-### 5.12 Em andamento: `full` = descoberta + pipeline
+### 5.12 `full` = descoberta + pipeline (implementado)
 
-Estado: a **descoberta já escreve as linhas** (`insert_pending_rows`, uma transação,
+A descoberta escreve as linhas (`insert_pending_rows`, uma transação,
 `ON CONFLICT DO NOTHING`, sem I/O além do walk). É o que impede o índice pela metade — um
 scan cancelado agora deixa um índice completo com trabalho pendente, não um "925 de 50 000"
-que parece concluído. A fase 3 também já não roda quando o backlog vai ser encadeado.
+que parece concluído.
 
-Falta o corte: o produtor do pipeline completar a linha e a fase 2 ficar só no `refresh`.
-O alvo, e o que **não** pode regredir:
+O corte entrou: **a fase 2 só roda no `refresh`** e o `full` caminha da descoberta direto
+para o pipeline, no mesmo job. Antes de o pipeline começar, o scan carimba toda linha viva
+(nova, modificada, inalterada, revivida) e zera o ponteiro morto das que perderam a
+thumbnail; o `moved` é decidido pelo produtor, comparando o fingerprint da linha nova com
+as linhas **vivas de outro marcador** (as que sumiram do disco), e o `merge_moved_row`
+troca o caminho da linha antiga na mesma transação em que apaga o placeholder. O cleanup
+(`mark_missing_as_deleted`) roda por último, e só quando o job não foi cancelado nem
+abortado pelo breaker. `chain_backlog = false` mantém o formato antigo (fase 2 + laço de
+classificação), como escape hatch.
+
+O mapa do que era da fase 2 e para onde foi, e o que **não** pode regredir:
 
 | o que a fase 2 faz | para onde vai |
 |---|---|
@@ -782,15 +792,18 @@ O alvo, e o que **não** pode regredir:
 | metadados de vídeo (ffprobe) | produtor, no ramo legado de vídeo |
 | `moved` (fingerprint igual, caminho novo) | **o item mais delicado**: hoje é a fase 2 que casa o caminho novo com a linha antiga e move id + descrição. Sem isso, um arquivo renomeado vira linha nova pendente e a antiga é soft-deletada |
 
-Dois testes são obrigatórios antes de o corte entrar: cancelar no meio do pipeline não pode
-soft-deletar nada (as linhas não visitadas ficam pendentes com `thumb_path` NULL), e um
-`full` numa pasta mista (novos + existentes + renomeados) tem de continuar acertando
-`unchanged`/`moved`. É o mesmo terreno do bug de §5.7.6, onde a limpeza apagou uma pasta
-inteira.
+Os dois testes que o corte exigia existem em `scan.rs`:
+`cancelled_full_scan_leaves_every_row_pending_and_alive` (cancelar pelo primeiro tick do
+pipeline não soft-deleta nada e deixa as linhas não visitadas pendentes, sem thumbnail) e
+`full_scan_keeps_unchanged_and_adopts_a_rename` (pasta mista: o inalterado fica com a
+thumbnail e a descrição, o renomeado mantém id + descrição no caminho novo e a thumbnail é
+reconstruída, o novo fica pendente, e o cleanup não apaga nenhum dos três). É o mesmo
+terreno do bug de §5.7.6, onde a limpeza apagou uma pasta inteira.
 
-Ganho esperado quando fechar: os 58 743 arquivos deixam de pagar um passe mono-thread de
-thumbnails (~4 h a 250 ms/arquivo) e passam a fazer thumb + classificação na mesma passada
-do pipeline.
+Ganho esperado: os 58 743 arquivos deixam de pagar um passe mono-thread de thumbnails
+(~4 h a 250 ms/arquivo) e passam a fazer thumb + classificação na mesma passada do
+pipeline. **A medição na pasta de 191 arquivos ainda não foi feita** — é o próximo passo
+antes de rodar nos 58 mil, com `scripts/measure-run.py 900` logo depois do job.
 
 ## 6. Riscos
 

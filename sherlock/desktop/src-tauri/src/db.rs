@@ -1220,6 +1220,22 @@ pub struct BacklogRow {
     /// not an error, it just means the row has to be probed once.
     pub image_width: Option<u32>,
     pub image_height: Option<u32>,
+    /// Content fingerprint recorded in the index. Empty when the row was written by
+    /// discovery and no pass has read the file yet: the pipeline producer fills it
+    /// ([`set_file_identity`]) and that is what makes `moved` detection possible
+    /// without a second fingerprint pass over the whole folder.
+    pub fingerprint: String,
+    /// Marker of the scan that last visited this row.
+    ///
+    /// The producer writes it back for every row it touches. Without it the
+    /// end-of-scan cleanup ([`mark_missing_as_deleted`]) treats the rows the
+    /// pipeline just processed as missing and soft-deletes them — the bug that
+    /// wiped a whole folder once (`plans/pipeline-cpu-gpu-overlap.md` §5.7.6).
+    pub scan_marker: i64,
+    /// Modification time recorded in the index. Needed by the rename adoption, which
+    /// rewrites the row at the new path: leaving the old timestamp behind would make
+    /// the next discovery compare it against the file and call it modified.
+    pub mtime_ns: i64,
 }
 
 /// Rows of `root_id` that still need a classification or have no thumbnail at all.
@@ -1232,12 +1248,34 @@ pub struct BacklogRow {
 /// sending them again on every pass is what kept a backlog from ever converging.
 /// [`list_failed_rows`] is the way back in, through an explicit retry.
 pub fn list_backlog_rows(db_path: &Path, root_id: i64) -> AppResult<Vec<BacklogRow>> {
-    query_backlog_rows(db_path, root_id, "AND classify_state <> 'failed'")
+    query_backlog_rows(db_path, root_id, None, "AND classify_state <> 'failed'")
 }
 
 /// Rows that gave up: every attempt failed. Used by `Retry failed`.
 pub fn list_failed_rows(db_path: &Path, root_id: i64) -> AppResult<Vec<BacklogRow>> {
-    query_backlog_rows(db_path, root_id, "AND classify_state = 'failed'")
+    query_backlog_rows(db_path, root_id, None, "AND classify_state = 'failed'")
+}
+
+/// The rows a `full` scan visited and that still need work.
+///
+/// Discovery writes and stamps every row it sees *before* the pipeline starts, so
+/// `scan_marker` alone answers "this row's file is still on disk". The pipeline then
+/// fills what discovery deliberately left out (fingerprint, thumbnail, classification)
+/// in the same pass, which is what removes the mono-thread thumbnail phase
+/// (`plans/pipeline-cpu-gpu-overlap.md` §5.12).
+///
+/// Rows marked failed stay out for the same reason as in [`list_backlog_rows`].
+pub fn list_backlog_rows_for_scan(
+    db_path: &Path,
+    root_id: i64,
+    scan_marker: i64,
+) -> AppResult<Vec<BacklogRow>> {
+    query_backlog_rows(
+        db_path,
+        root_id,
+        Some(scan_marker),
+        "AND classify_state <> 'failed'",
+    )
 }
 
 /// How many rows of `root_id` are marked failed, for the sidebar counter.
@@ -1273,20 +1311,30 @@ pub fn mark_file_failed(db_path: &Path, file_id: i64, kind: &str, detail: &str) 
 }
 
 /// `filter` is one of our own `AND ...` clauses, never user input.
-fn query_backlog_rows(db_path: &Path, root_id: i64, filter: &str) -> AppResult<Vec<BacklogRow>> {
+///
+/// The column list and the mapping below have to change together: the offsets are
+/// positional, and a column added to one side only silently shifts every field of
+/// the row (thumbnail pointer read as dimensions, and so on).
+fn query_backlog_rows(
+    db_path: &Path,
+    root_id: i64,
+    scan_marker: Option<i64>,
+    filter: &str,
+) -> AppResult<Vec<BacklogRow>> {
     let conn = open_conn(db_path)?;
     let sql = format!(
         "SELECT id, rel_path, abs_path, size_bytes, media_type,
                 {PENDING_CLASSIFICATION_SQL} AS pending, thumb_path,
-                image_width, image_height
+                image_width, image_height, fingerprint, scan_marker, mtime_ns
          FROM files
          WHERE deleted_at IS NULL AND root_id = ?1
+           AND (?2 IS NULL OR scan_marker = ?2)
            AND ({PENDING_CLASSIFICATION_SQL} OR thumb_path IS NULL)
            {filter}
          ORDER BY rel_path"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![root_id], |row| {
+    let rows = stmt.query_map(params![root_id, scan_marker], |row| {
         Ok(BacklogRow {
             id: row.get(0)?,
             rel_path: row.get(1)?,
@@ -1297,6 +1345,9 @@ fn query_backlog_rows(db_path: &Path, root_id: i64, filter: &str) -> AppResult<V
             thumb_path: row.get(6)?,
             image_width: row.get::<_, Option<i64>>(7)?.map(|v| v as u32),
             image_height: row.get::<_, Option<i64>>(8)?.map(|v| v as u32),
+            fingerprint: row.get(9)?,
+            scan_marker: row.get(10)?,
+            mtime_ns: row.get(11)?,
         })
     })?;
     let mut out = Vec::new();
@@ -1323,6 +1374,322 @@ pub fn set_image_dimensions(
          WHERE id = ?1 AND image_width IS NULL",
         params![file_id, width as i64, height as i64],
     )?;
+    Ok(())
+}
+
+/// Write the identity of a row that discovery deliberately left blank.
+///
+/// `fingerprint` is the 64 KB content hash and `location_text` the EXIF/GPS string,
+/// both of which need a read of the file — which is exactly the work the pipeline
+/// producer is already doing. The same statement stamps `scan_marker`, because for
+/// these rows the producer is the only visitor they get: a row processed but not
+/// stamped is treated as missing by the end-of-scan cleanup
+/// ([`mark_missing_as_deleted`]) and its thumbnail is purged
+/// (`plans/pipeline-cpu-gpu-overlap.md` §5.7.6).
+pub fn set_file_identity(
+    db_path: &Path,
+    file_id: i64,
+    fingerprint: &str,
+    location_text: &str,
+    scan_marker: i64,
+) -> AppResult<()> {
+    let conn = open_conn(db_path)?;
+    conn.execute(
+        "UPDATE files SET fingerprint = ?2, location_text = ?3, scan_marker = ?4, updated_at = ?5
+         WHERE id = ?1 AND deleted_at IS NULL",
+        params![
+            file_id,
+            fingerprint,
+            location_text,
+            scan_marker,
+            now_epoch_secs()
+        ],
+    )?;
+    Ok(())
+}
+
+/// Record what `ffprobe` reported for a video.
+///
+/// Phase 2 used to write these through `upsert_file_record`; with the thumbnail pass
+/// gone from `full`, the pipeline producer is the one that runs ffprobe. `COALESCE`
+/// keeps a previously recorded value when the probe fails, because a missing value is
+/// not the same information as "the video has no duration".
+pub fn set_video_metadata(
+    db_path: &Path,
+    file_id: i64,
+    duration_secs: Option<f64>,
+    width: Option<u32>,
+    height: Option<u32>,
+    video_codec: Option<&str>,
+    audio_codec: Option<&str>,
+) -> AppResult<()> {
+    let conn = open_conn(db_path)?;
+    conn.execute(
+        "UPDATE files
+            SET duration_secs = COALESCE(?2, duration_secs),
+                video_width = COALESCE(?3, video_width),
+                video_height = COALESCE(?4, video_height),
+                video_codec = COALESCE(?5, video_codec),
+                audio_codec = COALESCE(?6, audio_codec)
+          WHERE id = ?1",
+        params![
+            file_id,
+            duration_secs,
+            width.map(|v| v as i64),
+            height.map(|v| v as i64),
+            video_codec,
+            audio_codec
+        ],
+    )?;
+    Ok(())
+}
+
+/// Refresh the filesystem facts of rows discovery found modified.
+///
+/// A modified file is a different file at the same path: description, OCR text,
+/// mentions, confidence, dedupe hash and thumbnail all describe the previous
+/// content, so they are cleared here instead of being left to the classifier (which
+/// may never run, e.g. with `chain_backlog = false`).
+///
+/// `fingerprint` is cleared rather than rewritten: the producer recomputes it from
+/// the file it is about to read anyway ( [`set_file_identity`] ), and a stale hash
+/// would make the next rename adopt the wrong row.
+pub fn stamp_modified_rows(
+    db_path: &Path,
+    root_id: i64,
+    scan_marker: i64,
+    rows: &[(String, i64, i64)],
+) -> AppResult<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let conn = open_conn(db_path)?;
+    let tx = conn.unchecked_transaction()?;
+    let now = now_epoch_secs();
+    {
+        let mut stmt = tx.prepare(
+            "UPDATE files
+                SET mtime_ns = ?2, size_bytes = ?3, scan_marker = ?4, updated_at = ?5,
+                    description = '', extracted_text = '', canonical_mentions = '',
+                    confidence = 0.0, lang_hint = 'unknown', fingerprint = '',
+                    dhash = NULL, thumb_path = NULL,
+                    classify_state = '', failure_kind = '', failure_detail = '',
+                    failed_at = NULL
+              WHERE root_id = ?6 AND rel_path = ?1 AND deleted_at IS NULL",
+        )?;
+        for (rel_path, mtime_ns, size_bytes) in rows {
+            stmt.execute(params![
+                rel_path,
+                mtime_ns,
+                size_bytes,
+                scan_marker,
+                now,
+                root_id
+            ])?;
+        }
+    }
+    for (rel_path, _, _) in rows {
+        let id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM files WHERE root_id = ?1 AND rel_path = ?2",
+                params![root_id, rel_path],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(id) = id {
+            refresh_fts(&tx, id)?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Bring back a row that an earlier scan soft-deleted at a path that exists again.
+///
+/// The `CASE` keeps the classification when the size is the same (the file came
+/// back, not a namesake) and wipes it when it is not — a different file that
+/// happens to reuse the path must not inherit the old description.
+///
+/// `deleted_at IS NOT NULL` in the `WHERE` makes this a no-op for a live row, so the
+/// caller can pass every new path without checking.
+pub fn revive_deleted_rows(
+    db_path: &Path,
+    root_id: i64,
+    scan_marker: i64,
+    rows: &[(String, String, i64, i64)],
+) -> AppResult<u64> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let conn = open_conn(db_path)?;
+    let tx = conn.unchecked_transaction()?;
+    let now = now_epoch_secs();
+    let mut revived = 0u64;
+    {
+        let mut stmt = tx.prepare(
+            "UPDATE files
+                SET abs_path = ?2, mtime_ns = ?3, size_bytes = ?4, scan_marker = ?5,
+                    deleted_at = NULL, updated_at = ?6,
+                    description = CASE WHEN files.size_bytes = ?4 THEN files.description ELSE '' END,
+                    extracted_text = CASE WHEN files.size_bytes = ?4 THEN files.extracted_text ELSE '' END,
+                    canonical_mentions = CASE WHEN files.size_bytes = ?4 THEN files.canonical_mentions ELSE '' END,
+                    confidence = CASE WHEN files.size_bytes = ?4 THEN files.confidence ELSE 0.0 END,
+                    lang_hint = CASE WHEN files.size_bytes = ?4 THEN files.lang_hint ELSE 'unknown' END,
+                    fingerprint = CASE WHEN files.size_bytes = ?4 THEN files.fingerprint ELSE '' END,
+                    dhash = CASE WHEN files.size_bytes = ?4 THEN files.dhash ELSE NULL END,
+                    thumb_path = CASE WHEN files.size_bytes = ?4 THEN files.thumb_path ELSE NULL END,
+                    classify_state = CASE WHEN files.size_bytes = ?4 THEN files.classify_state ELSE '' END,
+                    failure_kind = CASE WHEN files.size_bytes = ?4 THEN files.failure_kind ELSE '' END,
+                    failure_detail = CASE WHEN files.size_bytes = ?4 THEN files.failure_detail ELSE '' END,
+                    failed_at = CASE WHEN files.size_bytes = ?4 THEN files.failed_at ELSE NULL END
+              WHERE root_id = ?1 AND rel_path = ?7 AND deleted_at IS NOT NULL",
+        )?;
+        for (rel_path, abs_path, mtime_ns, size_bytes) in rows {
+            let changed = stmt.execute(params![
+                root_id,
+                abs_path,
+                mtime_ns,
+                size_bytes,
+                scan_marker,
+                now,
+                rel_path
+            ])?;
+            if changed > 0 {
+                revived += changed as u64;
+                let id: i64 = tx.query_row(
+                    "SELECT id FROM files WHERE root_id = ?1 AND rel_path = ?2",
+                    params![root_id, rel_path],
+                    |row| row.get(0),
+                )?;
+                refresh_fts(&tx, id)?;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(revived)
+}
+
+/// Forget thumbnail pointers whose file is gone.
+///
+/// `thumb_path` is the pipeline's selection key (`thumb_path IS NULL`), so nulling a
+/// dead pointer is what puts an otherwise untouched row back in front of the
+/// producer. The phase-2 heal did the same thing through a second code path; here it
+/// is a plain database write before the pass starts.
+pub fn null_dead_thumb_pointers(db_path: &Path, file_ids: &[i64]) -> AppResult<()> {
+    if file_ids.is_empty() {
+        return Ok(());
+    }
+    let conn = open_conn(db_path)?;
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut stmt = tx.prepare("UPDATE files SET thumb_path = NULL WHERE id = ?1")?;
+        for id in file_ids {
+            stmt.execute(params![id])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// A row that disappeared from disk in this scan and may be the old path of a rename.
+#[derive(Debug, Clone)]
+pub struct MoveCandidate {
+    pub id: i64,
+    pub rel_path: String,
+    pub fingerprint: String,
+    /// True when the old row already has a description: the adopted row needs no
+    /// vision request, only its thumbnail rebuilt at the new path.
+    pub has_description: bool,
+    /// Pointer recorded for the old path. Its cache file is an orphan after the
+    /// move, exactly as it is today when phase 2 re-thumbnails a moved file.
+    pub thumb_path: Option<String>,
+}
+
+/// Live rows of `root_id` that this scan did **not** visit, i.e. the rename candidates.
+///
+/// "Not visited" is `scan_marker <> scan_marker`: discovery stamps every file that is
+/// still on disk (new, modified and unchanged) before the pipeline starts, so a live
+/// row carrying another marker is a file that is no longer there. `fingerprint = ''`
+/// cannot match anything and is skipped.
+pub fn move_candidates(
+    db_path: &Path,
+    root_id: i64,
+    scan_marker: i64,
+) -> AppResult<Vec<MoveCandidate>> {
+    let conn = open_conn(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, rel_path, fingerprint,
+                CASE WHEN description IS NULL OR description = '' THEN 0 ELSE 1 END,
+                thumb_path
+           FROM files
+          WHERE root_id = ?1 AND deleted_at IS NULL
+            AND scan_marker <> ?2
+            AND fingerprint <> ''",
+    )?;
+    let rows = stmt.query_map(params![root_id, scan_marker], |row| {
+        Ok(MoveCandidate {
+            id: row.get(0)?,
+            rel_path: row.get(1)?,
+            fingerprint: row.get(2)?,
+            has_description: row.get::<_, i64>(3)? != 0,
+            thumb_path: row.get(4)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Adopt a vanished row for a file that reappeared at another path.
+///
+/// Both writes share one transaction on purpose: `files` is
+/// `UNIQUE(root_id, rel_path)`, so removing the placeholder that discovery wrote and
+/// moving the old row onto that path in two steps would either violate the constraint
+/// or leave a window where a crash turns a rename into a deletion.
+///
+/// `thumb_path` goes to NULL because the cache mirrors `rel_path`: at the new path the
+/// thumbnail has to be rebuilt. The classification is kept — the fingerprint says the
+/// bytes are the same — which is the whole point of detecting a move at all.
+#[allow(clippy::too_many_arguments)]
+pub fn merge_moved_row(
+    db_path: &Path,
+    placeholder_id: i64,
+    kept_id: i64,
+    rel_path: &str,
+    abs_path: &str,
+    filename: &str,
+    mtime_ns: i64,
+    size_bytes: i64,
+    scan_marker: i64,
+) -> AppResult<()> {
+    let conn = open_conn(db_path)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM files WHERE id = ?1", params![placeholder_id])?;
+    tx.execute(
+        "DELETE FROM files_fts WHERE rowid = ?1",
+        params![placeholder_id],
+    )?;
+    tx.execute(
+        "UPDATE files
+            SET rel_path = ?2, abs_path = ?3, filename = ?4, mtime_ns = ?5,
+                size_bytes = ?6, scan_marker = ?7, updated_at = ?8,
+                deleted_at = NULL, thumb_path = NULL
+          WHERE id = ?1",
+        params![
+            kept_id,
+            rel_path,
+            abs_path,
+            filename,
+            mtime_ns,
+            size_bytes,
+            scan_marker,
+            now_epoch_secs()
+        ],
+    )?;
+    refresh_fts(&tx, kept_id)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -5069,6 +5436,300 @@ mod tests {
             video_codec: None,
             audio_codec: None,
         }
+    }
+
+    /// The backlog row is a positional projection: the `SELECT` list and the
+    /// `row.get` offsets have to move together, so this pins both ends.
+    #[test]
+    fn backlog_rows_carry_fingerprint_and_scan_marker() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/mapped").expect("root");
+
+        let mut scanned = sample_record(root_id, "scanned.jpg", "fp-scanned");
+        scanned.description = String::new();
+        scanned.scan_marker = 77;
+        let scanned_id = upsert_file_record(&db_path, &scanned).expect("row");
+
+        let mut stale = sample_record(root_id, "stale.jpg", "fp-stale");
+        stale.description = String::new();
+        stale.scan_marker = 11;
+        upsert_file_record(&db_path, &stale).expect("row");
+
+        assert_eq!(list_backlog_rows(&db_path, root_id).expect("all").len(), 2);
+
+        let this_scan = list_backlog_rows_for_scan(&db_path, root_id, 77).expect("rows");
+        assert_eq!(this_scan.len(), 1, "only the rows this scan stamped");
+        let row = &this_scan[0];
+        assert_eq!(row.id, scanned_id);
+        assert_eq!(row.rel_path, "scanned.jpg");
+        assert_eq!(row.size_bytes, 10_000);
+        assert_eq!(row.media_type, "photo");
+        assert!(row.needs_classification);
+        assert!(row.thumb_path.is_none());
+        assert_eq!(row.fingerprint, "fp-scanned");
+        assert_eq!(row.scan_marker, 77);
+        assert_eq!(row.mtime_ns, 1_700_000_000_000_000_000);
+    }
+
+    #[test]
+    fn set_file_identity_writes_fingerprint_location_and_marker() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/identity").expect("root");
+        let mut rec = sample_record(root_id, "a.jpg", "");
+        rec.description = String::new();
+        rec.scan_marker = 5;
+        let id = upsert_file_record(&db_path, &rec).expect("row");
+
+        set_file_identity(&db_path, id, "fp-real", "São Paulo", 9).expect("identity");
+
+        let conn = open_conn(&db_path).expect("conn");
+        let (fingerprint, location, marker): (String, String, i64) = conn
+            .query_row(
+                "SELECT fingerprint, location_text, scan_marker FROM files WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("row");
+        assert_eq!(fingerprint, "fp-real");
+        assert_eq!(location, "São Paulo");
+        assert_eq!(marker, 9);
+    }
+
+    #[test]
+    fn stamp_modified_rows_clears_the_previous_classification() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/modified").expect("root");
+        let mut rec = sample_record(root_id, "a.jpg", "fp-old");
+        rec.dhash = Some(42);
+        rec.scan_marker = 5;
+        let id = upsert_file_record(&db_path, &rec).expect("row");
+        update_file_thumb_path(&db_path, root_id, "a.jpg", "/cache/a.jpg").expect("thumb");
+
+        stamp_modified_rows(&db_path, root_id, 9, &[("a.jpg".to_string(), 555, 20_000)])
+            .expect("stamp");
+
+        let conn = open_conn(&db_path).expect("conn");
+        let row: (String, String, Option<i64>, Option<String>, i64, i64, i64) = conn
+            .query_row(
+                "SELECT description, fingerprint, dhash, thumb_path, scan_marker,
+                        size_bytes, mtime_ns
+                   FROM files WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .expect("row");
+        assert_eq!(row.0, "", "the old description belongs to other bytes");
+        assert_eq!(row.1, "", "the producer recomputes the fingerprint");
+        assert_eq!(row.2, None, "the dedupe hash belongs to other bytes too");
+        assert_eq!(row.3, None, "the thumbnail has to be rebuilt");
+        assert_eq!(row.4, 9, "the row is stamped so cleanup leaves it alone");
+        assert_eq!(row.5, 20_000);
+        assert_eq!(row.6, 555);
+        let hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM files_fts WHERE files_fts MATCH 'desc'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("fts");
+        assert_eq!(hits, 0, "the search index must not keep the old text");
+    }
+
+    #[test]
+    fn revive_keeps_the_classification_when_the_size_matches() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/revive").expect("root");
+        let mut rec = sample_record(root_id, "back.jpg", "fp-back");
+        rec.scan_marker = 5;
+        upsert_file_record(&db_path, &rec).expect("row");
+        mark_missing_as_deleted(&db_path, root_id, 9).expect("soft delete");
+
+        let revived = revive_deleted_rows(
+            &db_path,
+            root_id,
+            9,
+            &[(
+                "back.jpg".to_string(),
+                "/tmp/demo/back.jpg".to_string(),
+                42,
+                10_000,
+            )],
+        )
+        .expect("revive");
+
+        assert_eq!(revived, 1);
+        let conn = open_conn(&db_path).expect("conn");
+        let (description, deleted_at): (String, Option<i64>) = conn
+            .query_row(
+                "SELECT description, deleted_at FROM files WHERE root_id = ?1 AND rel_path = 'back.jpg'",
+                params![root_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(description, "desc of back.jpg");
+        assert_eq!(deleted_at, None);
+    }
+
+    #[test]
+    fn revive_resets_the_classification_when_the_size_changes() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/revive-other").expect("root");
+        let mut rec = sample_record(root_id, "back.jpg", "fp-back");
+        rec.scan_marker = 5;
+        upsert_file_record(&db_path, &rec).expect("row");
+        mark_missing_as_deleted(&db_path, root_id, 9).expect("soft delete");
+
+        revive_deleted_rows(
+            &db_path,
+            root_id,
+            9,
+            &[(
+                "back.jpg".to_string(),
+                "/tmp/demo/back.jpg".to_string(),
+                42,
+                20_000,
+            )],
+        )
+        .expect("revive");
+
+        let conn = open_conn(&db_path).expect("conn");
+        let (description, fingerprint, deleted_at): (String, String, Option<i64>) = conn
+            .query_row(
+                "SELECT description, fingerprint, deleted_at FROM files
+                  WHERE root_id = ?1 AND rel_path = 'back.jpg'",
+                params![root_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("row");
+        assert_eq!(description, "", "another file reusing the path");
+        assert_eq!(fingerprint, "");
+        assert_eq!(
+            deleted_at, None,
+            "the path exists again, so the row is live"
+        );
+    }
+
+    #[test]
+    fn merge_moved_row_keeps_the_id_and_the_description() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/renamed").expect("root");
+
+        let old_id = upsert_file_record(&db_path, &sample_record(root_id, "old.jpg", "fp-x"))
+            .expect("old row");
+        update_file_thumb_path(&db_path, root_id, "old.jpg", "/cache/old.jpg").expect("thumb");
+
+        // What discovery writes for a path it has never seen: a blank placeholder.
+        let mut placeholder = sample_record(root_id, "new.jpg", "");
+        placeholder.description = String::new();
+        placeholder.scan_marker = 9;
+        let placeholder_id = upsert_file_record(&db_path, &placeholder).expect("placeholder");
+
+        merge_moved_row(
+            &db_path,
+            placeholder_id,
+            old_id,
+            "new.jpg",
+            "/tmp/demo/new.jpg",
+            "new.jpg",
+            1_700_000_000_000_000_001,
+            10_000,
+            9,
+        )
+        .expect("merge");
+
+        let rows = load_existing_files(&db_path, root_id).expect("rows");
+        assert_eq!(rows.len(), 1, "one file, one row");
+        assert_eq!(
+            rows[0].id, old_id,
+            "the classification stays attached to the id"
+        );
+        assert_eq!(rows[0].rel_path, "new.jpg");
+        assert_eq!(rows[0].thumb_path, None, "the cache mirrors rel_path");
+
+        let conn = open_conn(&db_path).expect("conn");
+        let description: String = conn
+            .query_row(
+                "SELECT description FROM files WHERE id = ?1",
+                params![old_id],
+                |row| row.get(0),
+            )
+            .expect("desc");
+        assert_eq!(description, "desc of old.jpg");
+        let orphan: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM files_fts WHERE rowid = ?1",
+                params![placeholder_id],
+                |row| row.get(0),
+            )
+            .expect("fts");
+        assert_eq!(orphan, 0, "the deleted placeholder must leave the index");
+    }
+
+    #[test]
+    fn nulling_a_dead_pointer_puts_the_row_back_in_the_backlog() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/heal").expect("root");
+        let id =
+            upsert_file_record(&db_path, &sample_record(root_id, "a.jpg", "fp-a")).expect("row");
+        update_file_thumb_path(&db_path, root_id, "a.jpg", "/cache/a.jpg").expect("thumb");
+        assert!(
+            list_backlog_rows(&db_path, root_id)
+                .expect("backlog")
+                .is_empty(),
+            "a classified row with a thumbnail is not backlog work"
+        );
+
+        null_dead_thumb_pointers(&db_path, &[id]).expect("null");
+
+        let rows = list_backlog_rows(&db_path, root_id).expect("backlog");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].thumb_path.is_none());
+    }
+
+    #[test]
+    fn move_candidates_are_the_rows_this_scan_did_not_visit() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/candidates").expect("root");
+
+        let mut gone = sample_record(root_id, "gone.jpg", "fp-gone");
+        gone.scan_marker = 5;
+        upsert_file_record(&db_path, &gone).expect("gone");
+
+        let mut scanned = sample_record(root_id, "here.jpg", "fp-here");
+        scanned.scan_marker = 9;
+        upsert_file_record(&db_path, &scanned).expect("here");
+
+        let mut blank = sample_record(root_id, "blank.jpg", "");
+        blank.scan_marker = 5;
+        upsert_file_record(&db_path, &blank).expect("blank");
+
+        let candidates = move_candidates(&db_path, root_id, 9).expect("candidates");
+        assert_eq!(
+            candidates.len(),
+            1,
+            "visited rows and blank hashes cannot move"
+        );
+        assert_eq!(candidates[0].rel_path, "gone.jpg");
+        assert_eq!(candidates[0].fingerprint, "fp-gone");
+        assert!(candidates[0].has_description);
     }
 
     #[test]

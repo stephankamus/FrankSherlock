@@ -289,9 +289,6 @@ fn run_scan_job_impl(
     let walk_errors = discovery.walk_errors;
     let probes = discovery.probes;
 
-    // Thumbnail dedupe caches, seeded from rows that still have a thumbnail on disk.
-    let mut thumb_caches = ThumbCaches::seed(db_path, job.root_id)?;
-
     // Rows the DB claims to have a thumbnail for, but the file is gone: the cache was
     // wiped by a purge, an interrupted run, or a root removed and re-added. Unchanged
     // files are never re-thumbnailed otherwise, so the pointer would stay dead forever.
@@ -410,10 +407,22 @@ fn run_scan_job_impl(
     let mut skipped_unreadable: u64 = 0;
     const UNCHANGED_BATCH_SIZE: usize = 200;
 
+    // A `full` that continues into the pipeline never runs the thumbnail phase: the
+    // producer does that work while the GPU is busy, which is the whole point of
+    // `plans/pipeline-cpu-gpu-overlap.md` §5.12. `refresh` keeps the old path.
+    let chain_backlog = crate::config::load_runtime_settings()
+        .map(|settings| settings.chain_backlog)
+        .unwrap_or(true);
+    let pipeline_completes_rows = mode == ScanMode::Full && chain_backlog;
+
     // Determine whether to skip the thumbnailing phase (already done on a previous run).
-    let skip_thumbnailing = job.phase == "classifying";
+    let skip_thumbnailing = job.phase == "classifying" || pipeline_completes_rows;
 
     if !skip_thumbnailing {
+        // Thumbnail dedupe caches, seeded from rows that still have a thumbnail on
+        // disk. Only this phase uses them; seeding costs a `stat` per indexed row.
+        let mut thumb_caches = ThumbCaches::seed(db_path, job.root_id)?;
+
         db::checkpoint_scan_job(
             db_path,
             job_id,
@@ -855,20 +864,108 @@ fn run_scan_job_impl(
         });
     }
 
-    // Phase 3: Classification loop — LLM classify all unclassified files
+    // Phase 2.5: complete the rows and classify them, in one pipeline pass.
     //
-    // Skipped when the backlog pass is going to run right after this scan
-    // (`chain_backlog`): it is the same classification, but in the pipeline that overlaps
-    // the next file's CPU work with this one's GPU work — and it is where the context
-    // blocks live. Running both classified everything twice, because the chained pass
-    // then found nothing left to do.
-    let delegate_classification = mode == ScanMode::Full
-        && crate::config::load_runtime_settings()
-            .map(|settings| settings.chain_backlog)
-            .unwrap_or(true);
+    // Discovery already wrote the rows; here they are stamped (so the end-of-scan
+    // cleanup cannot mistake them for missing files), their identity is filled and the
+    // producer/consumer pair produces both artifacts while the GPU is busy. This is the
+    // cut of §5.12: `full` no longer pays the mono-thread thumbnail phase.
+    if pipeline_completes_rows {
+        let heal_ids: Vec<i64> = heal
+            .iter()
+            .filter_map(|rel_path| existing_by_path.get(rel_path).map(|file| file.id))
+            .collect();
+        let (revived, dead_pointers) = prepare_scan_rows(ctx, &job, &probes, &heal_ids)?;
+        if revived > 0 || dead_pointers > 0 {
+            log::info!(
+                "Scan job {job_id}: {revived} row(s) revived by path, \
+                 {dead_pointers} dead thumbnail pointer(s) cleared"
+            );
+        }
+
+        let rows = db::list_backlog_rows_for_scan(db_path, job.root_id, job.scan_marker)?;
+        // Renames can only be seen here, while the vanished rows are still live: the
+        // cleanup at the end of this job is what turns them into soft deletes.
+        let moves = MoveIndex::build(db_path, job.root_id, job.scan_marker)?;
+        if moves.len() > 0 {
+            log::info!(
+                "Scan job {job_id}: {} row(s) are no longer on disk and may be renames",
+                moves.len()
+            );
+        }
+
+        let outcome = run_pipeline_blocks(
+            ctx,
+            &job,
+            job_id,
+            &rows,
+            "backlog",
+            job.scan_marker,
+            Some(&moves),
+            cancel_flag,
+            on_backlog_tick,
+            (added, modified, moved, unchanged),
+        )?;
+        if outcome.aborted_by_breaker {
+            let message = format!(
+                "scan aborted after {MAX_CONSECUTIVE_FAILURES} consecutive failures: \
+                 Ollama is down or its model runner keeps crashing (usually VRAM exhaustion)"
+            );
+            db::fail_scan_job(db_path, job_id, &message)?;
+            return Err(AppError::Config(message));
+        }
+
+        // A rename moves a row from `added` to `moved` and a revived row was already
+        // indexed: the counters describe what happened to the *rows*, not to the files.
+        added = (new_count as u64).saturating_sub(moved + outcome.moved + revived);
+        modified = mod_count as u64;
+        unchanged = unch_count as u64 + revived;
+        moved += outcome.moved;
+        healed += outcome.thumbnailed;
+        deduped += outcome.deduped;
+        processed_files = total_files;
+        log::info!(
+            "Scan job {job_id}: pipeline complete — {} processed, {} classified ({} deduped), \
+             {} thumbnailed, {} moved, {} failed, {} deferred, {} unreadable",
+            outcome.processed,
+            outcome.classified,
+            outcome.deduped,
+            outcome.thumbnailed,
+            outcome.moved,
+            outcome.failed,
+            outcome.deferred,
+            outcome.unreadable
+        );
+
+        if cancel_flag.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            // Cancel means stop: no cleanup on the way out, so a half-processed folder
+            // is never mistaken for a folder with missing files.
+            db::cancel_scan_job(db_path, job_id)?;
+            return Ok(ScanSummary {
+                root_id: job.root_id,
+                root_path: root_path.display().to_string(),
+                scanned: processed_files,
+                added,
+                modified,
+                moved,
+                unchanged,
+                deleted: 0,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                healed,
+                deduped,
+            });
+        }
+    }
+
+    // Phase 3: Classification loop — LLM classify all unclassified files.
+    //
+    // A `full` with `chain_backlog` already classified through the pipeline above
+    // (both artifacts in one pass, and that is where the context blocks live), so this
+    // sequential loop only serves `refresh`-derived modes and the opt-out.
+    let delegate_classification = pipeline_completes_rows;
     if delegate_classification {
         log::info!(
-            "Scan job {}: classification delegated to the chained backlog pass",
+            "Scan job {}: classification already done by the pipeline pass",
             job_id
         );
     }
@@ -1245,6 +1342,55 @@ struct BacklogCounters {
     /// purpose: this is a local/index problem, not a classification failure, and it
     /// must not feed the circuit breaker (see [`is_permanent_failure`]).
     unreadable: AtomicU64,
+    /// Rows the producer recognised as renames and adopted from their old path.
+    moved: AtomicU64,
+}
+
+/// Rename candidates of this scan, indexed by fingerprint.
+///
+/// Built from the rows the scan did **not** visit (see [`db::move_candidates`]), which
+/// is the only place a rename can hide: discovery stamped every file that is still on
+/// disk before the pipeline started.
+///
+/// The producer is the only thread that reads it, but `thread::scope` requires the
+/// closure to be `Send`, so the set of adopted ids sits behind a `Mutex`.
+struct MoveIndex {
+    by_fingerprint: std::collections::HashMap<String, Vec<db::MoveCandidate>>,
+    used: std::sync::Mutex<HashSet<i64>>,
+}
+
+impl MoveIndex {
+    fn build(db_path: &Path, root_id: i64, scan_marker: i64) -> AppResult<Self> {
+        let mut by_fingerprint: std::collections::HashMap<String, Vec<db::MoveCandidate>> =
+            std::collections::HashMap::new();
+        for candidate in db::move_candidates(db_path, root_id, scan_marker)? {
+            by_fingerprint
+                .entry(candidate.fingerprint.clone())
+                .or_default()
+                .push(candidate);
+        }
+        Ok(Self {
+            by_fingerprint,
+            used: std::sync::Mutex::new(HashSet::new()),
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.by_fingerprint.values().map(Vec::len).sum()
+    }
+
+    /// One candidate per vanished row: adopting the same old row twice would rename it
+    /// a second time and leave the first new path without a row.
+    fn take(&self, fingerprint: &str) -> Option<db::MoveCandidate> {
+        let candidates = self.by_fingerprint.get(fingerprint)?;
+        let mut used = self.used.lock().ok()?;
+        for candidate in candidates {
+            if used.insert(candidate.id) {
+                return Some(candidate.clone());
+            }
+        }
+        None
+    }
 }
 
 /// A group of backlog rows that resolve to the same context window.
@@ -1325,6 +1471,11 @@ fn ctx_blocks(rows: &[db::BacklogRow], ctx: &ScanContext) -> Vec<CtxBlock> {
 /// Runs on its own thread. Because the consumer is a single GPU request at a
 /// time, one producer is enough: it costs ~600 ms per file against the ~2 s the
 /// consumer takes (measured in `_bench_vision/RESULTS.md` §7).
+///
+/// It is also the only visitor most rows get: a `full` scan writes the path and stops
+/// there, so the fingerprint, the EXIF location and the scan marker are filled here
+/// ([`identify_row`]) instead of by a second pass over the folder.
+#[allow(clippy::too_many_arguments)]
 fn produce_backlog_items(
     tx: std::sync::mpsc::SyncSender<BacklogItem>,
     ctx: &ScanContext,
@@ -1333,48 +1484,39 @@ fn produce_backlog_items(
     block: &CtxBlock,
     cancel: Option<&AtomicBool>,
     counters: &BacklogCounters,
+    scan_marker: i64,
+    moves: Option<&MoveIndex>,
 ) {
     let profile = ctx.vision_settings().prompt_profile;
-    for row in &block.rows {
+    // Only video and PDF consult these caches, and seeding them would cost a `stat`
+    // per indexed row; every still image is decoded here anyway.
+    let mut legacy_caches = ThumbCaches::default();
+
+    for original in &block.rows {
         if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             break;
         }
 
-        let legacy = matches!(row.media_type.as_str(), "video" | "pdf");
-        if legacy {
-            let item = BacklogItem {
-                row: row.clone(),
-                prepared: None,
-                dhash: None,
-                legacy: true,
-                failed: false,
-            };
-            if tx.send(item).is_err() {
-                break;
-            }
-            continue;
-        }
-
-        let abs = Path::new(&row.abs_path);
+        let abs_path = Path::new(&original.abs_path);
 
         // Which context window will this row need? The answer has to be known
         // *before* the decode: preparing an image for a window we are not going to
         // send wastes the work, and sending it in the wrong window costs a model
         // reload. Rows with a recorded size are already in the right block; the rest
         // are measured now (header only) and get their block on the next pass.
-        if row.needs_classification {
-            let dims = match (row.image_width, row.image_height) {
+        if original.needs_classification {
+            let dims = match (original.image_width, original.image_height) {
                 (Some(width), Some(height)) => Some((width, height)),
-                _ => match vision_prep::image_dimensions(abs) {
+                _ => match vision_prep::image_dimensions(abs_path) {
                     Ok((width, height)) => {
                         // Cache it so the next pass groups this row without even
                         // opening the file.
                         if let Err(e) =
-                            db::set_image_dimensions(&ctx.db_path, row.id, width, height)
+                            db::set_image_dimensions(&ctx.db_path, original.id, width, height)
                         {
                             log::debug!(
                                 "Backlog: could not record dimensions for {}: {e}",
-                                row.rel_path
+                                original.rel_path
                             );
                         }
                         Some((width, height))
@@ -1382,7 +1524,7 @@ fn produce_backlog_items(
                     Err(e) => {
                         log::debug!(
                             "Backlog: cannot read the size of {} ({e}); sending it anyway",
-                            row.rel_path
+                            original.rel_path
                         );
                         None
                     }
@@ -1400,13 +1542,64 @@ fn produce_backlog_items(
             }
         }
 
+        // Identity: the read this thread was going to do anyway. Discovery only
+        // writes the path, and without the fingerprint an unchanged row cannot be
+        // recognised and a rename cannot be detected.
+        let mut row = original.clone();
+        if row.fingerprint.is_empty() {
+            match identify_row(ctx, &row, scan_marker, moves, counters) {
+                Some(identified) => row = identified,
+                None => {
+                    let item = BacklogItem {
+                        row,
+                        prepared: None,
+                        dhash: None,
+                        legacy: false,
+                        failed: true,
+                    };
+                    if tx.send(item).is_err() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        }
+
+        let abs = Path::new(&row.abs_path);
+
+        // Video and PDF keep the legacy classification path (their frames/pages come
+        // from ffmpeg/pdfium), but the thumbnail and the ffprobe metadata used to be
+        // written by phase 2 — with that phase gone from `full`, they belong here.
+        if matches!(row.media_type.as_str(), "video" | "pdf") {
+            complete_legacy_row(
+                ctx,
+                root_id,
+                thumb_dir,
+                &row,
+                abs,
+                counters,
+                &mut legacy_caches,
+            );
+            let item = BacklogItem {
+                row,
+                prepared: None,
+                dhash: None,
+                legacy: true,
+                failed: false,
+            };
+            if tx.send(item).is_err() {
+                break;
+            }
+            continue;
+        }
+
         let Some(decoded) = thumbnail::decode_source(abs) else {
             // Not counted toward the circuit breaker and not persisted: a file the
             // NAS no longer has (or an unmounted share) says nothing about Ollama,
             // and hiding the row would need a rescan to undo.
             counters.unreadable.fetch_add(1, Ordering::Relaxed);
             let item = BacklogItem {
-                row: row.clone(),
+                row,
                 prepared: None,
                 dhash: None,
                 legacy: false,
@@ -1486,7 +1679,7 @@ fn produce_backlog_items(
         drop(decoded);
 
         let item = BacklogItem {
-            row: row.clone(),
+            row,
             prepared,
             dhash: Some(dhash),
             legacy: false,
@@ -1496,6 +1689,235 @@ fn produce_backlog_items(
             break;
         }
     }
+}
+
+/// Fill in what discovery could not: fingerprint, EXIF location and scan marker.
+///
+/// Returns the row to keep working on — the same one, or the row of a file that
+/// vanished and reappeared at this path under another name. `None` means the file
+/// could not be read, which is **not** a classification failure: it is counted as
+/// `unreadable` and kept out of the circuit breaker
+/// (see [`is_permanent_failure`]).
+///
+/// The rename branch is the delicate one (`plans/pipeline-cpu-gpu-overlap.md` §5.12):
+/// the old row keeps its id and its description, so a rename cannot degrade into "a
+/// new pending row plus a soft-deleted old one".
+fn identify_row(
+    ctx: &ScanContext,
+    row: &db::BacklogRow,
+    scan_marker: i64,
+    moves: Option<&MoveIndex>,
+    counters: &BacklogCounters,
+) -> Option<db::BacklogRow> {
+    let abs = Path::new(&row.abs_path);
+    let fingerprint = match fingerprint_file(abs, row.size_bytes.max(0) as u64) {
+        Ok(fingerprint) => fingerprint,
+        Err(e) => {
+            log::debug!("Backlog: cannot fingerprint {} ({e})", row.rel_path);
+            counters.unreadable.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
+
+    if let Some(moves) = moves {
+        if let Some(candidate) = moves.take(&fingerprint) {
+            match db::merge_moved_row(
+                &ctx.db_path,
+                row.id,
+                candidate.id,
+                &row.rel_path,
+                &row.abs_path,
+                crate::platform::paths::rel_path_filename(&row.rel_path),
+                row.mtime_ns,
+                row.size_bytes,
+                scan_marker,
+            ) {
+                Ok(()) => {
+                    counters.moved.fetch_add(1, Ordering::Relaxed);
+                    if let Some(old_thumb) = candidate.thumb_path.as_deref() {
+                        // The cache mirrors `rel_path`: the old file is an orphan now.
+                        let _ = std::fs::remove_file(old_thumb);
+                    }
+                    let mut adopted = row.clone();
+                    adopted.id = candidate.id;
+                    adopted.fingerprint = fingerprint;
+                    adopted.thumb_path = None;
+                    adopted.needs_classification = !candidate.has_description;
+                    return Some(adopted);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Backlog: could not adopt {} as the moved {}: {e}",
+                        candidate.rel_path,
+                        row.rel_path
+                    );
+                }
+            }
+        }
+    }
+
+    let location_text = if is_pdf_file(abs) || is_video(abs) {
+        String::new()
+    } else {
+        crate::exif::extract_location(abs).location_text
+    };
+    if let Err(e) = db::set_file_identity(
+        &ctx.db_path,
+        row.id,
+        &fingerprint,
+        &location_text,
+        scan_marker,
+    ) {
+        log::warn!(
+            "Backlog: could not record the identity of {}: {e}",
+            row.rel_path
+        );
+        counters.failed.fetch_add(1, Ordering::Relaxed);
+    }
+    let mut identified = row.clone();
+    identified.fingerprint = fingerprint;
+    Some(identified)
+}
+
+/// Thumbnail and `ffprobe` metadata for a video or PDF row.
+///
+/// Phase 2 used to do this. Skipping it here would leave every new video without a
+/// thumbnail and without duration/codec: the file would classify normally and still
+/// look broken in the grid.
+fn complete_legacy_row(
+    ctx: &ScanContext,
+    root_id: i64,
+    thumb_dir: &Path,
+    row: &db::BacklogRow,
+    abs: &Path,
+    counters: &BacklogCounters,
+    caches: &mut ThumbCaches,
+) {
+    let thumb_missing = match row.thumb_path.as_deref() {
+        Some(path) => !Path::new(path).exists(),
+        None => true,
+    };
+    if thumb_missing {
+        counters.thumbs_needed.fetch_add(1, Ordering::Relaxed);
+        let result = thumbnail_for_path(
+            ctx,
+            thumb_dir,
+            &row.rel_path,
+            abs,
+            &row.fingerprint,
+            true,
+            false,
+            caches,
+        );
+        match result.thumb_path {
+            Some(thumb) => match db::update_file_thumb_and_dhash(
+                &ctx.db_path,
+                root_id,
+                &row.rel_path,
+                &thumb,
+                result.dhash.map(|h| h as i64),
+            ) {
+                Ok(_) => {
+                    counters.thumbnailed.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Backlog: could not record the thumbnail of {}: {e}",
+                        row.rel_path
+                    );
+                    counters.failed.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+            None => {
+                log::warn!("Backlog: thumbnail generation failed for {}", row.rel_path);
+                counters.failed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    if is_video(abs) {
+        if let Some(meta) = video::extract_metadata(abs) {
+            if let Err(e) = db::set_video_metadata(
+                &ctx.db_path,
+                row.id,
+                meta.duration_secs,
+                meta.width,
+                meta.height,
+                meta.video_codec.as_deref(),
+                meta.audio_codec.as_deref(),
+            ) {
+                log::warn!(
+                    "Backlog: could not record the video metadata of {}: {e}",
+                    row.rel_path
+                );
+            }
+        }
+    }
+}
+
+/// Write and stamp everything the walk found, before the pipeline runs.
+///
+/// The invariant this function exists for: **every live row of the root carries this
+/// scan's marker before cleanup runs**. Leaving a class of rows out — modified,
+/// revived, healed — is what makes [`db::mark_missing_as_deleted`] delete files that
+/// are perfectly present. It happened once and wiped a whole folder
+/// (`plans/pipeline-cpu-gpu-overlap.md` §5.7.6).
+///
+/// All four steps are batch writes: no file is opened here, which is why this is not
+/// the thumbnail phase coming back under another name.
+///
+/// Returns `(rows revived from a soft delete, dead pointers cleared)`.
+fn prepare_scan_rows(
+    ctx: &ScanContext,
+    job: &ScanJobState,
+    probes: &[FileProbe],
+    dead_pointer_ids: &[i64],
+) -> AppResult<(u64, u64)> {
+    let db_path = &ctx.db_path;
+
+    // Paths that exist again but whose row was soft-deleted by an earlier scan.
+    // `insert_pending_rows` does nothing for them (`ON CONFLICT DO NOTHING`), so
+    // without this step such a file would stay invisible and its row would never be
+    // touched by the cleanup either.
+    let new_paths: Vec<(String, String, i64, i64)> = probes
+        .iter()
+        .filter(|probe| matches!(probe.status, FileStatus::New))
+        .map(|probe| {
+            (
+                probe.rel_path.clone(),
+                probe.abs_path.clone(),
+                probe.mtime_ns,
+                probe.size_bytes,
+            )
+        })
+        .collect();
+    let revived = db::revive_deleted_rows(db_path, job.root_id, job.scan_marker, &new_paths)?;
+
+    // Unchanged rows: one batched UPDATE, no I/O. They are the majority of a rescan.
+    let unchanged: Vec<&str> = probes
+        .iter()
+        .filter(|probe| matches!(probe.status, FileStatus::Unchanged))
+        .map(|probe| probe.rel_path.as_str())
+        .collect();
+    for batch in unchanged.chunks(200) {
+        db::touch_file_scan_markers_batch(db_path, job.root_id, batch, job.scan_marker)?;
+    }
+
+    // Modified rows: different bytes at the same path. The old classification and the
+    // old fingerprint describe content that no longer exists, so they are cleared and
+    // the producer recomputes the hash from the file it reads.
+    let modified: Vec<(String, i64, i64)> = probes
+        .iter()
+        .filter(|probe| matches!(probe.status, FileStatus::Modified))
+        .map(|probe| (probe.rel_path.clone(), probe.mtime_ns, probe.size_bytes))
+        .collect();
+    db::stamp_modified_rows(db_path, job.root_id, job.scan_marker, &modified)?;
+
+    // Dead pointers drop to NULL, which is the pipeline's selection key, so the
+    // producer regenerates them without a special "heal" path.
+    db::null_dead_thumb_pointers(db_path, dead_pointer_ids)?;
+
+    Ok((revived, dead_pointer_ids.len() as u64))
 }
 
 /// Failure kinds worth persisting on the row.
@@ -1573,57 +1995,73 @@ fn classify_prepared_and_update(
     }
 }
 
-/// One pass over everything that still needs work.
+/// Outcome of one producer/consumer pass.
+#[derive(Debug, Default)]
+struct PipelineOutcome {
+    processed: u64,
+    classified: u64,
+    deduped: u64,
+    failed: u64,
+    deferred: u64,
+    unreadable: u64,
+    thumbnailed: u64,
+    moved: u64,
+    aborted_by_breaker: bool,
+}
+
+/// The producer/consumer core, shared by `backlog`/`retry_failed` and by `full`.
 ///
-/// The producer decodes each still image once and hands the consumer a
-/// model-ready JPEG; the consumer (this thread, the only one talking to Ollama)
-/// does the near-duplicate lookup and the vision request. The queue is bounded,
-/// so a slow GPU throttles the producer instead of filling the disk with
-/// prepared JPEGs or the RAM with decoded bitmaps.
+/// A `full` scan runs exactly this machinery over the rows it just discovered and
+/// stamped, which is what removes the mono-thread thumbnail phase from the scan
+/// (`plans/pipeline-cpu-gpu-overlap.md` §5.12). Everything that differs between the
+/// modes is an argument: which rows, which marker, and whether renames can exist
+/// (`moves` is `Some` only for a pass whose scan also walked the folder).
 ///
-/// Resume is implicit: the backlog is re-derived from the index on every run, so
-/// an interrupted or cancelled pass simply picks up what is still pending. That
-/// is why no cursor is written.
-fn run_backlog_pipeline(
+/// The producer decodes each still image once and hands the consumer a model-ready
+/// JPEG; the consumer (this thread, the only one talking to Ollama) does the
+/// near-duplicate lookup and the vision request. The queue is bounded, so a slow GPU
+/// throttles the producer instead of filling the disk with prepared JPEGs or the RAM
+/// with decoded bitmaps.
+///
+/// Resume is implicit: the selection is re-derived from the index on every run, so an
+/// interrupted or cancelled pass simply picks up what is still pending. That is why no
+/// cursor is written.
+#[allow(clippy::too_many_arguments)]
+fn run_pipeline_blocks(
     ctx: &ScanContext,
     job: &ScanJobState,
     job_id: i64,
+    rows: &[db::BacklogRow],
+    phase: &str,
+    scan_marker: i64,
+    moves: Option<&MoveIndex>,
     cancel_flag: Option<&AtomicBool>,
-    started: Instant,
     on_tick: &(dyn Fn(BacklogTick) + Sync),
-    only_failed: bool,
-) -> AppResult<ScanSummary> {
+    tally: (u64, u64, u64, u64),
+) -> AppResult<PipelineOutcome> {
     let db_path = &ctx.db_path;
-    let root_path = canonical_root_path(&job.root_path)?;
-    let thumb_dir = ctx.thumb_dir_for(&thumbnail::root_key(&job.root_path));
-    // `only_failed` is the "Retry failed" pass: the default selection skips rows
-    // that already burned every attempt, so this is the only way back in for them.
-    let rows = if only_failed {
-        db::list_failed_rows(db_path, job.root_id)?
-    } else {
-        db::list_backlog_rows(db_path, job.root_id)?
-    };
     let total = rows.len() as u64;
-    // The phase is what the sidebar uses to resume in the right mode, so a retry
-    // must not be recorded as a backlog pass.
-    let phase = if only_failed {
-        "retry_failed"
-    } else {
-        "backlog"
-    };
+    let (tally_added, tally_modified, tally_moved, tally_unchanged) = tally;
 
-    log::info!(
-        "Scan job {job_id}: {} pass for {} ({total} file(s))",
-        if only_failed {
-            "retry-failed"
-        } else {
-            "backlog"
-        },
-        root_path.display()
-    );
     // Two stage-specific denominators: most rows need only one of the two, and
     // dividing by `total` made the thumbnail share look stuck near zero after a
     // `Repair Thumbnails` run had already filled the cache.
+    // Rows last visited by another scan are normal in a `backlog` pass, which runs no
+    // discovery, and impossible in the `full` path, which selects by marker. Seeing one
+    // there would mean the cleanup can delete a row the pipeline just processed
+    // (§5.7.6), so it is worth a warning instead of a silent count.
+    if moves.is_some() {
+        let foreign = rows
+            .iter()
+            .filter(|row| row.scan_marker != scan_marker)
+            .count();
+        if foreign > 0 {
+            log::warn!(
+                "Scan job {job_id}: {foreign} row(s) of this pass carry a different scan marker"
+            );
+        }
+    }
+
     let classify_total = rows.iter().filter(|row| row.needs_classification).count() as u64;
     let thumbless = rows.iter().filter(|row| row.thumb_path.is_none()).count() as u64;
     on_tick(BacklogTick {
@@ -1640,10 +2078,10 @@ fn run_backlog_pipeline(
         total,
         0,
         None,
-        job.added,
-        job.modified,
-        job.moved,
-        job.unchanged,
+        tally_added,
+        tally_modified,
+        tally_moved,
+        tally_unchanged,
     )?;
 
     let cancelled = || cancel_flag.is_some_and(|flag| flag.load(Ordering::Relaxed));
@@ -1660,7 +2098,7 @@ fn run_backlog_pipeline(
 
     // A change of `num_ctx` reloads the model, so the pass runs one block per
     // window instead of one window per file (see [`ctx_blocks`]).
-    let blocks = ctx_blocks(&rows, ctx);
+    let blocks = ctx_blocks(rows, ctx);
     if blocks.len() > 1 {
         log::info!(
             "Scan job {job_id}: {} context block(s) — {}",
@@ -1676,6 +2114,7 @@ fn run_backlog_pipeline(
     // Four is enough to keep the consumer busy while bounding the prepared JPEGs
     // on disk to a handful.
     const QUEUE_DEPTH: usize = 4;
+    let thumb_dir = ctx.thumb_dir_for(&thumbnail::root_key(&job.root_path));
     let thumb_dir_ref: &Path = &thumb_dir;
     let counters_ref = &counters;
     let root_id = job.root_id;
@@ -1710,6 +2149,8 @@ fn run_backlog_pipeline(
                     block_ref,
                     cancel_flag,
                     counters_ref,
+                    scan_marker,
+                    moves,
                 );
             });
 
@@ -1809,10 +2250,10 @@ fn run_backlog_pipeline(
                         total,
                         processed,
                         None,
-                        job.added,
-                        job.modified,
-                        job.moved,
-                        job.unchanged,
+                        tally_added,
+                        tally_modified,
+                        tally_moved,
+                        tally_unchanged,
                     )?;
                 }
             }
@@ -1827,7 +2268,73 @@ fn run_backlog_pipeline(
         })?;
     }
 
-    if aborted_by_breaker {
+    Ok(PipelineOutcome {
+        processed,
+        classified,
+        deduped,
+        failed: counters.failed.load(Ordering::Relaxed),
+        deferred: counters.deferred.load(Ordering::Relaxed),
+        unreadable: counters.unreadable.load(Ordering::Relaxed),
+        thumbnailed: counters.thumbnailed.load(Ordering::Relaxed),
+        moved: counters.moved.load(Ordering::Relaxed),
+        aborted_by_breaker,
+    })
+}
+
+/// One pass over everything that still needs work (`backlog` and `retry_failed`).
+fn run_backlog_pipeline(
+    ctx: &ScanContext,
+    job: &ScanJobState,
+    job_id: i64,
+    cancel_flag: Option<&AtomicBool>,
+    started: Instant,
+    on_tick: &(dyn Fn(BacklogTick) + Sync),
+    only_failed: bool,
+) -> AppResult<ScanSummary> {
+    let db_path = &ctx.db_path;
+    let root_path = canonical_root_path(&job.root_path)?;
+    // `only_failed` is the "Retry failed" pass: the default selection skips rows
+    // that already burned every attempt, so this is the only way back in for them.
+    let rows = if only_failed {
+        db::list_failed_rows(db_path, job.root_id)?
+    } else {
+        db::list_backlog_rows(db_path, job.root_id)?
+    };
+    // The phase is what the sidebar uses to resume in the right mode, so a retry
+    // must not be recorded as a backlog pass.
+    let phase = if only_failed {
+        "retry_failed"
+    } else {
+        "backlog"
+    };
+
+    log::info!(
+        "Scan job {job_id}: {} pass for {} ({} file(s))",
+        if only_failed {
+            "retry-failed"
+        } else {
+            "backlog"
+        },
+        root_path.display(),
+        rows.len()
+    );
+
+    // No discovery ran here, so there are no vanished rows to compare against: a
+    // rename is a `full`/`refresh` concern.
+    let outcome = run_pipeline_blocks(
+        ctx,
+        job,
+        job_id,
+        &rows,
+        phase,
+        job.scan_marker,
+        None,
+        cancel_flag,
+        on_tick,
+        (job.added, job.modified, job.moved, job.unchanged),
+    )?;
+
+    if outcome.aborted_by_breaker {
         let message = format!(
             "backlog aborted after {MAX_CONSECUTIVE_FAILURES} consecutive failures: \
              Ollama is down or its model runner keeps crashing (usually VRAM exhaustion)"
@@ -1836,40 +2343,43 @@ fn run_backlog_pipeline(
         return Err(AppError::Config(message));
     }
 
-    let failed = counters.failed.load(Ordering::Relaxed);
-    let deferred = counters.deferred.load(Ordering::Relaxed);
-    let unreadable = counters.unreadable.load(Ordering::Relaxed);
     let summary = ScanSummary {
         root_id: job.root_id,
         root_path: root_path.display().to_string(),
-        scanned: processed,
+        scanned: outcome.processed,
         added: job.added,
         modified: job.modified,
-        moved: job.moved,
+        moved: job.moved + outcome.moved,
         unchanged: job.unchanged,
         deleted: 0,
         elapsed_ms: started.elapsed().as_millis() as u64,
-        healed: counters.thumbnailed.load(Ordering::Relaxed),
-        deduped,
+        healed: outcome.thumbnailed,
+        deduped: outcome.deduped,
     };
 
     db::touch_root_scan(db_path, job.root_id)?;
-    if cancelled() {
+    if cancel_flag.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
         db::cancel_scan_job(db_path, job_id)?;
     } else {
         db::complete_scan_job_by_id(db_path, job_id, &summary, None)?;
     }
     log::info!(
-        "Backlog{}: {processed} processed, {classified} classified ({deduped} deduped), \
-         {} thumbnailed, {failed} failed, {deferred} deferred to the next pass, \
-         {unreadable} unreadable",
+        "Backlog{}: {} processed, {} classified ({} deduped), {} thumbnailed, \
+         {} failed, {} deferred to the next pass, {} unreadable",
         if only_failed { " (retry failed)" } else { "" },
-        summary.healed
+        outcome.processed,
+        outcome.classified,
+        outcome.deduped,
+        outcome.thumbnailed,
+        outcome.failed,
+        outcome.deferred,
+        outcome.unreadable
     );
-    if unreadable > 0 {
+    if outcome.unreadable > 0 {
         log::warn!(
-            "Backlog: {unreadable} file(s) could not be opened; if they no longer exist \
-             on disk, run Refresh so the index drops them"
+            "Backlog: {} file(s) could not be opened; if they no longer exist \
+             on disk, run Refresh so the index drops them",
+            outcome.unreadable
         );
     }
     Ok(summary)
@@ -2005,14 +2515,41 @@ fn thumbnail_only(
     want_exif: bool,
     caches: &mut ThumbCaches,
 ) -> ThumbnailOnlyResult {
-    let abs = Path::new(&probe.abs_path);
+    thumbnail_for_path(
+        ctx,
+        thumb_dir,
+        &probe.rel_path,
+        Path::new(&probe.abs_path),
+        fingerprint,
+        force,
+        want_exif,
+        caches,
+    )
+}
+
+/// The same work as [`thumbnail_only`], for a row that came from the index.
+///
+/// The pipeline producer has no `FileProbe` (it reads rows, not a discovery walk), but
+/// video and PDF still go through ffmpeg/pdfium here — with the thumbnail phase gone
+/// from `full`, this is the only place their thumbnail is ever produced.
+#[allow(clippy::too_many_arguments)]
+fn thumbnail_for_path(
+    ctx: &ScanContext,
+    thumb_dir: &Path,
+    rel_path: &str,
+    abs: &Path,
+    fingerprint: &str,
+    force: bool,
+    want_exif: bool,
+    caches: &mut ThumbCaches,
+) -> ThumbnailOnlyResult {
     let is_pdf = is_pdf_file(abs);
     let is_vid = is_video(abs);
 
     // 1. Byte-identical file already thumbnailed: hard link it, the source is never
     //    opened. This is the common case in libraries with duplicated albums.
     if let Some((shared, dhash)) = caches.by_fingerprint.get(fingerprint).cloned() {
-        if let Some(tr) = thumbnail::reuse_thumbnail(&shared, dhash, thumb_dir, &probe.rel_path) {
+        if let Some(tr) = thumbnail::reuse_thumbnail(&shared, dhash, thumb_dir, rel_path) {
             // The copy carries its own EXIF, so the upsert must not overwrite
             // `location_text` with an empty string.
             let location_text = if want_exif && !is_pdf && !is_vid {
@@ -2038,18 +2575,18 @@ fn thumbnail_only(
         };
 
     let thumb_result = if is_vid {
-        thumbnail::generate_video_thumbnail(abs, thumb_dir, &probe.rel_path, &ctx.tmp_dir, force)
+        thumbnail::generate_video_thumbnail(abs, thumb_dir, rel_path, &ctx.tmp_dir, force)
     } else if is_pdf {
         thumbnail::generate_pdf_thumbnail(
             abs,
             thumb_dir,
-            &probe.rel_path,
+            rel_path,
             &ctx.pdfium_lib_path,
             pdf_password.as_deref(),
             force,
         )
     } else {
-        thumbnail::generate_thumbnail(abs, thumb_dir, &probe.rel_path, force)
+        thumbnail::generate_thumbnail(abs, thumb_dir, rel_path, force)
     };
 
     let Some(tr) = thumb_result else {
@@ -2067,7 +2604,7 @@ fn thumbnail_only(
     let thumb_path = match dhash {
         Some(hash) => {
             let linked = caches.by_dhash.get(&hash).cloned().and_then(|shared| {
-                thumbnail::reuse_thumbnail(&shared, Some(hash), thumb_dir, &probe.rel_path)
+                thumbnail::reuse_thumbnail(&shared, Some(hash), thumb_dir, rel_path)
             });
             match linked {
                 Some(linked) => Some(linked.path),
@@ -2857,6 +3394,8 @@ mod tests {
             &block_of(rows, crate::llm::MIN_NUM_CTX),
             None,
             &counters,
+            0,
+            None,
         );
 
         let item = rx.try_recv().expect("one item for one row");
@@ -2907,6 +3446,8 @@ mod tests {
             &block_of(rows, crate::llm::MIN_NUM_CTX),
             Some(&cancel),
             &counters,
+            0,
+            None,
         );
 
         assert!(
@@ -2996,6 +3537,8 @@ mod tests {
             &block_of(vec![row], 4096),
             None,
             &counters,
+            0,
+            None,
         );
 
         assert!(
@@ -3038,6 +3581,8 @@ mod tests {
             &block_of(rows, crate::llm::MIN_NUM_CTX),
             None,
             &counters,
+            0,
+            None,
         );
         assert!(
             rx.try_recv().is_ok(),
@@ -3724,6 +4269,297 @@ mod tests {
         assert_eq!(
             status.status, "completed",
             "empty runs must not stay running"
+        );
+    }
+
+    /// A decodable image above [`MIN_IMAGE_SIZE_BYTES`], which discovery requires
+    /// before it even looks at a file.
+    ///
+    /// `seed` has to differ per file: two byte-identical images share a fingerprint,
+    /// and the rename adoption would match the wrong one.
+    fn write_large_image(path: &Path, seed: u32) {
+        let img = image::RgbImage::from_fn(1024, 768, |x, y| {
+            let noise = x.wrapping_mul(31_337) ^ y.wrapping_mul(97) ^ seed;
+            image::Rgb([
+                (noise % 251) as u8,
+                (noise / 7 % 241) as u8,
+                (noise / 13 % 239) as u8,
+            ])
+        });
+        image::DynamicImage::ImageRgb8(img)
+            .save(path)
+            .expect("save image");
+    }
+
+    /// `(mtime_ns, size_bytes)` as discovery records them.
+    fn file_facts(path: &Path) -> (i64, i64) {
+        let metadata = std::fs::metadata(path).expect("metadata");
+        let mtime_ns = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or_default();
+        (mtime_ns, metadata.len() as i64)
+    }
+
+    /// Cancelling a `full` while the pipeline runs must not soft-delete anything.
+    ///
+    /// Every row is stamped before the pipeline starts, so the end-of-scan cleanup
+    /// *would* be allowed to run — but a cancel means "stop". The rows the pass never
+    /// reached have to stay pending (no description, no thumbnail) instead of being
+    /// mistaken for files that vanished. Same ground as §5.7.6, where the cleanup
+    /// wiped a whole folder.
+    #[test]
+    fn cancelled_full_scan_leaves_every_row_pending_and_alive() {
+        let root_dir = tempfile::tempdir().expect("root");
+        let db_dir = tempfile::tempdir().expect("dbdir");
+        let cache_dir = tempfile::tempdir().expect("cache");
+        let db_path = db_dir.path().join("index.sqlite");
+        db::init_database(&db_path).expect("init");
+        for (index, name) in ["a.png", "b.png", "c.png"].iter().enumerate() {
+            write_large_image(&root_dir.path().join(name), index as u32);
+        }
+        let root = root_dir.path().to_str().expect("path").to_string();
+        let ctx = scan_context_with_cache(&db_path, cache_dir.path());
+
+        let job = start_or_resume_scan_job(&db_path, &root).expect("job");
+        let flag = AtomicBool::new(false);
+        // The pipeline emits its first tick before touching a file, so flipping the
+        // flag there cancels it deterministically — and without needing Ollama.
+        let on_tick = |_tick: BacklogTick| flag.store(true, Ordering::Relaxed);
+
+        let summary =
+            run_scan_job_with_progress(&ctx, job.id, Some(&flag), ScanMode::Full, &on_tick)
+                .expect("scan");
+
+        assert_eq!(summary.deleted, 0, "a cancelled scan must not delete rows");
+        let rows = db::load_existing_files(&db_path, job.root_id).expect("rows");
+        assert_eq!(rows.len(), 3, "every discovered file must stay indexed");
+        assert!(
+            db::load_deleted_files(&db_path, job.root_id)
+                .expect("deleted")
+                .is_empty(),
+            "a cancelled scan must not soft-delete anything"
+        );
+        assert_eq!(
+            db::list_backlog_rows(&db_path, job.root_id)
+                .expect("backlog")
+                .len(),
+            3,
+            "unvisited rows stay pending, so the next pass picks them up"
+        );
+        let status = db::get_scan_job(&db_path, job.id)
+            .expect("status")
+            .expect("job exists");
+        assert_eq!(
+            status.status, "interrupted",
+            "a cancel is recorded as an interrupted job (see cancel_scan_job)"
+        );
+    }
+
+    /// A `full` over a mixed folder keeps the unchanged row, adopts the renamed one and
+    /// leaves the new one pending.
+    ///
+    /// The rename is the delicate case: if it were resolved after the cleanup, the old
+    /// row would already be soft-deleted and the file would come back unclassified —
+    /// exactly the outcome §5.12 forbids. No Ollama is involved: the test drives the
+    /// pieces the scan owns (discovery rows, stamping, the producer's identity step and
+    /// the end-of-scan cleanup) and drains the queue instead of classifying.
+    #[test]
+    fn full_scan_keeps_unchanged_and_adopts_a_rename() {
+        let root_dir = tempfile::tempdir().expect("root");
+        let db_dir = tempfile::tempdir().expect("dbdir");
+        let cache_dir = tempfile::tempdir().expect("cache");
+        let db_path = db_dir.path().join("index.sqlite");
+        db::init_database(&db_path).expect("init");
+        let root_path = root_dir.path().to_str().expect("path").to_string();
+        let root_id = db::upsert_root(&db_path, &root_path).expect("root");
+        let ctx = scan_context_with_cache(&db_path, cache_dir.path());
+        let marker = 9;
+
+        let keep = root_dir.path().join("keep.png");
+        write_large_image(&keep, 1);
+        // The bytes that used to live at gone.png.
+        let renamed = root_dir.path().join("renamed.png");
+        write_large_image(&renamed, 2);
+        let fresh = root_dir.path().join("fresh.png");
+        write_large_image(&fresh, 3);
+
+        let thumb_file = cache_dir.path().join("keep-thumb.jpg");
+        std::fs::write(&thumb_file, b"thumb").expect("thumb");
+        let (keep_mtime, keep_size) = file_facts(&keep);
+        let keep_fingerprint = fingerprint_file(&keep, keep_size as u64).expect("fp keep");
+        let keep_row = crate::models::FileRecordUpsert {
+            root_id,
+            rel_path: "keep.png".to_string(),
+            abs_path: keep.display().to_string(),
+            filename: "keep.png".to_string(),
+            media_type: "photo".to_string(),
+            description: "kept".to_string(),
+            extracted_text: String::new(),
+            canonical_mentions: String::new(),
+            confidence: 0.9,
+            lang_hint: "en".to_string(),
+            mtime_ns: keep_mtime,
+            size_bytes: keep_size,
+            fingerprint: keep_fingerprint,
+            scan_marker: 1,
+            location_text: String::new(),
+            dhash: None,
+            duration_secs: None,
+            video_width: None,
+            video_height: None,
+            video_codec: None,
+            audio_codec: None,
+        };
+        db::upsert_file_record(&db_path, &keep_row).expect("keep row");
+        db::update_file_thumb_path(
+            &db_path,
+            root_id,
+            "keep.png",
+            &thumb_file.display().to_string(),
+        )
+        .expect("keep thumb");
+
+        // The row of the file that was renamed: same bytes, old path, already classified.
+        let (renamed_mtime, renamed_size) = file_facts(&renamed);
+        let renamed_fingerprint =
+            fingerprint_file(&renamed, renamed_size as u64).expect("fp renamed");
+        let gone_row = crate::models::FileRecordUpsert {
+            root_id,
+            rel_path: "gone.png".to_string(),
+            abs_path: root_dir.path().join("gone.png").display().to_string(),
+            filename: "gone.png".to_string(),
+            media_type: "photo".to_string(),
+            description: "the old one".to_string(),
+            extracted_text: String::new(),
+            canonical_mentions: String::new(),
+            confidence: 0.9,
+            lang_hint: "en".to_string(),
+            mtime_ns: renamed_mtime,
+            size_bytes: renamed_size,
+            fingerprint: renamed_fingerprint.clone(),
+            scan_marker: 1,
+            location_text: String::new(),
+            dhash: None,
+            duration_secs: None,
+            video_width: None,
+            video_height: None,
+            video_codec: None,
+            audio_codec: None,
+        };
+        let gone_id = db::upsert_file_record(&db_path, &gone_row).expect("gone row");
+
+        // Discovery, then the writes and stamps a `full` performs before the pipeline.
+        let existing = db::load_existing_files(&db_path, root_id).expect("existing");
+        let existing_by_path: HashMap<String, ExistingFile> = existing
+            .iter()
+            .map(|file| (file.rel_path.clone(), file.clone()))
+            .collect();
+        let probes = collect_image_probes_incremental(
+            root_dir.path(),
+            &existing_by_path,
+            &[],
+            &db_path,
+            0,
+            None,
+        )
+        .expect("probes")
+        .probes;
+        let pending: Vec<crate::models::FileRecordUpsert> = probes
+            .iter()
+            .filter(|probe| matches!(probe.status, FileStatus::New))
+            .map(|probe| probe_to_pending_record(root_id, marker, probe))
+            .collect();
+        assert_eq!(pending.len(), 2, "renamed.png and fresh.png are new paths");
+        db::insert_pending_rows(&db_path, &pending).expect("pending rows");
+
+        let job = ScanJobState {
+            root_id,
+            root_path: root_path.clone(),
+            scan_marker: marker,
+            processed_files: 0,
+            added: 0,
+            modified: 0,
+            moved: 0,
+            unchanged: 0,
+            cursor_rel_path: None,
+            phase: "discovering".to_string(),
+        };
+        prepare_scan_rows(&ctx, &job, &probes, &[]).expect("stamp");
+
+        // The producer fills the identities and adopts the rename.
+        let rows = db::list_backlog_rows_for_scan(&db_path, root_id, marker).expect("rows");
+        assert_eq!(rows.len(), 2, "the unchanged row is not work");
+        let moves = MoveIndex::build(&db_path, root_id, marker).expect("moves");
+        assert_eq!(moves.len(), 1, "the vanished row is the rename candidate");
+
+        let counters = BacklogCounters::default();
+        let thumb_dir = ctx.thumb_dir_for(&thumbnail::root_key(&root_path));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<BacklogItem>(16);
+        produce_backlog_items(
+            tx,
+            &ctx,
+            root_id,
+            &thumb_dir,
+            &block_of(rows, crate::llm::MIN_NUM_CTX),
+            None,
+            &counters,
+            marker,
+            Some(&moves),
+        );
+        let items: Vec<BacklogItem> = rx.try_iter().collect();
+        assert_eq!(items.len(), 2);
+        assert_eq!(counters.moved.load(Ordering::Relaxed), 1);
+
+        // Cleanup: every file that is still on disk carries the marker.
+        assert_eq!(
+            db::mark_missing_as_deleted(&db_path, root_id, marker).expect("cleanup"),
+            0,
+            "nothing on disk may be soft-deleted"
+        );
+
+        let live = db::load_existing_files(&db_path, root_id).expect("live");
+        assert_eq!(
+            live.len(),
+            3,
+            "one row per file, and no leftover at the old path"
+        );
+        assert!(
+            !live.iter().any(|file| file.rel_path == "gone.png"),
+            "the old path must not keep a row"
+        );
+        let adopted = live
+            .iter()
+            .find(|file| file.rel_path == "renamed.png")
+            .expect("the rename must live under the new path");
+        assert_eq!(adopted.id, gone_id, "the row keeps its id");
+        let rebuilt_thumb = adopted
+            .thumb_path
+            .as_deref()
+            .expect("the cache mirrors rel_path, so the producer rebuilds the thumbnail");
+        assert!(
+            Path::new(rebuilt_thumb).exists(),
+            "the adopted row points at a thumbnail that exists"
+        );
+        assert!(
+            rebuilt_thumb.contains("renamed"),
+            "the thumbnail is keyed by the new rel_path, not the old one"
+        );
+        let metadata = db::get_file_metadata(&db_path, adopted.id).expect("metadata");
+        assert_eq!(
+            metadata.description, "the old one",
+            "the classification of the renamed file must survive"
+        );
+        let kept = live
+            .iter()
+            .find(|file| file.rel_path == "keep.png")
+            .expect("unchanged row");
+        assert!(kept.thumb_path.is_some(), "the untouched row is left alone");
+        assert!(
+            live.iter().any(|file| file.rel_path == "fresh.png"),
+            "the genuinely new file is indexed"
         );
     }
 }

@@ -189,10 +189,13 @@ startup_scan = "ask"
 # - 10+ starts folding bursts and near-identical shots into one description
 dedupe_dhash_distance = 6
 
-# Run the backlog pass automatically when a full scan finishes.
-# A `full` scan owns discovery and cleanup; the backlog is what classifies with the
-# producer/consumer overlap, so chaining the two means one action indexes and
-# classifies a folder. Set to false to leave the backlog to the sidebar button.
+# Continue a full scan into the pipeline once discovery has written the rows.
+# A `full` scan owns discovery and cleanup, and the pipeline is what produces the
+# thumbnail and the classification in the same pass (it is also the only moment a
+# fresh folder gives the producer real CPU work to hide from the GPU), which removes
+# the mono-thread thumbnail phase from the scan.
+# Set to false for the old shape: a sequential thumbnail pass followed by the
+# sequential classification loop. "Refresh" is the thumbnail-only mode either way.
 chain_backlog = true
 "#;
 
