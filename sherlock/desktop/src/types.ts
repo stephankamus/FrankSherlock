@@ -416,14 +416,43 @@ export type PendingScanInfo = {
   lastScanAt: number | null;
 };
 
+/** Resampler used when downscaling the image sent to the model. */
+export type ImageFilterSetting = "auto" | "box" | "lanczos";
+
 /** Mirrors `config::RuntimeSettings` in the Rust backend. */
 export type VisionSettings = {
   modelOverride: string | null;
   /** Longest side sent to the model. 0 keeps the original bytes. */
   imageMaxSide: number;
   promptProfile: VisionPromptProfile;
+  /** `auto` uses box for JPEG/HEIC and Lanczos3 for PNG/BMP/TIFF. */
+  imageFilter: ImageFilterSetting;
   ocrEngine: VisionOcrEngine;
   startupScan: StartupScanSetting;
+  /**
+   * Hamming distance under which two photos are treated as the same picture.
+   * `0` disables the near-duplicate dedupe.
+   */
+  dedupeDhashDistance: number;
+  /** Continue a full scan into the pipeline (thumbnails + classification). */
+  chainBacklog: boolean;
+};
+
+/**
+ * Body of `update_settings`: the whole settings surface in one write.
+ *
+ * Mirrors `config::SettingsUpdate`; sending everything at once is what keeps a
+ * rejected field from leaving `settings.toml` half applied.
+ */
+export type SettingsUpdatePayload = {
+  model: string | null;
+  imageMaxSide: number;
+  promptProfile: VisionPromptProfile;
+  imageFilter: ImageFilterSetting;
+  ocrEngine: VisionOcrEngine;
+  startupScan: StartupScanSetting;
+  dedupeDhashDistance: number;
+  chainBacklog: boolean;
 };
 
 export type VisionModelOption = {

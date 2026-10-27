@@ -54,6 +54,8 @@ type SidebarProps = {
   onCancelFaceDetect: () => void;
   onCancelScan: (scan: ScanJobStatus) => void;
   onResumeScan: (scan: ScanJobStatus) => void;
+  /** Opens the settings modal (model, resize, OCR, dedupe, startup, chaining). */
+  onOpenSettings?: () => void;
   onSelectAlbum: (album: Album) => void;
   onDeleteAlbum: (album: Album) => void;
   onSelectSmartFolder: (folder: SmartFolder) => void;
@@ -81,7 +83,7 @@ export default function Sidebar({
   thumbRepair, onRepairThumbnails, onCancelThumbRepair, onProcessBacklog,
   backlog, onCancelBacklog, failedCount, onRetryFailed,
   onDetectFaces, onCancelFaceDetect,
-  onCancelScan, onResumeScan,
+  onCancelScan, onResumeScan, onOpenSettings,
   onSelectAlbum, onDeleteAlbum, onSelectSmartFolder, onDeleteSmartFolder,
   onReorderRoots, onReorderAlbums, onReorderSmartFolders, onFindDuplicates,
   onOpenPdfPasswords, onOpenFaces,
@@ -395,6 +397,16 @@ export default function Sidebar({
             title="Reclaim free space in the database with VACUUM"
           >
             {compacting ? "Compacting…" : `Compact DB (${formatBytes(dbStats?.dbFreeBytes ?? 0)} free)`}
+          </button>
+        )}
+        {onOpenSettings && (
+          <button
+            type="button"
+            className="sidebar-compact-btn"
+            onClick={onOpenSettings}
+            title="Model, resize filter, OCR engine, duplicate distance, startup and backlog chaining"
+          >
+            Settings
           </button>
         )}
       </div>

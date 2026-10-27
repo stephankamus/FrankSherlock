@@ -26,6 +26,7 @@ import type {
   ScanJobStatus,
   ScanMode,
   ScanOverrides,
+  SettingsUpdatePayload,
   StartupScanSetting,
   SetupDownloadStatus,
   SetupStatus,
@@ -128,6 +129,16 @@ export async function getRuntimeStatus(): Promise<RuntimeStatus> {
 
 export async function getVisionSettings(): Promise<VisionSettings> {
   return invoke<VisionSettings>("get_vision_settings");
+}
+
+/**
+ * Save the whole settings surface (Settings screen).
+ *
+ * The backend validates every field with the same parsers `settings.toml` uses and
+ * writes nothing when one is invalid, so a typo cannot leave the file half applied.
+ */
+export async function updateSettings(update: SettingsUpdatePayload): Promise<VisionSettings> {
+  return invoke<VisionSettings>("update_settings", { update });
 }
 
 export type VisionSettingsUpdate = {

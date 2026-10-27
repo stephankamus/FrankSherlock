@@ -46,6 +46,7 @@ import EditMetadataModal from "./components/modals/EditMetadataModal";
 import PropertiesModal from "./components/modals/PropertiesModal";
 import ModelInfoModal from "./components/modals/ModelInfoModal";
 import ModelPickerModal from "./components/modals/ModelPickerModal";
+import SettingsModal from "./components/modals/SettingsModal";
 import CreateAlbumModal from "./components/modals/CreateAlbumModal";
 import CreateSmartFolderModal from "./components/modals/CreateSmartFolderModal";
 import { useToast } from "./hooks/useToast";
@@ -96,6 +97,7 @@ export default function App() {
    * Vision settings modal. `resolve` is only set when the modal is gating a
    * scan start; without it the modal is just a settings screen.
    */
+  const [showSettings, setShowSettings] = useState(false);
   const [visionPicker, setVisionPicker] = useState<{
     rootPath: string | null;
     resolve: ((ok: boolean) => void) | null;
@@ -820,6 +822,14 @@ export default function App() {
           }}
         />
       )}
+      {showSettings && (
+        <SettingsModal
+          onClose={() => setShowSettings(false)}
+          // The runtime panel reads the model and the estimate, both of which depend
+          // on what was just saved.
+          onSaved={() => void scanManager.pollRuntimeAndScans()}
+        />
+      )}
       {visionPicker && (
         <ModelPickerModal
           rootPath={visionPicker.rootPath}
@@ -964,6 +974,7 @@ export default function App() {
           }}
           onDeleteRoot={(root) => setConfirmDeleteRoot(root)}
           onReclassifyRoot={(root) => setConfirmReclassifyRoot(root)}
+          onOpenSettings={() => setShowSettings(true)}
           onRescanRoot={(root) => scanManager.onRescanRoot(root, setup, readOnly)}
           onRefreshRoot={(root) => scanManager.onRefreshRoot(root, readOnly)}
           onCopyRootPath={(root) => {

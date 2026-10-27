@@ -443,6 +443,9 @@ describe("App - API integration on init", () => {
       promptProfile: "concise",
       ocrEngine: "llm",
       startupScan: "ask",
+      imageFilter: "auto",
+      dedupeDhashDistance: 6,
+      chainBacklog: true,
     });
     mockInitApp.mockResolvedValueOnce(initResult({
       roots: [mockRoot],
@@ -469,6 +472,9 @@ describe("App - API integration on init", () => {
       promptProfile: "concise",
       ocrEngine: "llm",
       startupScan: "classify_only",
+      imageFilter: "auto",
+      dedupeDhashDistance: 6,
+      chainBacklog: true,
     });
     mockInitApp.mockResolvedValueOnce(initResult({ roots: [mockRoot] }));
     renderApp();
@@ -496,6 +502,9 @@ describe("App - API integration on init", () => {
       promptProfile: "concise",
       ocrEngine: "llm",
       startupScan: "ask",
+      imageFilter: "auto",
+      dedupeDhashDistance: 6,
+      chainBacklog: true,
     });
     mockInitApp.mockResolvedValueOnce(initResult({ roots: [mockRoot] }));
     renderApp();

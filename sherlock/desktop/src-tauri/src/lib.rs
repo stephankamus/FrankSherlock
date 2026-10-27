@@ -2047,6 +2047,20 @@ struct VisionSettingsUpdate {
     ocr_engine: String,
 }
 
+/// Save the whole settings surface from the Settings screen.
+///
+/// Takes the struct the form edits — all eight fields — instead of a per-field command,
+/// so an update can never leave `settings.toml` half-applied, and so the UI and a
+/// hand-edited file are validated by the same code
+/// ([`config::RuntimeSettings::apply_update`]).
+#[tauri::command]
+fn update_settings(update: config::SettingsUpdate) -> Result<config::RuntimeSettings, String> {
+    let mut settings = config::load_runtime_settings().unwrap_or_default();
+    settings.apply_update(&update)?;
+    config::save_runtime_settings(&settings).map_err(|e| e.to_string())?;
+    Ok(settings)
+}
+
 #[tauri::command]
 fn set_vision_settings(update: VisionSettingsUpdate) -> Result<config::RuntimeSettings, String> {
     let mut settings = config::load_runtime_settings().unwrap_or_default();
@@ -2396,6 +2410,7 @@ pub fn run() {
             list_active_scans,
             get_runtime_status,
             get_vision_settings,
+            update_settings,
             set_vision_settings,
             list_vision_models,
             estimate_vision_scan,

@@ -379,7 +379,61 @@ impl Default for RuntimeSettings {
     }
 }
 
+/// Everything the settings screen submits, in one struct.
+///
+/// Kept apart from [`RuntimeSettings`] because every field arrives as text from a form
+/// and has to go through the same parsers `settings.toml` uses: one validation path for
+/// a hand-edited file and for the UI, so the two cannot drift.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsUpdate {
+    /// `None` or empty restores automatic model selection from the hardware.
+    pub model: Option<String>,
+    pub image_max_side: u32,
+    pub prompt_profile: String,
+    pub image_filter: String,
+    pub ocr_engine: String,
+    pub startup_scan: String,
+    pub dedupe_dhash_distance: u32,
+    pub chain_backlog: bool,
+}
+
 impl RuntimeSettings {
+    /// Apply a whole update on top of the current settings, validating every value.
+    ///
+    /// Returns the offending field on the first error, without touching the rest: a
+    /// half-applied update would leave `settings.toml` in a state neither the user nor
+    /// the app asked for.
+    pub fn apply_update(&mut self, update: &SettingsUpdate) -> Result<(), String> {
+        let model_override = update
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string);
+        if let Some(model) = model_override.as_deref() {
+            validate_model_tag(model).map_err(|e| e.to_string())?;
+        }
+        let prompt_profile = PromptProfile::parse(&update.prompt_profile)
+            .ok_or_else(|| format!("invalid prompt_profile '{}'", update.prompt_profile))?;
+        let image_filter = ImageFilter::parse(&update.image_filter)
+            .ok_or_else(|| format!("invalid image_filter '{}'", update.image_filter))?;
+        let ocr_engine = OcrEngine::parse(&update.ocr_engine)
+            .ok_or_else(|| format!("invalid ocr_engine '{}'", update.ocr_engine))?;
+        let startup_scan = StartupScan::parse(&update.startup_scan)
+            .ok_or_else(|| format!("invalid startup_scan '{}'", update.startup_scan))?;
+
+        self.model_override = model_override;
+        self.image_max_side = Self::normalize_image_max_side(update.image_max_side);
+        self.prompt_profile = prompt_profile;
+        self.image_filter = image_filter;
+        self.ocr_engine = ocr_engine;
+        self.startup_scan = startup_scan;
+        self.dedupe_dhash_distance = Self::normalize_dedupe_distance(update.dedupe_dhash_distance);
+        self.chain_backlog = update.chain_backlog;
+        Ok(())
+    }
+
     /// `0` is preserved (meaning "original bytes"); anything else is clamped to the
     /// supported range so a hand-edited file cannot make classification absurdly slow
     /// or degrade quality below what the prompts expect.
@@ -882,6 +936,58 @@ mod tests {
         assert_eq!(settings.image_max_side, DEFAULT_IMAGE_MAX_SIDE);
         assert_eq!(settings.prompt_profile, PromptProfile::Concise);
         assert_eq!(settings.ocr_engine, OcrEngine::Llm);
+    }
+
+    fn full_update() -> SettingsUpdate {
+        SettingsUpdate {
+            model: Some("qwen2.5vl:7b".to_string()),
+            image_max_side: 768,
+            prompt_profile: "detailed".to_string(),
+            image_filter: "box".to_string(),
+            ocr_engine: "surya".to_string(),
+            startup_scan: "classify_only".to_string(),
+            dedupe_dhash_distance: 4,
+            chain_backlog: false,
+        }
+    }
+
+    #[test]
+    fn apply_update_sets_every_field_and_normalizes() {
+        let mut settings = RuntimeSettings::default();
+        let mut update = full_update();
+        // Out-of-range values are clamped instead of rejected: the form cannot send
+        // them, but a hand-written JSON body can.
+        update.image_max_side = 99_999;
+        update.dedupe_dhash_distance = 99;
+
+        settings.apply_update(&update).expect("apply");
+
+        assert_eq!(settings.model_override.as_deref(), Some("qwen2.5vl:7b"));
+        assert_eq!(settings.image_max_side, MAX_IMAGE_MAX_SIDE);
+        assert_eq!(settings.prompt_profile, PromptProfile::Detailed);
+        assert_eq!(settings.image_filter, ImageFilter::Box);
+        assert_eq!(settings.ocr_engine, OcrEngine::Surya);
+        assert_eq!(settings.startup_scan, StartupScan::ClassifyOnly);
+        assert_eq!(settings.dedupe_dhash_distance, MAX_DEDUPE_DHASH_DISTANCE);
+        assert!(!settings.chain_backlog);
+
+        // An empty model restores the automatic choice from the hardware.
+        let mut cleared = full_update();
+        cleared.model = Some("   ".to_string());
+        settings.apply_update(&cleared).expect("apply");
+        assert!(settings.model_override.is_none());
+    }
+
+    #[test]
+    fn apply_update_rejects_an_invalid_field_without_half_applying() {
+        let mut settings = RuntimeSettings::default();
+        let before = settings.clone();
+        let mut update = full_update();
+        update.prompt_profile = "verbose".to_string();
+
+        let error = settings.apply_update(&update).expect_err("must reject");
+        assert!(error.contains("prompt_profile"), "{error}");
+        assert_eq!(settings, before, "a rejected update must change nothing");
     }
 
     #[test]

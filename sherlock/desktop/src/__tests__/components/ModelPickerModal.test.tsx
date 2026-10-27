@@ -26,6 +26,9 @@ const settings: VisionSettings = {
   promptProfile: "concise",
   ocrEngine: "llm",
   startupScan: "ask",
+  imageFilter: "auto",
+  dedupeDhashDistance: 6,
+  chainBacklog: true,
 };
 
 const models: VisionModelOption[] = [
