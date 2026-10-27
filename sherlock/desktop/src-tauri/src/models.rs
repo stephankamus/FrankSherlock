@@ -364,6 +364,8 @@ pub struct ScanContext {
     /// Longest side of the image sent to the model (`0` = original bytes).
     pub image_max_side: u32,
     pub prompt_profile: crate::config::PromptProfile,
+    /// Language the free-text description is written in.
+    pub description_language: crate::config::DescriptionLanguage,
     /// Resampler used when downscaling the image for the model.
     pub image_filter: crate::config::ImageFilter,
     pub ocr_engine: crate::config::OcrEngine,
@@ -387,6 +389,7 @@ impl ScanContext {
         VisionSettings {
             image_max_side: self.image_max_side,
             prompt_profile: self.prompt_profile,
+            description_language: self.description_language,
             image_filter: self.image_filter,
             ocr_engine: self.ocr_engine,
         }
@@ -399,6 +402,7 @@ impl ScanContext {
 pub struct VisionSettings {
     pub image_max_side: u32,
     pub prompt_profile: crate::config::PromptProfile,
+    pub description_language: crate::config::DescriptionLanguage,
     pub image_filter: crate::config::ImageFilter,
     pub ocr_engine: crate::config::OcrEngine,
 }
@@ -409,6 +413,7 @@ impl Default for VisionSettings {
         Self {
             image_max_side: defaults.image_max_side,
             prompt_profile: defaults.prompt_profile,
+            description_language: defaults.description_language,
             image_filter: defaults.image_filter,
             ocr_engine: defaults.ocr_engine,
         }
@@ -642,6 +647,29 @@ pub struct ThumbRepairProgress {
     pub started_at: i64,
     /// `"scanning"` while collecting dead pointers, `"repairing"` while
     /// regenerating, then `"done"`, `"cancelled"` or `"failed"`.
+    pub phase: String,
+    pub error: Option<String>,
+}
+
+/// Progress of the "convert existing descriptions" pass.
+///
+/// Text-only work: it rewrites the description of rows that are already classified
+/// into `settings.description_language`, so it needs no image and no thumbnail. Kept
+/// in memory and polled by the settings screen, like `ThumbRepairProgress`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DescriptionLanguageProgress {
+    /// Language the pass is writing (`pt_br` / `en`).
+    pub language: String,
+    pub total: u64,
+    pub processed: u64,
+    pub converted: u64,
+    /// Rows left alone: machine markers, or a description that cannot be translated
+    /// (empty, or the model answered garbage and the old text is kept).
+    pub skipped: u64,
+    pub failed: u64,
+    pub started_at: i64,
+    /// `"converting"`, then `"done"`, `"cancelled"` or `"failed"`.
     pub phase: String,
     pub error: Option<String>,
 }

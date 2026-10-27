@@ -1423,7 +1423,9 @@ struct CtxBlock {
 /// the rest are deferred to the next pass, where their size is known and they get
 /// their own block.
 fn ctx_blocks(rows: &[db::BacklogRow], ctx: &ScanContext) -> Vec<CtxBlock> {
-    let profile = ctx.vision_settings().prompt_profile;
+    let vision = ctx.vision_settings();
+    let profile = vision.prompt_profile;
+    let language = vision.description_language;
     let mut known: std::collections::BTreeMap<u32, Vec<db::BacklogRow>> =
         std::collections::BTreeMap::new();
     let mut probed: Vec<db::BacklogRow> = Vec::new();
@@ -1440,6 +1442,7 @@ fn ctx_blocks(rows: &[db::BacklogRow], ctx: &ScanContext) -> Vec<CtxBlock> {
                     height,
                     ctx.image_max_side,
                     profile,
+                    language,
                 ))
                 .or_default()
                 .push(row.clone()),
@@ -1492,7 +1495,9 @@ fn produce_backlog_items(
     scan_marker: i64,
     moves: Option<&MoveIndex>,
 ) {
-    let profile = ctx.vision_settings().prompt_profile;
+    let vision = ctx.vision_settings();
+    let profile = vision.prompt_profile;
+    let language = vision.description_language;
     // Only video and PDF consult these caches, and seeding them would cost a `stat`
     // per indexed row; every still image is decoded here anyway.
     let mut legacy_caches = ThumbCaches::default();
@@ -1536,7 +1541,8 @@ fn produce_backlog_items(
                 },
             };
             if let Some((width, height)) = dims {
-                let needed = classify::primary_ctx_for(width, height, ctx.image_max_side, profile);
+                let needed =
+                    classify::primary_ctx_for(width, height, ctx.image_max_side, profile, language);
                 if needed > block.ctx {
                     // Another window owns this row. Sending it here would either
                     // 400 (too big for the loaded window) or reload the model,
@@ -1992,6 +1998,7 @@ fn classify_prepared_and_update(
         classification.confidence,
         &classification.lang_hint,
         &classification.document_hint,
+        ctx.description_language.as_str(),
     ) {
         Ok(_) => true,
         Err(e) => {
@@ -2817,6 +2824,7 @@ fn classify_and_update(ctx: &ScanContext, file_id: i64, abs_path: &str) -> bool 
         classification.confidence,
         &classification.lang_hint,
         &classification.document_hint,
+        ctx.description_language.as_str(),
     ) {
         Ok(_) => true,
         Err(e) => {
@@ -3289,6 +3297,7 @@ mod tests {
             model: "qwen2.5vl:7b".to_string(),
             image_max_side: vision.image_max_side,
             prompt_profile: vision.prompt_profile,
+            description_language: vision.description_language,
             image_filter: vision.image_filter,
             ocr_engine: vision.ocr_engine,
             pdfium_lib_path: tmp.path().join("lib"),
@@ -4282,7 +4291,7 @@ mod tests {
         let indexed = db::load_existing_files(&db_path, first.root_id).expect("load");
         for file in indexed {
             db::update_file_classification(
-                &db_path, file.id, "photo", "done", "", "", 0.9, "en", "none",
+                &db_path, file.id, "photo", "done", "", "", 0.9, "en", "none", "en",
             )
             .expect("mark classified");
         }

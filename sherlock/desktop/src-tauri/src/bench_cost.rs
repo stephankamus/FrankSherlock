@@ -44,7 +44,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::config::{ImageFilter, PromptProfile};
+use crate::config::{DescriptionLanguage, ImageFilter, PromptProfile};
 use crate::models::VisionSettings;
 use crate::{classify, thumbnail, vision_estimate, vision_prep};
 
@@ -319,6 +319,12 @@ fn bench_cost_split() {
     {
         settings.prompt_profile = profile;
     }
+    if let Some(language) = std::env::var("BENCH_LANGUAGE")
+        .ok()
+        .and_then(|v| DescriptionLanguage::parse(&v))
+    {
+        settings.description_language = language;
+    }
 
     let paths = resolve_paths(limit);
     assert!(!paths.is_empty(), "no files to measure");
@@ -479,7 +485,12 @@ fn bench_cost_split() {
 
         if let Some(model_name) = model.as_deref() {
             if let Ok(prepared) = prepared {
-                let probe = classify::probe_primary(model_name, prepared, settings.prompt_profile);
+                let probe = classify::probe_primary(
+                    model_name,
+                    prepared,
+                    settings.prompt_profile,
+                    settings.description_language,
+                );
                 if probe.ok {
                     // A cold model load (~50 s) happens once per session, not per
                     // image, so it must not enter the per-image average. Same rule
@@ -500,10 +511,18 @@ fn bench_cost_split() {
         if quality {
             if let Some(model_name) = model.as_deref() {
                 if let (Ok(box_img), Ok(lanc_img)) = (&prepared_box, &prepared_lanczos) {
-                    let boxed =
-                        classify::probe_primary(model_name, box_img, settings.prompt_profile);
-                    let lanczos =
-                        classify::probe_primary(model_name, lanc_img, settings.prompt_profile);
+                    let boxed = classify::probe_primary(
+                        model_name,
+                        box_img,
+                        settings.prompt_profile,
+                        settings.description_language,
+                    );
+                    let lanczos = classify::probe_primary(
+                        model_name,
+                        lanc_img,
+                        settings.prompt_profile,
+                        settings.description_language,
+                    );
                     eprintln!(
                         "quality [{rel}]\n  box     : {}\n  lanczos : {}",
                         summarize_raw(&boxed.raw),

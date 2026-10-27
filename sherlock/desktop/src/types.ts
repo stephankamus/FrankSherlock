@@ -319,6 +319,25 @@ export type ThumbRepairProgress = {
   error: string | null;
 };
 
+/**
+ * Progress of the "convert existing descriptions" pass.
+ *
+ * Text-only: it rewrites the description of rows that are already classified into
+ * the configured language, so it needs no image and no thumbnail.
+ */
+export type DescriptionLanguageProgress = {
+  language: string;
+  total: number;
+  processed: number;
+  converted: number;
+  skipped: number;
+  failed: number;
+  /** Unix seconds when the run started (used for rate and ETA). */
+  startedAt: number;
+  phase: "converting" | "done" | "cancelled" | "failed";
+  error: string | null;
+};
+
 // ── Backlog pipeline ────────────────────────────────────────────────
 
 /**
@@ -396,6 +415,14 @@ export type ReclusterProgress = {
 export type VisionPromptProfile = "concise" | "detailed";
 export type VisionOcrEngine = "off" | "llm" | "surya";
 
+/**
+ * Language the free-text description is written in.
+ *
+ * JSON keys, enum values, OCR text and the `[Doc: …]` markers stay English in both
+ * cases: only prose follows this setting.
+ */
+export type DescriptionLanguageSetting = "pt_br" | "en";
+
 /** What a scan job is allowed to do. */
 export type ScanMode = "full" | "refresh" | "classify_only" | "backlog" | "retry_failed";
 
@@ -430,6 +457,8 @@ export type VisionSettings = {
   /** Longest side sent to the model. 0 keeps the original bytes. */
   imageMaxSide: number;
   promptProfile: VisionPromptProfile;
+  /** Language of the description; PT-BR by default. */
+  descriptionLanguage: DescriptionLanguageSetting;
   /** `auto` uses box for JPEG/HEIC and Lanczos3 for PNG/BMP/TIFF. */
   imageFilter: ImageFilterSetting;
   ocrEngine: VisionOcrEngine;
@@ -453,6 +482,7 @@ export type SettingsUpdatePayload = {
   model: string | null;
   imageMaxSide: number;
   promptProfile: VisionPromptProfile;
+  descriptionLanguage: DescriptionLanguageSetting;
   imageFilter: ImageFilterSetting;
   ocrEngine: VisionOcrEngine;
   startupScan: StartupScanSetting;

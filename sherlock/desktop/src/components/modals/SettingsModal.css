@@ -46,6 +46,16 @@
   margin-bottom: 14px;
 }
 
+/* Live counter of the description conversion pass: a line of text plus Cancel. */
+.settings-conversion {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+}
+
 .settings-loading {
   opacity: 0.7;
 }

@@ -5,7 +5,7 @@ use crate::platform::process::silent_command;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::config::{OcrEngine, PromptProfile};
+use crate::config::{DescriptionLanguage, OcrEngine, PromptProfile};
 use crate::llm::{num_ctx_for, ollama_generate, parse_json_response, GenerateParams};
 use crate::models::{ClassificationResult, VisionSettings};
 use crate::vision_prep::{self, PreparedImage};
@@ -52,6 +52,50 @@ const PRIMARY_PROMPT_CONCISE: &str = concat!(
     "4) Favor precision over guesswork.",
 );
 
+// PT-BR variants of the two primary prompts.
+//
+// The schema, the keys and every enum value stay **English**: `media_type`,
+// `contains_text`, `document_photo` and their values are matched in Rust and the model
+// is shown them as literals, so only the free-text field changes language.
+//
+// The word cap stays at 12. Measured on 12 real photos (`scripts/
+// bench-description-language.py`), allowing 16 words made one image loop — `Pessoa de
+// pé em pé de pé de pé…` — into the 180-token budget, which is the failure described
+// below. PT-BR does not need extra room for time either: it produced *fewer* output
+// tokens than English (43.2 vs 46.2) because it says the same thing in fewer words.
+const PRIMARY_PROMPT_CONCISE_PT: &str = concat!(
+    "Analise esta imagem. Responda SOMENTE com JSON compacto, sem markdown. Schema: ",
+    r#"{"media_type":"screenshot|anime|manga|photo|document|artwork|other","#,
+    r#""contains_text":true,"#,
+    r#""document_photo":"none|receipt|invoice|statement|other","#,
+    r#""description":"no máximo 12 palavras","#,
+    r#""confidence":0.0}"#,
+    " Regras: ",
+    "1) contains_text=true apenas quando houver texto claramente visível (interface, recibo, digitalização, legendas). ",
+    "2) document_photo=receipt|invoice|statement|other apenas quando a imagem FOR esse documento; uma cena com placas, logotipos ou preços é \"none\". ",
+    "3) description deve ser factual, em português do Brasil, com no máximo 12 palavras. ",
+    "4) Prefira precisão a adivinhação.",
+);
+
+const PRIMARY_PROMPT_DETAILED_PT: &str = concat!(
+    "Analise esta imagem e responda SOMENTE com JSON válido. Schema: ",
+    r#"{"media_type":"screenshot|anime|manga|photo|document|artwork|other","#,
+    r#""contains_text":true,"#,
+    r#""is_anime_related":false,"#,
+    r#""document_photo":"none|receipt|invoice|statement|other","#,
+    r#""description":"no máximo 24 palavras","#,
+    r#""series_candidates":["nome"],"#,
+    r#""character_candidates":["nome"],"#,
+    r#""confidence":0.0}"#,
+    " Regras: ",
+    "1) Use arrays vazios quando não souber; nomes de séries e personagens ficam no original, sem traduzir. ",
+    "2) contains_text=true apenas quando houver texto claramente visível (interface, recibo, digitalização, legendas). ",
+    "3) document_photo descreve a FOTO em si: um recibo fotografado é \"receipt\", uma nota fiscal digitalizada é \"invoice\". Uma cena que apenas mostra uma placa, um logotipo ou um preço é \"none\" — nunca deduza um documento a partir de nomes de marcas. ",
+    "4) series_candidates e character_candidates: no máximo 5 itens cada, sem repetir. ",
+    "5) description em português do Brasil, com no máximo 24 palavras. ",
+    "6) Prefira precisão a adivinhação.",
+);
+
 // The old `PRIMARY_PROMPT_FALLBACK` lived here: a second wording of the same schema
 // used as the retry. It turned out to be the *cause* of the failure it was meant to
 // recover from — on low-contrast photos (construction sites, concrete) that wording
@@ -60,10 +104,12 @@ const PRIMARY_PROMPT_CONCISE: &str = concat!(
 // with the normal prompt and no grammar, so the retry now keeps the prompt and only
 // changes the sampling mode.
 
-fn primary_prompt(profile: PromptProfile) -> &'static str {
-    match profile {
-        PromptProfile::Concise => PRIMARY_PROMPT_CONCISE,
-        PromptProfile::Detailed => PRIMARY_PROMPT_DETAILED,
+fn primary_prompt(profile: PromptProfile, language: DescriptionLanguage) -> &'static str {
+    match (profile, language) {
+        (PromptProfile::Concise, DescriptionLanguage::PtBr) => PRIMARY_PROMPT_CONCISE_PT,
+        (PromptProfile::Detailed, DescriptionLanguage::PtBr) => PRIMARY_PROMPT_DETAILED_PT,
+        (PromptProfile::Concise, DescriptionLanguage::En) => PRIMARY_PROMPT_CONCISE,
+        (PromptProfile::Detailed, DescriptionLanguage::En) => PRIMARY_PROMPT_DETAILED,
     }
 }
 
@@ -84,6 +130,27 @@ const ANIME_PROMPT: &str = concat!(
     r#""confidence":0.0}"#,
     " Rules: prefer canonical full names when possible; if unknown set null/empty.",
 );
+
+/// `scene_summary` is free text, so it follows `description_language`; the series
+/// and character names never do — they are what `canonical_mentions` (and therefore
+/// search) is built from, and a translated name would stop matching.
+const ANIME_PROMPT_PT: &str = concat!(
+    "Esta imagem parece ser de anime/mangá. Responda SOMENTE com JSON válido, schema: ",
+    r#"{"series":"nome ou null","#,
+    r#""franchise":"nome ou null","#,
+    r#""characters":[{"name":"nome canônico completo","series":"nome ou null","confidence":0.0}],"#,
+    r#""canonical_mentions":["Nome da Série"],"#,
+    r#""scene_summary":"curto","#,
+    r#""confidence":0.0}"#,
+    " Regras: prefira nomes canônicos completos quando possível; nomes de séries e personagens ficam no original, sem traduzir; scene_summary em português do Brasil; se não souber, use null ou vazio.",
+);
+
+fn anime_prompt(language: DescriptionLanguage) -> &'static str {
+    match language {
+        DescriptionLanguage::PtBr => ANIME_PROMPT_PT,
+        DescriptionLanguage::En => ANIME_PROMPT,
+    }
+}
 
 const OCR_PROMPT: &str =
     "Extract ALL visible text exactly as seen. Return ONLY raw text. Preserve line breaks.";
@@ -354,7 +421,7 @@ pub fn is_empty_result(result: &ClassificationResult) -> bool {
         && result.confidence <= 0.0
 }
 
-fn truncate_chars(text: &str, max_chars: usize) -> &str {
+pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> &str {
     match text.char_indices().nth(max_chars) {
         Some((idx, _)) => &text[..idx],
         None => text,
@@ -506,12 +573,18 @@ fn original_fits_window(
 /// classifier itself keeps deriving `num_ctx` from the prepared image it really
 /// sends ([`num_ctx_for`]); [`vision_prep::prepared_size`] is what keeps the two
 /// numbers identical.
-pub fn primary_ctx_for(width: u32, height: u32, max_side: u32, profile: PromptProfile) -> u32 {
+pub fn primary_ctx_for(
+    width: u32,
+    height: u32,
+    max_side: u32,
+    profile: PromptProfile,
+    language: DescriptionLanguage,
+) -> u32 {
     let (prepared_w, prepared_h) = vision_prep::prepared_size(width, height, max_side);
     num_ctx_for(
         prepared_w,
         prepared_h,
-        primary_prompt(profile).len(),
+        primary_prompt(profile, language).len(),
         primary_num_predict(profile),
     )
 }
@@ -554,8 +627,9 @@ fn classify_primary(
     model: &str,
     prepared: &PreparedImage,
     profile: PromptProfile,
+    language: DescriptionLanguage,
 ) -> PrimaryOutcome {
-    let prompt = primary_prompt(profile);
+    let prompt = primary_prompt(profile, language);
     let num_predict = primary_num_predict(profile);
     let num_ctx = num_ctx_for(prepared.width, prepared.height, prompt.len(), num_predict);
 
@@ -774,8 +848,13 @@ pub struct ProbeResult {
 /// hardcoded throughput table, the estimator measures real images from the
 /// user's library with the exact prompt, resolution and context that the scan
 /// will use.
-pub fn probe_primary(model: &str, prepared: &PreparedImage, profile: PromptProfile) -> ProbeResult {
-    let prompt = primary_prompt(profile);
+pub fn probe_primary(
+    model: &str,
+    prepared: &PreparedImage,
+    profile: PromptProfile,
+    language: DescriptionLanguage,
+) -> ProbeResult {
+    let prompt = primary_prompt(profile, language);
     let num_predict = primary_num_predict(profile);
     let num_ctx = num_ctx_for(prepared.width, prepared.height, prompt.len(), num_predict);
 
@@ -809,17 +888,17 @@ pub fn probe_primary(model: &str, prepared: &PreparedImage, profile: PromptProfi
 // Stage 2a: Anime enrichment
 // ---------------------------------------------------------------------------
 
-fn classify_anime_details(model: &str, prepared: &PreparedImage) -> Option<Value> {
+fn classify_anime_details(
+    model: &str,
+    prepared: &PreparedImage,
+    language: DescriptionLanguage,
+) -> Option<Value> {
     const NUM_PREDICT: u32 = 500;
-    let num_ctx = num_ctx_for(
-        prepared.width,
-        prepared.height,
-        ANIME_PROMPT.len(),
-        NUM_PREDICT,
-    );
+    let prompt = anime_prompt(language);
+    let num_ctx = num_ctx_for(prepared.width, prepared.height, prompt.len(), NUM_PREDICT);
 
     let params = GenerateParams::vision(NUM_PREDICT, Some(num_ctx));
-    let resp = ollama_generate(model, ANIME_PROMPT, Some(&prepared.path), &params);
+    let resp = ollama_generate(model, prompt, Some(&prepared.path), &params);
     if resp.ok {
         if let Some(v) = parse_json_response(&resp.raw) {
             let conf = v.get("confidence").and_then(|c| c.as_f64()).unwrap_or(0.0);
@@ -839,7 +918,7 @@ fn classify_anime_details(model: &str, prepared: &PreparedImage) -> Option<Value
         json_mode: false,
         ..GenerateParams::vision(NUM_PREDICT, Some(num_ctx))
     };
-    let resp2 = ollama_generate(model, ANIME_PROMPT, Some(&prepared.path), &params2);
+    let resp2 = ollama_generate(model, prompt, Some(&prepared.path), &params2);
     if resp2.ok {
         if let Some(v) = parse_json_response(&resp2.raw) {
             return Some(v);
@@ -1177,7 +1256,12 @@ pub fn classify_image_prepared(
 ) -> ClassificationResult {
     log::info!("Classifying: {}", image_path.display());
 
-    let (primary, primary_failure) = classify_primary(model, prepared, vision.prompt_profile);
+    let (primary, primary_failure) = classify_primary(
+        model,
+        prepared,
+        vision.prompt_profile,
+        vision.description_language,
+    );
 
     let media_type = primary
         .get("media_type")
@@ -1210,7 +1294,7 @@ pub fn classify_image_prepared(
 
     // Anime enrichment
     if should_run_anime_enrichment(&primary) {
-        if let Some(anime) = classify_anime_details(model, prepared) {
+        if let Some(anime) = classify_anime_details(model, prepared, vision.description_language) {
             if let Some(series) = anime.get("series").and_then(clean_nullable_str) {
                 full_description = format!("{full_description} [Series: {series}]");
             }
@@ -1308,6 +1392,37 @@ const VIDEO_PROMPT: &str = concat!(
     "6) Favor precision over guesswork.",
 );
 
+/// `title_guess` is deliberately **not** translated: it is the name of the work, and a
+/// translated name would neither match the filename nor search. `description` and the
+/// category explanation do follow `description_language`; the category values stay
+/// English because `video_category` is matched in Rust.
+const VIDEO_PROMPT_PT: &str = concat!(
+    "Estes são quadros-chave de um vídeo. Analise e responda SOMENTE com JSON válido. Schema: ",
+    r#"{"media_type":"video","#,
+    r#""video_category":"movie|tv_episode|personal|music_video|tutorial|other","#,
+    r#""is_anime_related":false,"#,
+    r#""description":"descrição curta e factual","#,
+    r#""title_guess":"título original ou null","#,
+    r#""series_candidates":["nome"],"#,
+    r#""character_candidates":["nome"],"#,
+    r#""confidence":0.0}"#,
+    " Regras: ",
+    "1) Use arrays vazios quando não souber. ",
+    "2) video_category: movie=filme, tv_episode=episódio de série, personal=filme caseiro/vlog, ",
+    "music_video=clipe musical, tutorial=educativo/passo a passo, other=todo o resto. ",
+    "3) title_guess: o título original, sem traduzir; null se desconhecido. ",
+    "4) series_candidates e character_candidates: no máximo 5 itens cada, nomes no original. ",
+    "5) description em português do Brasil, com no máximo 24 palavras. ",
+    "6) Prefira precisão a adivinhação.",
+);
+
+fn video_prompt(language: DescriptionLanguage) -> &'static str {
+    match language {
+        DescriptionLanguage::PtBr => VIDEO_PROMPT_PT,
+        DescriptionLanguage::En => VIDEO_PROMPT,
+    }
+}
+
 pub fn classify_video(
     video_path: &Path,
     model: &str,
@@ -1393,10 +1508,11 @@ pub fn classify_video(
 
     let primary = if let Some(frame) = &prepared_frame {
         const NUM_PREDICT: u32 = 400;
-        let num_ctx = num_ctx_for(frame.width, frame.height, VIDEO_PROMPT.len(), NUM_PREDICT);
+        let prompt = video_prompt(vision.description_language);
+        let num_ctx = num_ctx_for(frame.width, frame.height, prompt.len(), NUM_PREDICT);
         let resp = ollama_generate(
             model,
-            VIDEO_PROMPT,
+            prompt,
             Some(&frame.path),
             &GenerateParams::vision(NUM_PREDICT, Some(num_ctx)),
         );
@@ -1462,7 +1578,9 @@ pub fn classify_video(
     // Anime enrichment on the best keyframe
     if is_anime {
         if let Some(best_frame) = &prepared_frame {
-            if let Some(anime) = classify_anime_details(model, best_frame) {
+            if let Some(anime) =
+                classify_anime_details(model, best_frame, vision.description_language)
+            {
                 if let Some(series) = anime.get("series").and_then(clean_nullable_str) {
                     description = format!("{description} [Series: {series}]");
                 }
@@ -1609,9 +1727,15 @@ pub fn classify_pdf(
         }
     };
 
-    let primary = prepared_page
-        .as_ref()
-        .map(|prepared| classify_primary(model, prepared, vision.prompt_profile).0);
+    let primary = prepared_page.as_ref().map(|prepared| {
+        classify_primary(
+            model,
+            prepared,
+            vision.prompt_profile,
+            vision.description_language,
+        )
+        .0
+    });
 
     // Use vision model results as the base, fall back to generic PDF description
     let media_type = primary
@@ -1640,10 +1764,9 @@ pub fn classify_pdf(
     if let Some(ref p) = primary {
         // Anime enrichment on the rendered page (same logic as classify_image)
         if should_run_anime_enrichment(p) {
-            if let Some(anime) = prepared_page
-                .as_ref()
-                .and_then(|prepared| classify_anime_details(model, prepared))
-            {
+            if let Some(anime) = prepared_page.as_ref().and_then(|prepared| {
+                classify_anime_details(model, prepared, vision.description_language)
+            }) {
                 if let Some(series) = anime.get("series").and_then(clean_nullable_str) {
                     description = format!("{description} [Series: {series}]");
                 }
@@ -1835,7 +1958,7 @@ mod tests {
     fn primary_ctx_splits_the_library_only_when_the_prep_size_grows() {
         for (w, h) in [(4000, 3000), (768, 1024), (640, 480), (12, 12)] {
             assert_eq!(
-                primary_ctx_for(w, h, 768, PromptProfile::Concise),
+                primary_ctx_for(w, h, 768, PromptProfile::Concise, DescriptionLanguage::En),
                 4096,
                 "{w}x{h} at 768 px must stay in the single 4096 window"
             );
@@ -1843,12 +1966,24 @@ mod tests {
 
         // At 1280 px the prepared sides are 1280x960 (4:3) and 1280x1280.
         assert_eq!(
-            primary_ctx_for(4000, 3000, 1280, PromptProfile::Concise),
+            primary_ctx_for(
+                4000,
+                3000,
+                1280,
+                PromptProfile::Concise,
+                DescriptionLanguage::En
+            ),
             4096,
             "4:3 at 1280 px still fits 4096"
         );
         assert_eq!(
-            primary_ctx_for(3000, 3000, 1280, PromptProfile::Concise),
+            primary_ctx_for(
+                3000,
+                3000,
+                1280,
+                PromptProfile::Concise,
+                DescriptionLanguage::En
+            ),
             8192,
             "a 1280x1280 square needs the next window"
         );
@@ -2082,19 +2217,27 @@ mod tests {
     #[test]
     fn primary_prompt_matches_profile() {
         assert_eq!(
-            primary_prompt(PromptProfile::Concise),
+            primary_prompt(PromptProfile::Concise, DescriptionLanguage::En),
             PRIMARY_PROMPT_CONCISE
         );
         assert_eq!(
-            primary_prompt(PromptProfile::Detailed),
+            primary_prompt(PromptProfile::Detailed, DescriptionLanguage::En),
             PRIMARY_PROMPT_DETAILED
+        );
+        assert_eq!(
+            primary_prompt(PromptProfile::Concise, DescriptionLanguage::PtBr),
+            PRIMARY_PROMPT_CONCISE_PT
+        );
+        assert_eq!(
+            primary_prompt(PromptProfile::Detailed, DescriptionLanguage::PtBr),
+            PRIMARY_PROMPT_DETAILED_PT
         );
         assert!(
             primary_num_predict(PromptProfile::Concise)
                 < primary_num_predict(PromptProfile::Detailed)
         );
         // The concise schema must still carry the fields the routing relies on.
-        let concise = primary_prompt(PromptProfile::Concise);
+        let concise = primary_prompt(PromptProfile::Concise, DescriptionLanguage::En);
         assert!(concise.contains("media_type"));
         assert!(concise.contains("contains_text"));
         assert!(concise.contains("description"));
@@ -2141,6 +2284,7 @@ mod tests {
         let vision = crate::models::VisionSettings {
             image_max_side: 1024,
             prompt_profile: PromptProfile::Concise,
+            description_language: DescriptionLanguage::En,
             image_filter: crate::config::ImageFilter::Auto,
             // Surya needs a provisioned venv; keep the smoke test self-contained.
             ocr_engine: OcrEngine::Off,

@@ -250,3 +250,50 @@ Primeira rodada (3 arquivos, 0,24 MB cada, JPEG de WhatsApp):
   1024 px) o duplicado de 32 ms vira **~1 %** do custo por arquivo nesta classe de tamanho.
 - Conclusão preliminar: para JPEGs pequenos o pipeline não paga; o ganho mora nos arquivos
   grandes (12–14 MP) e na **paralelização** da fase 2, que hoje usa 1 core.
+
+## 8. Idioma da descrição — PT-BR vs inglês (2026-10-27)
+
+Script: `scripts/bench-description-language.py` (12 fotos reais do índice, `qwen2.5vl:3b`,
+`image_max_side = 768`, `num_ctx = 4096`, `format: json`, temperatura 0, ordem das chamadas
+alternada para cancelar o cache de imagem do Ollama).
+
+| Variante | tokens de saída | decode | observação |
+|---|---|---|---|
+| EN (prompt atual) | 46,2 | 0,38 s | |
+| PT-BR, limite de 12 palavras | **43,2** | **0,35 s** | 12/12 JSON válido |
+| PT-BR, limite de 16 palavras | 61,2 | 0,50 s | 1/12 entrou em loop até o teto de 180 tokens |
+| EN + request de tradução | 46,2 + 15 | 0,38 + 0,15 s | **+18 a 23 %** por imagem |
+
+Conclusões:
+
+- **O qwen2.5-VL escreve PT-BR nativamente e o custo é nulo** (menos tokens que em inglês,
+  porque diz o mesmo em menos palavras). O delta é ~0,03 s/imagem: ~30 min em 58,7 mil
+  arquivos, ~2 % de uma rodada de 22 h.
+- **Não vale traduzir depois**: um request extra por arquivo (+18–23 %) e a tradução do 3b
+  erra (medido: "Two men lighting a candle" → `Dois pessoas acendendo uma vela`;
+  "Man surfing on a purple board" → `Praticando surf de man oceano`).
+- **O limite de 12 palavras não pode subir**: com 16 o modelo entrou em repetição
+  (`Pessoa de pé em pé de pé de pé…`), que é o `token repeat limit` já documentado em
+  `classify.rs`.
+- Qualidade: PT-BR no 3b é mais **telegráfico** e às vezes pior que o inglês
+  (`Girl blowing out candle on birthday cake` → `jovem segurando algo invisível`). Por isso
+  as linhas antigas são convertidas por **tradução** (que herda a análise boa em inglês) e
+  não por uma nova passada de visão.
+
+Medição da conversão das linhas existentes (`descriptions.rs`, texto puro, sem imagem):
+0,09–0,14 s por linha em regime, ~8 min para as 3.664 linhas descritas do índice atual.
+
+Duas armadilhas medidas na conversão:
+
+- placeholder (`⟦0⟧`) é **descartado** pelo modelo: 7 de 8 linhas voltaram sem ele;
+- mandar o marcador no prompt faz o modelo **traduzi-lo** (`[Doc: bank_transfer]` →
+  `[Documento: transferência bancária]`), o que quebra `document_kind_of` e o bucket de
+  documentos.
+
+Solução: os trechos entre colchetes **não são enviados** (`split_markers`), a prosa é
+traduzida e os bytes originais dos marcadores são recolocados (`join_markers`) — 10 de 10
+linhas preservaram todos os marcadores.
+
+Busca: verificado contra o tokenizer real (`porter unicode61`) — acentos são dobrados nos
+dois sentidos (`coração` = `coracao`), plurais casam (`casamento` = `casamentos`) e prefixo
+funciona (`anivers*`, `crian*`). Só flexão verbal não casa (`nadar` ≠ `nadando`, `nada*` casa).

@@ -235,12 +235,16 @@ fn cache_path() -> Option<PathBuf> {
 }
 
 fn cache_key(root: &Path, model: &str, settings: &VisionSettings, gpu_signature: &str) -> String {
+    // The description language is part of the key: the prompt differs in length and in
+    // the language of its output, and a measurement taken with the other one is not the
+    // measurement this scan will reproduce.
     format!(
-        "{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}",
         root.display(),
         model,
         settings.image_max_side,
         settings.prompt_profile.as_str(),
+        settings.description_language.as_str(),
         settings.image_filter.as_str(),
         gpu_signature
     )
@@ -326,7 +330,12 @@ pub fn estimate(
                 continue;
             }
         };
-        let probe = crate::classify::probe_primary(model, &prepared, settings.prompt_profile);
+        let probe = crate::classify::probe_primary(
+            model,
+            &prepared,
+            settings.prompt_profile,
+            settings.description_language,
+        );
         if !probe.ok {
             continue;
         }
@@ -573,17 +582,26 @@ mod tests {
             image_filter: crate::config::ImageFilter::Box,
             ..concise
         };
+        let english = VisionSettings {
+            description_language: crate::config::DescriptionLanguage::En,
+            ..concise
+        };
         let k1 = cache_key(root, "qwen2.5vl:3b", &concise, "gpu-12gb");
         let k2 = cache_key(root, "qwen2.5vl:3b", &detailed, "gpu-12gb");
         let k3 = cache_key(root, "qwen2.5vl:7b", &concise, "gpu-12gb");
         let k4 = cache_key(root, "qwen2.5vl:3b", &concise, "gpu-8gb");
         let k5 = cache_key(root, "qwen2.5vl:3b", &boxed, "gpu-12gb");
+        let k6 = cache_key(root, "qwen2.5vl:3b", &english, "gpu-12gb");
         assert_ne!(k1, k2);
         assert_ne!(k1, k3);
         assert_ne!(k1, k4);
         assert_ne!(
             k1, k5,
             "changing the filter must invalidate the calibration"
+        );
+        assert_ne!(
+            k1, k6,
+            "the description language changes the prompt, so the measurement differs"
         );
     }
 

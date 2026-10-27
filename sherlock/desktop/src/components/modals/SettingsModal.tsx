@@ -1,6 +1,14 @@
 import { useEffect, useState } from "react";
-import { getVisionSettings, updateSettings } from "../../api";
+import {
+  cancelDescriptionConversion,
+  convertExistingDescriptions,
+  getDescriptionLanguageStatus,
+  getVisionSettings,
+  updateSettings,
+} from "../../api";
 import type {
+  DescriptionLanguageProgress,
+  DescriptionLanguageSetting,
   ImageFilterSetting,
   SettingsUpdatePayload,
   StartupScanSetting,
@@ -29,6 +37,11 @@ const IMAGE_FILTERS: { value: ImageFilterSetting; label: string; hint: string }[
   { value: "lanczos", label: "Lanczos3", hint: "sharpest text, three times slower" },
 ];
 
+const DESCRIPTION_LANGUAGES: { value: DescriptionLanguageSetting; label: string }[] = [
+  { value: "pt_br", label: "Português (Brasil)" },
+  { value: "en", label: "English" },
+];
+
 const OCR_ENGINES: { value: VisionOcrEngine; label: string }[] = [
   { value: "llm", label: "LLM (multimodal model)" },
   { value: "surya", label: "Surya (isolated venv)" },
@@ -48,6 +61,7 @@ function toPayload(settings: VisionSettings): SettingsUpdatePayload {
     model: settings.modelOverride,
     imageMaxSide: settings.imageMaxSide,
     promptProfile: settings.promptProfile,
+    descriptionLanguage: settings.descriptionLanguage,
     imageFilter: settings.imageFilter,
     ocrEngine: settings.ocrEngine,
     startupScan: settings.startupScan,
@@ -69,6 +83,9 @@ export default function SettingsModal({ onClose, onSaved }: Props) {
   const [settings, setSettings] = useState<VisionSettings | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** Last known state of the description conversion pass (polled while it runs). */
+  const [conversion, setConversion] = useState<DescriptionLanguageProgress | null>(null);
+  const [converting, setConverting] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -79,10 +96,62 @@ export default function SettingsModal({ onClose, onSaved }: Props) {
       .catch((err: unknown) => {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err));
       });
+    // A pass may already be running: show its counters instead of a stale "Convert".
+    getDescriptionLanguageStatus()
+      .then((status) => {
+        if (cancelled || !status) return;
+        setConversion(status);
+        setConverting(status.phase === "converting");
+      })
+      .catch(() => {
+        // The status command is best-effort; a failure here must not block the form.
+      });
     return () => {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (!converting) return;
+    const id = window.setInterval(() => {
+      getDescriptionLanguageStatus()
+        .then((status) => {
+          setConversion(status);
+          if (!status || status.phase !== "converting") setConverting(false);
+        })
+        .catch(() => setConverting(false));
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [converting]);
+
+  /**
+   * Persist what the form shows, then rewrite the descriptions already in the index.
+   *
+   * Saving first is what makes the button honest: the backend converts into
+   * `settings.toml`, not into whatever is selected on screen.
+   */
+  async function startConversion() {
+    if (!settings) return;
+    setError(null);
+    try {
+      const saved = await updateSettings(toPayload(settings));
+      setSettings(saved);
+      onSaved?.(saved);
+      setConverting(true);
+      await convertExistingDescriptions();
+    } catch (err: unknown) {
+      setConverting(false);
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function stopConversion() {
+    try {
+      await cancelDescriptionConversion();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
 
   async function save() {
     if (!settings) return;
@@ -154,6 +223,52 @@ export default function SettingsModal({ onClose, onSaved }: Props) {
                   <option key={option.value} value={option.value}>{option.label}</option>
                 ))}
               </select>
+            </div>
+
+            <div className="settings-field">
+              <label htmlFor="settings-language">Description language</label>
+              <select
+                id="settings-language"
+                value={settings.descriptionLanguage}
+                onChange={(e) =>
+                  patch({ descriptionLanguage: e.target.value as DescriptionLanguageSetting })
+                }
+              >
+                {DESCRIPTION_LANGUAGES.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+              <span className="settings-hint">
+                What new scans write, and what the search box matches on. Identifiers such
+                as <code>[Doc: …]</code>, the media types and the OCR text stay English.
+              </span>
+            </div>
+
+            <div className="settings-field">
+              <span className="settings-hint">
+                Descriptions already in the index keep their language until they are
+                converted. The conversion is text-only — no image is read — so it takes
+                minutes instead of a full scan.
+              </span>
+              {converting ? (
+                <div className="settings-conversion">
+                  <span>
+                    Converting… {conversion?.processed ?? 0} / {conversion?.total ?? 0}
+                    {conversion ? ` (${conversion.converted} converted, ${conversion.skipped} skipped, ${conversion.failed} failed)` : ""}
+                  </span>
+                  <button type="button" onClick={stopConversion}>Cancel</button>
+                </div>
+              ) : (
+                <button type="button" onClick={startConversion} disabled={saving}>
+                  Convert existing descriptions
+                </button>
+              )}
+              {!converting && conversion && conversion.phase !== "converting" && (
+                <span className="settings-hint" role="status">
+                  Last run: {conversion.converted} converted, {conversion.skipped} skipped,{" "}
+                  {conversion.failed} failed ({conversion.phase}).
+                </span>
+              )}
             </div>
 
             <div className="settings-field">

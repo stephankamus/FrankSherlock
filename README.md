@@ -70,6 +70,13 @@ image_max_side = 1024
 # "concise" (default) or "detailed" (adds anime series/character candidates).
 prompt_profile = "concise"
 
+# Language of the description (what search matches on): "pt_br" (default) or "en".
+# Only free text follows this: media types, enum values, OCR text and the
+# "[Doc: …]" style markers stay English. Rows already described keep their
+# language — "Convert existing descriptions" in the settings screen rewrites them
+# with a text-only pass (minutes, no image is read).
+description_language = "pt_br"
+
 # OCR for screenshots/documents: "off", "llm" (default, fast) or "surya"
 # (better recall, but spawns a Python process per image).
 ocr_engine = "llm"

@@ -162,6 +162,18 @@ image_max_side = 1024
 # - detailed  adds anime series/character candidates: ~78 output tokens (slower)
 prompt_profile = "concise"
 
+# Language of the free-text description (what the search box matches on).
+# - pt_br  Brazilian Portuguese (default)
+# - en     English
+# Measured on qwen2.5vl:3b at 768 px: PT-BR costs the same as English (43 vs 46
+# output tokens, 0.35 s vs 0.38 s of decode), so this is a reading choice, not a
+# speed knob. JSON keys, enum values, OCR text and the `[Doc: …]` style markers
+# stay English either way.
+# Rows already in the index keep the description they have: use "Converter
+# descrições existentes" in the settings screen to rewrite them (a text-only
+# pass, no image re-encoding).
+description_language = "pt_br"
+
 # Resampling filter used to downscale the image sent to the vision model.
 # - auto     area-average for photos/JPEG (fast), Lanczos3 for screenshots/documents
 # - box      always area-average: the fastest option
@@ -207,6 +219,9 @@ pub const DEFAULT_DEDUPE_DHASH_DISTANCE: u32 = 6;
 pub const MAX_DEDUPE_DHASH_DISTANCE: u32 = 16;
 /// Default resampler for the image handed to the model.
 pub const DEFAULT_IMAGE_FILTER: ImageFilter = ImageFilter::Auto;
+/// Default language for the free-text description. PT-BR is the project owner's
+/// native language and reads better for the people who search the library.
+pub const DEFAULT_DESCRIPTION_LANGUAGE: DescriptionLanguage = DescriptionLanguage::PtBr;
 /// Smallest accepted longest-side. Below this the model starts losing small subjects.
 pub const MIN_IMAGE_MAX_SIDE: u32 = 640;
 /// Largest accepted longest-side. Above this Ollama caps image tokens anyway.
@@ -237,6 +252,56 @@ impl PromptProfile {
             "detailed" | "full" => Some(PromptProfile::Detailed),
             _ => None,
         }
+    }
+}
+
+/// Language the free-text part of a description is written in.
+///
+/// Measured on `qwen2.5vl:3b` at 768 px with the concise prompt (`scripts/
+/// bench-description-language.py`, 12 images from a real library): PT-BR cost
+/// 43.2 output tokens / 0.35 s of decode against 46.2 / 0.38 s for English, so
+/// the choice is about who reads the library, not about speed.
+///
+/// Only free text follows this setting. The JSON keys, the enum values
+/// (`photo`, `receipt`, …), the OCR text and the machine markers
+/// (`Password-protected PDF (skipped)`, `[Doc: …]`) stay English: the values are
+/// matched in Rust and one marker is compared in SQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DescriptionLanguage {
+    /// Brazilian Portuguese.
+    PtBr,
+    En,
+}
+
+impl DescriptionLanguage {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DescriptionLanguage::PtBr => "pt_br",
+            DescriptionLanguage::En => "en",
+        }
+    }
+
+    /// Accepts the values exposed in `settings.toml` and by the UI.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "pt_br" | "pt-br" | "pt" | "ptbr" | "portuguese" | "portugues" | "português" => {
+                Some(DescriptionLanguage::PtBr)
+            }
+            "en" | "en_us" | "en-us" | "english" | "ingles" | "inglês" => {
+                Some(DescriptionLanguage::En)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether a `files.description_lang` tag is already this language.
+    ///
+    /// `""` is the tag of a row written before the column existed: it is treated as
+    /// "unknown", so a conversion pass picks those rows up instead of trusting the
+    /// setting they were written under.
+    pub fn owns_tag(&self, tag: &str) -> bool {
+        !tag.is_empty() && DescriptionLanguage::parse(tag) == Some(*self)
     }
 }
 
@@ -348,6 +413,8 @@ pub struct RuntimeSettings {
     /// Longest side of the image handed to the model. `0` = original bytes.
     pub image_max_side: u32,
     pub prompt_profile: PromptProfile,
+    /// Language of the free-text description (PT-BR by default).
+    pub description_language: DescriptionLanguage,
     /// Resampler used when downscaling the image for the model.
     pub image_filter: ImageFilter,
     pub ocr_engine: OcrEngine,
@@ -370,6 +437,7 @@ impl Default for RuntimeSettings {
             model_override: None,
             image_max_side: DEFAULT_IMAGE_MAX_SIDE,
             prompt_profile: PromptProfile::Concise,
+            description_language: DEFAULT_DESCRIPTION_LANGUAGE,
             image_filter: DEFAULT_IMAGE_FILTER,
             ocr_engine: OcrEngine::Llm,
             startup_scan: StartupScan::Ask,
@@ -391,6 +459,8 @@ pub struct SettingsUpdate {
     pub model: Option<String>,
     pub image_max_side: u32,
     pub prompt_profile: String,
+    /// `pt_br` | `en`.
+    pub description_language: String,
     pub image_filter: String,
     pub ocr_engine: String,
     pub startup_scan: String,
@@ -416,6 +486,13 @@ impl RuntimeSettings {
         }
         let prompt_profile = PromptProfile::parse(&update.prompt_profile)
             .ok_or_else(|| format!("invalid prompt_profile '{}'", update.prompt_profile))?;
+        let description_language = DescriptionLanguage::parse(&update.description_language)
+            .ok_or_else(|| {
+                format!(
+                    "invalid description_language '{}'",
+                    update.description_language
+                )
+            })?;
         let image_filter = ImageFilter::parse(&update.image_filter)
             .ok_or_else(|| format!("invalid image_filter '{}'", update.image_filter))?;
         let ocr_engine = OcrEngine::parse(&update.ocr_engine)
@@ -426,6 +503,7 @@ impl RuntimeSettings {
         self.model_override = model_override;
         self.image_max_side = Self::normalize_image_max_side(update.image_max_side);
         self.prompt_profile = prompt_profile;
+        self.description_language = description_language;
         self.image_filter = image_filter;
         self.ocr_engine = ocr_engine;
         self.startup_scan = startup_scan;
@@ -518,6 +596,15 @@ fn parse_runtime_settings(data: &str) -> AppResult<RuntimeSettings> {
                     ),
                 }
             }
+            "description_language" => {
+                let parsed = parse_settings_string(value.trim())?;
+                match DescriptionLanguage::parse(&parsed) {
+                    Some(v) => settings.description_language = v,
+                    None => log::warn!(
+                        "settings.toml: ignoring description_language '{parsed}' (expected: pt_br | en)"
+                    ),
+                }
+            }
             "image_filter" => {
                 let parsed = parse_settings_string(value.trim())?;
                 match ImageFilter::parse(&parsed) {
@@ -587,6 +674,7 @@ pub fn save_runtime_settings(settings: &RuntimeSettings) -> AppResult<()> {
         "model_override",
         "image_max_side",
         "prompt_profile",
+        "description_language",
         "image_filter",
         "ocr_engine",
         "startup_scan",
@@ -612,6 +700,13 @@ pub fn save_runtime_settings(settings: &RuntimeSettings) -> AppResult<()> {
         format!(
             "prompt_profile = {}",
             serde_json::json!(settings.prompt_profile.as_str())
+        ),
+    );
+    replacements.insert(
+        "description_language",
+        format!(
+            "description_language = {}",
+            serde_json::json!(settings.description_language.as_str())
         ),
     );
     replacements.insert(
@@ -873,7 +968,43 @@ mod tests {
         assert_eq!(settings.model_override, None);
         assert_eq!(settings.image_max_side, DEFAULT_IMAGE_MAX_SIDE);
         assert_eq!(settings.prompt_profile, PromptProfile::Concise);
+        assert_eq!(
+            settings.description_language,
+            DescriptionLanguage::PtBr,
+            "PT-BR is the default so a fresh install reads in the owner's language"
+        );
         assert_eq!(settings.ocr_engine, OcrEngine::Llm);
+    }
+
+    #[test]
+    fn parse_runtime_settings_description_language() {
+        let en = parse_runtime_settings(r#"description_language = "en""#).expect("settings");
+        assert_eq!(en.description_language, DescriptionLanguage::En);
+
+        let pt = parse_runtime_settings(r#"description_language = "pt-br""#).expect("settings");
+        assert_eq!(
+            pt.description_language,
+            DescriptionLanguage::PtBr,
+            "the hyphenated spelling is what people type"
+        );
+
+        let invalid =
+            parse_runtime_settings(r#"description_language = "klingon""#).expect("settings");
+        assert_eq!(
+            invalid.description_language, DEFAULT_DESCRIPTION_LANGUAGE,
+            "an unknown language keeps the default instead of failing the whole file"
+        );
+    }
+
+    #[test]
+    fn description_language_owns_tag() {
+        assert!(DescriptionLanguage::PtBr.owns_tag("pt_br"));
+        assert!(DescriptionLanguage::En.owns_tag("en"));
+        assert!(
+            !DescriptionLanguage::PtBr.owns_tag(""),
+            "a row written before the column existed must be converted"
+        );
+        assert!(!DescriptionLanguage::En.owns_tag("pt_br"));
     }
 
     #[test]
@@ -943,6 +1074,7 @@ mod tests {
             model: Some("qwen2.5vl:7b".to_string()),
             image_max_side: 768,
             prompt_profile: "detailed".to_string(),
+            description_language: "en".to_string(),
             image_filter: "box".to_string(),
             ocr_engine: "surya".to_string(),
             startup_scan: "classify_only".to_string(),
@@ -965,6 +1097,7 @@ mod tests {
         assert_eq!(settings.model_override.as_deref(), Some("qwen2.5vl:7b"));
         assert_eq!(settings.image_max_side, MAX_IMAGE_MAX_SIDE);
         assert_eq!(settings.prompt_profile, PromptProfile::Detailed);
+        assert_eq!(settings.description_language, DescriptionLanguage::En);
         assert_eq!(settings.image_filter, ImageFilter::Box);
         assert_eq!(settings.ocr_engine, OcrEngine::Surya);
         assert_eq!(settings.startup_scan, StartupScan::ClassifyOnly);
@@ -988,6 +1121,12 @@ mod tests {
         let error = settings.apply_update(&update).expect_err("must reject");
         assert!(error.contains("prompt_profile"), "{error}");
         assert_eq!(settings, before, "a rejected update must change nothing");
+
+        let mut update = full_update();
+        update.description_language = "esperanto".to_string();
+        let error = settings.apply_update(&update).expect_err("must reject");
+        assert!(error.contains("description_language"), "{error}");
+        assert_eq!(settings, before, "a rejected update must change nothing");
     }
 
     #[test]
@@ -1001,6 +1140,7 @@ mod tests {
             model_override: Some("qwen2.5vl:3b".to_string()),
             image_max_side: 768,
             prompt_profile: PromptProfile::Detailed,
+            description_language: DescriptionLanguage::En,
             image_filter: ImageFilter::Box,
             ocr_engine: OcrEngine::Off,
             startup_scan: StartupScan::ClassifyOnly,
@@ -1015,6 +1155,7 @@ mod tests {
         assert!(text.contains("model_override = \"qwen2.5vl:3b\""));
         assert!(text.contains("image_max_side = 768"));
         assert!(text.contains("prompt_profile = \"detailed\""));
+        assert!(text.contains("description_language = \"en\""));
         assert!(text.contains("image_filter = \"box\""));
         assert!(text.contains("ocr_engine = \"off\""));
         assert!(text.contains("startup_scan = \"classify_only\""));

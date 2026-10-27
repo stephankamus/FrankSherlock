@@ -6,6 +6,7 @@ import type {
   CompactResult,
   DbStats,
   DeleteFilesResult,
+  DescriptionLanguageProgress,
   DuplicatesResponse,
   FaceDetectProgress,
   FaceInfo,
@@ -228,6 +229,24 @@ export async function repairThumbnails(rootId?: number | null): Promise<boolean>
 
 export async function getThumbRepairStatus(): Promise<ThumbRepairProgress | null> {
   return invoke<ThumbRepairProgress | null>("thumb_repair_status");
+}
+
+/**
+ * Rewrite the descriptions already in the index into `description_language`.
+ *
+ * Text in, text out: no image is read and no thumbnail is rebuilt, so a library
+ * described in another language is converted in minutes instead of a full pass.
+ */
+export async function convertExistingDescriptions(): Promise<boolean> {
+  return invoke<boolean>("convert_existing_descriptions");
+}
+
+export async function getDescriptionLanguageStatus(): Promise<DescriptionLanguageProgress | null> {
+  return invoke<DescriptionLanguageProgress | null>("description_language_status");
+}
+
+export async function cancelDescriptionConversion(): Promise<boolean> {
+  return invoke<boolean>("cancel_description_conversion");
 }
 
 export async function cancelThumbRepair(): Promise<boolean> {

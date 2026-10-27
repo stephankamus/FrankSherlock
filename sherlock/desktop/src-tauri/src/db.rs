@@ -362,6 +362,24 @@ fn run_migrations(conn: &mut Connection) -> AppResult<()> {
             CREATE INDEX IF NOT EXISTS idx_files_document_hint ON files(document_hint);
             "#,
         ),
+        // Migration 17: the language a description was written in.
+        //
+        // Why: `description` is the field the search box matches on, and the language
+        // it is written in became a setting (`description_language`, PT-BR by default).
+        // Without this column the only way to tell an English row from a Portuguese one
+        // would be to guess from the words, and a conversion pass could not be resumed:
+        // it would re-translate the whole library every time it was started.
+        //
+        // `''` means "unknown" — every row written before this migration. A conversion
+        // pass therefore picks those rows up instead of trusting the setting they were
+        // written under, and `lang_hint` is untouched: that one is the language of the
+        // OCR text, not of the description.
+        M::up(
+            r#"
+            ALTER TABLE files ADD COLUMN description_lang TEXT NOT NULL DEFAULT '';
+            CREATE INDEX IF NOT EXISTS idx_files_description_lang ON files(description_lang);
+            "#,
+        ),
     ]);
 
     migrations
@@ -1162,6 +1180,7 @@ pub fn copy_classification(db_path: &Path, target_id: i64, source_id: i64) -> Ap
         "UPDATE files SET \
              media_type = (SELECT media_type FROM files WHERE id = ?2), \
              description = (SELECT description FROM files WHERE id = ?2), \
+             description_lang = (SELECT description_lang FROM files WHERE id = ?2), \
              canonical_mentions = (SELECT canonical_mentions FROM files WHERE id = ?2), \
              confidence = (SELECT confidence FROM files WHERE id = ?2), \
              lang_hint = (SELECT lang_hint FROM files WHERE id = ?2), \
@@ -1490,7 +1509,8 @@ pub fn stamp_modified_rows(
         let mut stmt = tx.prepare(
             "UPDATE files
                 SET mtime_ns = ?2, size_bytes = ?3, scan_marker = ?4, updated_at = ?5,
-                    description = '', extracted_text = '', canonical_mentions = '',
+                    description = '', description_lang = '', extracted_text = '',
+                    canonical_mentions = '',
                     confidence = 0.0, lang_hint = 'unknown', fingerprint = '',
                     dhash = NULL, thumb_path = NULL, document_hint = '',
                     classify_state = '', failure_kind = '', failure_detail = '',
@@ -1972,6 +1992,12 @@ pub fn upsert_file_record(db_path: &Path, record: &FileRecordUpsert) -> AppResul
             abs_path = excluded.abs_path,
             media_type = excluded.media_type,
             description = excluded.description,
+            -- The tag follows the text: a rewritten description is of unknown
+            -- language until a classifier or a conversion pass says otherwise.
+            description_lang = CASE
+                WHEN files.description = excluded.description THEN files.description_lang
+                ELSE ''
+            END,
             extracted_text = excluded.extracted_text,
             canonical_mentions = excluded.canonical_mentions,
             confidence = excluded.confidence,
@@ -2498,7 +2524,8 @@ pub fn reset_root_classifications(
         tx.execute(
             &format!(
                 "UPDATE files
-                 SET description = '', extracted_text = '', canonical_mentions = '',
+                 SET description = '', description_lang = '', extracted_text = '',
+                     canonical_mentions = '',
                      confidence = 0, lang_hint = '', document_hint = '', updated_at = ?2
                  WHERE root_id = ?1 AND deleted_at IS NULL AND NOT {PENDING_CLASSIFICATION_SQL}"
             ),
@@ -2993,6 +3020,9 @@ pub fn update_file_classification(
     confidence: f32,
     lang_hint: &str,
     document_hint: &str,
+    // Language the description was written in (`pt_br` / `en`), from
+    // `settings.description_language`. Empty when the writer cannot know.
+    description_lang: &str,
 ) -> AppResult<()> {
     let conn = open_conn(db_path)?;
     let tx = conn.unchecked_transaction()?;
@@ -3003,7 +3033,7 @@ pub fn update_file_classification(
         // selection. `classify_attempts` is kept: it is history, not state.
         "UPDATE files SET media_type = ?2, description = ?3, extracted_text = ?4,
                 canonical_mentions = ?5, confidence = ?6, lang_hint = ?7, updated_at = ?8,
-                document_hint = ?9,
+                document_hint = ?9, description_lang = ?10,
                 classify_state = '', failure_kind = '', failure_detail = '', failed_at = NULL
          WHERE id = ?1 AND deleted_at IS NULL",
         params![
@@ -3015,8 +3045,74 @@ pub fn update_file_classification(
             confidence,
             lang_hint,
             now,
-            document_hint
+            document_hint,
+            description_lang
         ],
+    )?;
+    refresh_fts(&tx, file_id)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// One row of the "convert existing descriptions" work list.
+#[derive(Debug, Clone)]
+pub struct DescriptionRow {
+    pub id: i64,
+    /// What the row is, so the conversion can skip machine markers per type.
+    pub media_type: String,
+    pub description: String,
+    /// Empty when the row was written before the column existed.
+    pub description_lang: String,
+}
+
+/// Described rows whose text is not yet in `lang_tag`.
+///
+/// Machine markers are excluded by the caller, not here: this is the honest work
+/// list, and `description <> ''` is the same marker the backlog uses to mean "this
+/// row was classified" ([`PENDING_CLASSIFICATION_SQL`]).
+pub fn list_descriptions_needing_language(
+    db_path: &Path,
+    lang_tag: &str,
+) -> AppResult<Vec<DescriptionRow>> {
+    let conn = open_conn(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, media_type, description, description_lang
+           FROM files
+          WHERE deleted_at IS NULL
+            AND description <> ''
+            AND description_lang <> ?1
+          ORDER BY id",
+    )?;
+    let rows = stmt
+        .query_map(params![lang_tag], |row| {
+            Ok(DescriptionRow {
+                id: row.get(0)?,
+                media_type: row.get(1)?,
+                description: row.get(2)?,
+                description_lang: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Rewrite one description and refresh its FTS entry.
+///
+/// The tag is written in the same statement as the text, so an interrupted pass
+/// cannot leave a Portuguese description labelled English — the label is what makes
+/// the conversion resumable.
+pub fn set_file_description(
+    db_path: &Path,
+    file_id: i64,
+    description: &str,
+    description_lang: &str,
+) -> AppResult<()> {
+    let conn = open_conn(db_path)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE files SET description = ?2, description_lang = ?3, updated_at = ?4
+          WHERE id = ?1 AND deleted_at IS NULL",
+        params![file_id, description, description_lang, now_epoch_secs()],
     )?;
     refresh_fts(&tx, file_id)?;
     tx.commit()?;
@@ -5431,7 +5527,7 @@ mod tests {
         // A successful classification clears the failure, so the row stops counting
         // as failed without ever leaving the index.
         update_file_classification(
-            &db_path, failed, "photo", "a beach", "", "", 0.4, "en", "none",
+            &db_path, failed, "photo", "a beach", "", "", 0.4, "en", "none", "en",
         )
         .expect("classify");
         assert_eq!(
@@ -5470,6 +5566,7 @@ mod tests {
             0.9,
             "pt",
             "receipt",
+            "pt_br",
         )
         .expect("classify");
 
@@ -5526,8 +5623,19 @@ mod tests {
             let id =
                 upsert_file_record(&db_path, &sample_record(root_id, rel, &format!("fp-{rel}")))
                     .expect("row");
-            update_file_classification(&db_path, id, "photo", "described", "", "", 0.8, "en", hint)
-                .expect("classify");
+            update_file_classification(
+                &db_path,
+                id,
+                "photo",
+                "described",
+                "",
+                "",
+                0.8,
+                "en",
+                hint,
+                "en",
+            )
+            .expect("classify");
         }
 
         let bucket = list_document_rows(&db_path, root_id).expect("bucket");
@@ -5914,6 +6022,77 @@ mod tests {
         };
         let page2 = search_images(&db_path, &req2).expect("page2");
         assert_eq!(page2.items.len(), 120);
+    }
+
+    /// The conversion pass needs a work list that is resumable (the tag) and a rewrite
+    /// that keeps search in sync — a description changed without the FTS update would
+    /// keep matching the words it no longer has.
+    #[test]
+    fn description_language_worklist_and_rewrite() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/lang").expect("root");
+        let english = upsert_file_record(&db_path, &sample_record(root_id, "en.jpg", "fp-en"))
+            .expect("en row");
+        let portuguese = upsert_file_record(&db_path, &sample_record(root_id, "pt.jpg", "fp-pt"))
+            .expect("pt row");
+        update_file_classification(
+            &db_path,
+            english,
+            "photo",
+            "man on the beach",
+            "",
+            "",
+            0.9,
+            "en",
+            "none",
+            "en",
+        )
+        .expect("classify en");
+        update_file_classification(
+            &db_path,
+            portuguese,
+            "photo",
+            "criança na praia",
+            "",
+            "",
+            0.9,
+            "pt",
+            "none",
+            "pt_br",
+        )
+        .expect("classify pt");
+
+        let worklist = list_descriptions_needing_language(&db_path, "pt_br").expect("worklist");
+        assert_eq!(worklist.len(), 1, "only the English row is pending");
+        assert_eq!(worklist[0].id, english);
+        assert_eq!(worklist[0].description_lang, "en");
+
+        set_file_description(&db_path, english, "homem na praia", "pt_br").expect("rewrite");
+        assert!(
+            list_descriptions_needing_language(&db_path, "pt_br")
+                .expect("worklist")
+                .is_empty(),
+            "a converted row must not come back"
+        );
+
+        let conn = open_conn(&db_path).expect("open");
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM files_fts WHERE files_fts MATCH 'homem*'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("fts");
+        assert_eq!(indexed, 1, "the new text is searchable");
+        let stale: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM files_fts WHERE files_fts MATCH 'beach*'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("fts");
+        assert_eq!(stale, 0, "the old text is gone from the index");
     }
 
     #[test]
@@ -6744,11 +6923,21 @@ mod tests {
         init_database(&db_path).expect("init");
 
         let conn = open_conn(&db_path).expect("open");
-        // Verify user_version is set (17 migrations applied → version 17)
+        // Verify user_version is set (18 migrations applied → version 18)
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 17);
+        assert_eq!(version, 18);
+
+        // Migration 17 records the language each description was written in.
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('files')")
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+        assert!(columns.contains(&"description_lang".to_string()));
 
         // Migration 13 adds the non-destructive root availability columns.
         let root_columns: Vec<String> = {
@@ -6807,8 +6996,8 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        // We have 17 migrations (indices 0..16), so user_version should be 17
-        assert_eq!(version, 17);
+        // We have 18 migrations (indices 0..17), so user_version should be 18
+        assert_eq!(version, 18);
     }
 
     #[test]
@@ -7460,7 +7649,7 @@ mod tests {
         let classified =
             upsert_file_record(&db_path, &sample_record(root_id, "a.jpg", "fp-a")).expect("a");
         update_file_classification(
-            &db_path, classified, "photo", "a beach", "", "", 0.4, "en", "none",
+            &db_path, classified, "photo", "a beach", "", "", 0.4, "en", "none", "en",
         )
         .expect("classify");
 

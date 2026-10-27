@@ -24,6 +24,7 @@ const settings: VisionSettings = {
   modelOverride: null,
   imageMaxSide: 1024,
   promptProfile: "concise",
+  descriptionLanguage: "pt_br",
   ocrEngine: "llm",
   startupScan: "ask",
   imageFilter: "auto",

@@ -1,6 +1,7 @@
 mod classify;
 mod config;
 mod db;
+mod descriptions;
 mod error;
 mod exif;
 mod face;
@@ -63,6 +64,10 @@ struct AppState {
     recluster_progress: Arc<Mutex<Option<models::ReclusterProgress>>>,
     thumb_repair_progress: Arc<Mutex<Option<models::ThumbRepairProgress>>>,
     thumb_repair_cancel: Arc<AtomicBool>,
+    /// Live counters of the "convert existing descriptions" pass, polled by the
+    /// settings screen.
+    description_language_progress: Arc<Mutex<Option<models::DescriptionLanguageProgress>>>,
+    description_language_cancel: Arc<AtomicBool>,
     /// Live counters of the producer/consumer pipeline (backlog, retry and the
     /// pipeline half of a `full`), polled by the sidebar.
     backlog_progress: Arc<Mutex<Option<models::BacklogProgress>>>,
@@ -758,6 +763,139 @@ fn cancel_thumb_repair(state: State<'_, AppState>) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Rewrite the descriptions already in the index into the configured language.
+///
+/// `description_language` only governs what the classifier writes from now on, and an
+/// existing index is mostly older than the setting. This pass translates the rows that
+/// are already described — text in, text out, no image read — so the corpus becomes
+/// consistent without paying for a full re-classification. Progress and cancellation
+/// follow the thumbnail-repair pattern.
+#[tauri::command]
+async fn convert_existing_descriptions(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<bool, String> {
+    require_writable(state.inner())?;
+    if !state
+        .running_scan_jobs
+        .lock()
+        .expect("scan job mutex poisoned")
+        .is_empty()
+    {
+        return Err("Cannot rewrite descriptions while a scan is running".to_string());
+    }
+
+    let target = config::load_runtime_settings()
+        .map_err(|e| e.to_string())?
+        .description_language;
+
+    let app_state = state.inner().clone();
+    {
+        let mut progress = app_state
+            .description_language_progress
+            .lock()
+            .expect("description language mutex poisoned");
+        if progress.as_ref().is_some_and(|p| p.phase == "converting") {
+            return Err("Description conversion is already running".to_string());
+        }
+        *progress = Some(models::DescriptionLanguageProgress {
+            language: target.as_str().to_string(),
+            total: 0,
+            processed: 0,
+            converted: 0,
+            skipped: 0,
+            failed: 0,
+            started_at: unix_now_secs(),
+            phase: "converting".to_string(),
+            error: None,
+        });
+    }
+
+    app_state
+        .description_language_cancel
+        .store(false, Ordering::Relaxed);
+    let ctx = build_scan_context(&app_state, &app_handle);
+    let progress_arc = app_state.description_language_progress.clone();
+    let cancel = app_state.description_language_cancel.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let outcome = descriptions::convert_existing_descriptions(
+            &ctx.db_path,
+            &ctx.model,
+            target,
+            &cancel,
+            |summary| {
+                let mut guard = progress_arc
+                    .lock()
+                    .expect("description language mutex poisoned");
+                if let Some(p) = guard.as_mut() {
+                    p.total = summary.total;
+                    p.processed = summary.processed;
+                    p.converted = summary.converted;
+                    p.skipped = summary.skipped;
+                    p.failed = summary.failed;
+                }
+            },
+        );
+
+        let mut guard = progress_arc
+            .lock()
+            .expect("description language mutex poisoned");
+        match outcome {
+            Ok(summary) => {
+                if let Some(p) = guard.as_mut() {
+                    p.total = summary.total;
+                    p.processed = summary.processed;
+                    p.converted = summary.converted;
+                    p.skipped = summary.skipped;
+                    p.failed = summary.failed;
+                    p.phase = if cancel.load(Ordering::Relaxed) {
+                        "cancelled".to_string()
+                    } else {
+                        "done".to_string()
+                    };
+                }
+                log::info!(
+                    "Description conversion into {}: {} converted, {} skipped, {} failed of {}",
+                    target.as_str(),
+                    summary.converted,
+                    summary.skipped,
+                    summary.failed,
+                    summary.total
+                );
+            }
+            Err(e) => {
+                log::error!("Description conversion failed: {e}");
+                if let Some(p) = guard.as_mut() {
+                    p.phase = "failed".to_string();
+                    p.error = Some(e.to_string());
+                }
+            }
+        }
+    });
+
+    Ok(true)
+}
+
+#[tauri::command]
+fn description_language_status(
+    state: State<'_, AppState>,
+) -> Result<Option<models::DescriptionLanguageProgress>, String> {
+    Ok(state
+        .description_language_progress
+        .lock()
+        .expect("description language mutex poisoned")
+        .clone())
+}
+
+#[tauri::command]
+fn cancel_description_conversion(state: State<'_, AppState>) -> Result<bool, String> {
+    state
+        .description_language_cancel
+        .store(true, Ordering::Relaxed);
+    Ok(true)
+}
+
 /// Live counters of the backlog pass (`ScanMode::Backlog`), polled by the sidebar.
 ///
 /// Cancelling uses the normal `cancel_scan(job_id)`; the record carries the job
@@ -1194,6 +1332,7 @@ async fn retry_protected_pdfs(
                     classification.confidence,
                     &classification.lang_hint,
                     &classification.document_hint,
+                    scan_ctx.description_language.as_str(),
                 );
 
                 if let Some(ref tr) = thumb_result {
@@ -1275,6 +1414,7 @@ async fn reclassify_pdf(
             classification.confidence,
             &classification.lang_hint,
             &classification.document_hint,
+            scan_ctx.description_language.as_str(),
         );
 
         if let Some(ref tr) = thumb_result {
@@ -2021,6 +2161,7 @@ fn vision_settings_from_config() -> models::VisionSettings {
     models::VisionSettings {
         image_max_side: settings.image_max_side,
         prompt_profile: settings.prompt_profile,
+        description_language: settings.description_language,
         image_filter: settings.image_filter,
         ocr_engine: settings.ocr_engine,
     }
@@ -2050,6 +2191,7 @@ fn build_scan_context(app_state: &AppState, app_handle: &tauri::AppHandle) -> mo
         model: model_selection.scan_model,
         image_max_side: vision.image_max_side,
         prompt_profile: vision.prompt_profile,
+        description_language: vision.description_language,
         image_filter: vision.image_filter,
         ocr_engine: vision.ocr_engine,
         pdfium_lib_path,
@@ -2184,10 +2326,12 @@ fn spawn_scan_worker_if_needed(
     if let Some(overrides) = overrides.as_ref() {
         overrides.apply(&mut scan_ctx);
         log::info!(
-            "scan job {job_id}: running with overrides — model {}, {} px, profile {}, ocr {}",
+            "scan job {job_id}: running with overrides — model {}, {} px, profile {}, \
+             description language {}, ocr {}",
             scan_ctx.model,
             scan_ctx.image_max_side,
             scan_ctx.prompt_profile.as_str(),
+            scan_ctx.description_language.as_str(),
             scan_ctx.ocr_engine.as_str()
         );
     }
@@ -2428,6 +2572,8 @@ pub fn run() {
         recluster_progress: Arc::new(Mutex::new(None)),
         thumb_repair_progress: Arc::new(Mutex::new(None)),
         thumb_repair_cancel: Arc::new(AtomicBool::new(false)),
+        description_language_progress: Arc::new(Mutex::new(None)),
+        description_language_cancel: Arc::new(AtomicBool::new(false)),
         backlog_progress: Arc::new(Mutex::new(None)),
     };
 
@@ -2486,6 +2632,9 @@ pub fn run() {
             repair_thumbnails,
             thumb_repair_status,
             cancel_thumb_repair,
+            convert_existing_descriptions,
+            description_language_status,
+            cancel_description_conversion,
             backlog_status,
             retry_failed,
             failed_classifications,
