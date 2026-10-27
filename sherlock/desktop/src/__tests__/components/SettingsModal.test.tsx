@@ -51,6 +51,16 @@ describe("SettingsModal", () => {
     });
   });
 
+  it("opens the live log viewer from the logs entry", async () => {
+    const user = userEvent.setup();
+    const onOpenLogs = vi.fn();
+    render(<SettingsModal onClose={() => {}} onOpenLogs={onOpenLogs} />);
+
+    await user.click(await screen.findByRole("button", { name: "Open logs" }));
+
+    expect(onOpenLogs).toHaveBeenCalledTimes(1);
+  });
+
   it("exposes the settings that had no UI before", async () => {
     render(<SettingsModal onClose={() => {}} />);
 

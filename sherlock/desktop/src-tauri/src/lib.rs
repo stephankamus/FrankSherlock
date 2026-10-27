@@ -6,6 +6,7 @@ mod error;
 mod exif;
 mod face;
 mod llm;
+mod logs;
 mod models;
 mod pdf;
 mod platform;
@@ -3169,6 +3170,7 @@ pub fn run() {
         // CLI folder handling is delegated to the frontend via get_cli_folder_path.
         .invoke_handler(tauri::generate_handler![
             app_health,
+            logs::read_logs,
             get_app_paths,
             get_cli_folder_path,
             ensure_database,

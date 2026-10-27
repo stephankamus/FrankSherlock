@@ -56,6 +56,23 @@
   color: var(--text-secondary);
 }
 
+/* The logs entry point reads like a field, but the action is a plain button. */
+.settings-logs-btn {
+  align-self: flex-start;
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  padding: 6px 14px;
+  font: inherit;
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+}
+
+.settings-logs-btn:hover {
+  border-color: var(--border-focus);
+}
+
 .settings-loading {
   opacity: 0.7;
 }

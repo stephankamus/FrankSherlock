@@ -133,8 +133,45 @@
 
 /* ── Scanning indicator ──────────────────────────────────── */
 .scanning-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   color: var(--accent);
   font-weight: 500;
+}
+
+.scanning-indicator::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: scanning-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes scanning-pulse {
+  50% {
+    opacity: 0.2;
+  }
+}
+
+/* When it is a button, keep the text look but make the affordance obvious. */
+button.scanning-indicator {
+  border: none;
+  background: transparent;
+  padding: 0;
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+button.scanning-indicator:hover {
+  text-decoration: underline;
+}
+
+button.scanning-indicator:focus-visible {
+  outline: 1px solid var(--border-focus);
+  outline-offset: 2px;
 }
 
 /* ── Grid ─────────────────────────────────────────────────── */

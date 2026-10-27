@@ -49,6 +49,7 @@ import PropertiesModal from "./components/modals/PropertiesModal";
 import ModelInfoModal from "./components/modals/ModelInfoModal";
 import ModelPickerModal from "./components/modals/ModelPickerModal";
 import SettingsModal, { toSettingsPayload } from "./components/modals/SettingsModal";
+import LogsModal from "./components/modals/LogsModal";
 import CreateAlbumModal from "./components/modals/CreateAlbumModal";
 import CreateSmartFolderModal from "./components/modals/CreateSmartFolderModal";
 import { useToast } from "./hooks/useToast";
@@ -102,6 +103,11 @@ export default function App() {
    * scan start; without it the modal is just a settings screen.
    */
   const [showSettings, setShowSettings] = useState(false);
+  /**
+   * Live log viewer. Opened from the "Scanning..." indicator or from Settings,
+   * and stacked over the settings modal when it comes from there.
+   */
+  const [showLogs, setShowLogs] = useState(false);
   /**
    * Mirror of `settings.toml`, kept here so the root context menu can offer the
    * "read faces during scans" switch without opening the Settings modal. Refreshed
@@ -373,7 +379,7 @@ export default function App() {
   usePolling(POLL_MS, scanManager.pollRuntimeAndScans, [scanManager.trackedJobIds]);
   useInfiniteScroll(sentinelRef, onLoadMore, [items.length, total, loadingMore]);
 
-  const hasModalOpen = !!(confirmDeleteFiles || renameItem || editMetadataItem || propertiesItem || albumManager.showCreateAlbum || smartFolderManager.showCreateSmartFolder || visionPicker || startupPrompt);
+  const hasModalOpen = !!(confirmDeleteFiles || renameItem || editMetadataItem || propertiesItem || albumManager.showCreateAlbum || smartFolderManager.showCreateSmartFolder || visionPicker || startupPrompt || showLogs);
 
   const onRequestDelete = useCallback(() => {
     const filesToDelete = [...selectedIndices].sort((a, b) => a - b)
@@ -877,8 +883,11 @@ export default function App() {
             setVisionSettings(saved);
             void scanManager.pollRuntimeAndScans();
           }}
+          onOpenLogs={() => setShowLogs(true)}
         />
       )}
+      {/* Rendered after Settings so it stacks on top when opened from there. */}
+      {showLogs && <LogsModal onClose={() => setShowLogs(false)} />}
       {visionPicker && (
         <ModelPickerModal
           rootPath={visionPicker.rootPath}
@@ -1180,6 +1189,7 @@ export default function App() {
             canLoadMore={canLoadMore}
             isScanning={isScanning}
             selectedRootName={selectedRootId != null ? (roots.find((r) => r.id === selectedRootId)?.rootName ?? null) : null}
+            onShowLogs={() => setShowLogs(true)}
             selectedIndices={selectedIndices}
             focusIndex={focusIndex}
             gridRef={gridRef}

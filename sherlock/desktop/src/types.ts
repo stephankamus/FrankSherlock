@@ -618,3 +618,26 @@ export type VisionEstimate = {
   spillBytes: number;
   modelMissing: boolean;
 };
+
+/** One line of the application log, as the live viewer displays it. */
+export type LogEntry = {
+  /** `YYYY-MM-DD`, local time. */
+  date: string;
+  /** `HH:MM:SS`. */
+  time: string;
+  /** Rust module that emitted the line. */
+  target: string;
+  /** `TRACE` | `DEBUG` | `INFO` | `WARN` | `ERROR` | `UNKNOWN`. */
+  level: string;
+  message: string;
+};
+
+/** Tail of the log file plus what the viewer needs to explain the window. */
+export type LogSnapshot = {
+  /** Newest log file; null until the first line is written. */
+  path: string | null;
+  entries: LogEntry[];
+  /** True when the file was longer than the tail read. */
+  truncated: boolean;
+  sizeBytes: number;
+};

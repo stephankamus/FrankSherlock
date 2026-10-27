@@ -26,6 +26,8 @@ type Props = {
   onClose: () => void;
   /** Called with what the backend saved, so the caller can refresh its state. */
   onSaved?: (settings: VisionSettings) => void;
+  /** Opens the live log viewer on top of this modal. */
+  onOpenLogs?: () => void;
 };
 
 const PROMPT_PROFILES: { value: VisionPromptProfile; label: string }[] = [
@@ -83,7 +85,7 @@ export function toSettingsPayload(settings: VisionSettings): SettingsUpdatePaylo
  * its own flow (the picker with VRAM calibration); this screen only edits what the
  * pipeline does with the chosen model.
  */
-export default function SettingsModal({ onClose, onSaved }: Props) {
+export default function SettingsModal({ onClose, onSaved, onOpenLogs }: Props) {
   const [settings, setSettings] = useState<VisionSettings | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -392,6 +394,19 @@ export default function SettingsModal({ onClose, onSaved }: Props) {
                   : ""}
               </span>
             </div>
+
+            {onOpenLogs && (
+              <div className="settings-field settings-logs">
+                <label>Live logs</label>
+                <button type="button" className="settings-logs-btn" onClick={onOpenLogs}>
+                  Open logs
+                </button>
+                <span className="settings-hint">
+                  The same lines the terminal prints, updated every second — including
+                  which photo is being classified right now.
+                </span>
+              </div>
+            )}
 
             <div className="modal-actions">
               <button type="button" onClick={onClose}>Cancel</button>

@@ -24,6 +24,8 @@ type ContentProps = {
   canLoadMore: boolean;
   isScanning: boolean;
   selectedRootName: string | null;
+  /** Opens the live log modal from the "Scanning..." indicator. */
+  onShowLogs?: () => void;
   selectedIndices: Set<number>;
   focusIndex: number | null;
   gridRef: RefObject<HTMLDivElement>;
@@ -36,7 +38,7 @@ type ContentProps = {
 export default function Content({
   query, onQueryChange, selectedMediaType, onMediaTypeChange, mediaTypeOptions,
   sortBy, onSortByChange, sortOrder, onSortOrderChange, hasTextQuery, onSaveSmartFolder,
-  items, total, loading, loadingMore, canLoadMore, isScanning, selectedRootName,
+  items, total, loading, loadingMore, canLoadMore, isScanning, selectedRootName, onShowLogs,
   selectedIndices, focusIndex, gridRef, sentinelRef, onTileClick, onTileDoubleClick,
   onTileContextMenu,
 }: ContentProps) {
@@ -63,6 +65,7 @@ export default function Content({
           loading={loading}
           isScanning={isScanning}
           selectedRootName={selectedRootName}
+          onShowLogs={onShowLogs}
         />
 
         <ImageGrid

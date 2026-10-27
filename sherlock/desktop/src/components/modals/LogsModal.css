@@ -1,0 +1,208 @@
+/* ── Live logs viewer ─────────────────────────────────────── */
+
+.logs-modal {
+  width: min(96vw, 1080px);
+  height: min(84vh, 760px);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px;
+}
+
+.logs-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.logs-header h3 {
+  margin: 0;
+}
+
+/* Live badge: the dot pulses to make it obvious the view is updating. */
+.logs-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border: 1px solid var(--border-primary);
+  border-radius: 999px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs, 11px);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.logs-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--success);
+  animation: logs-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes logs-pulse {
+  50% {
+    opacity: 0.25;
+  }
+}
+
+.logs-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+}
+
+.logs-toolbar label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.logs-toolbar select {
+  padding: 3px 6px;
+}
+
+.logs-toolbar .logs-spacer {
+  flex: 1;
+}
+
+.logs-toolbar button {
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  padding: 5px 12px;
+  font: inherit;
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+}
+
+.logs-toolbar button:hover:not(:disabled) {
+  border-color: var(--border-focus);
+}
+
+.logs-toolbar button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* The terminal-like pane. Monospace is what keeps the file names aligned. */
+.logs-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  background: var(--bg-base);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-sm);
+  padding: 6px 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.75rem;
+  line-height: 1.45;
+}
+
+.log-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 1px 2px;
+  border-radius: 2px;
+}
+
+.log-line:hover {
+  background: var(--bg-hover);
+}
+
+.log-time {
+  flex-shrink: 0;
+  color: var(--text-secondary);
+  opacity: 0.8;
+  font-variant-numeric: tabular-nums;
+}
+
+.log-level {
+  flex-shrink: 0;
+  width: 48px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.log-target {
+  flex-shrink: 0;
+  max-width: 170px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+  opacity: 0.75;
+}
+
+.log-message {
+  flex: 1;
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.log-level-info .log-level {
+  color: var(--accent);
+}
+
+.log-level-debug .log-level,
+.log-level-trace .log-level {
+  color: var(--text-secondary);
+}
+
+.log-level-debug .log-message,
+.log-level-trace .log-message {
+  color: var(--text-secondary);
+}
+
+.log-level-warn .log-level,
+.log-level-warn .log-message {
+  color: #d7ba7d;
+}
+
+.log-level-error .log-level,
+.log-level-error .log-message {
+  color: var(--danger);
+}
+
+.logs-empty {
+  margin: 8px;
+  color: var(--text-secondary);
+}
+
+.logs-footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: var(--font-size-xs, 11px);
+  color: var(--text-secondary);
+}
+
+.logs-footer .logs-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.8;
+}
+
+.logs-note {
+  flex-shrink: 0;
+  color: #d7ba7d;
+}
+
+@media (max-width: 720px) {
+  .log-target {
+    display: none;
+  }
+}

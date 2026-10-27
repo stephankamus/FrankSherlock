@@ -14,6 +14,7 @@ import type {
   FileMetadata,
   FileProperties,
   HealthStatus,
+  LogSnapshot,
   PdfPassword,
   PersonInfo,
   ProtectedPdfInfo,
@@ -529,4 +530,16 @@ export async function reassignFacesToPerson(faceIds: number[], targetPersonId: n
 
 export async function setRepresentativeFace(personId: number, faceId: number): Promise<void> {
   return invoke<void>("set_representative_face", { personId, faceId });
+}
+
+// ── Live logs ───────────────────────────────────────────────────────
+
+/**
+ * Tail of the running application log.
+ *
+ * The same file `tauri_plugin_log` writes for the terminal: the viewer polls this
+ * while a scan runs to show the file currently being classified.
+ */
+export async function readLogs(maxLines = 600): Promise<LogSnapshot> {
+  return invoke<LogSnapshot>("read_logs", { maxLines });
 }

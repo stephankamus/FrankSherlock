@@ -841,3 +841,31 @@ pub struct ReclusterProgress {
     /// Populated once clustering finishes.
     pub result: Option<ClusterResult>,
 }
+
+/// One line of the application log, as the live viewer displays it.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogEntry {
+    /// `YYYY-MM-DD`, in the machine's local time (the file already stores it that way).
+    pub date: String,
+    /// `HH:MM:SS`.
+    pub time: String,
+    /// Rust module that emitted the line, e.g. `sherlock_app_lib::scan`.
+    pub target: String,
+    /// `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR`, or `UNKNOWN` for a line that did
+    /// not match the plugin's format (a continuation of a multi-line message).
+    pub level: String,
+    pub message: String,
+}
+
+/// Tail of the log file plus what the viewer needs to explain the window.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogSnapshot {
+    /// Newest log file; `None` until the first line is written.
+    pub path: Option<String>,
+    pub entries: Vec<LogEntry>,
+    /// True when the file was longer than the tail read, so older lines exist.
+    pub truncated: bool,
+    pub size_bytes: u64,
+}
