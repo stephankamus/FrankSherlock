@@ -9,6 +9,7 @@ Local-only, AI-powered image cataloging and search for your NAS. Point it at a d
 ## What it does
 
 - Scans image, PDF, and video directories read-only (JPEG, PNG, GIF, BMP, WebP, TIFF, PDF, MP4, MKV, AVI, MOV, WebM, and more)
+- Converts HEIC and NEF photos into JPEG copies on request (`FrankSherlock-JPG/` next to the originals), so phone photos and camera raw files become searchable without changing the vision pipeline — the originals are never modified
 - Classifies each image with a local Ollama vision model selected for your hardware (media type, description, anime/manga identification, document detection)
 - Extracts text via Surya OCR (with vision LLM fallback) for documents, receipts, screenshots
 - Generates 300px JPEG thumbnails for fast browsing (PDF 2-page montage)
@@ -20,6 +21,7 @@ Local-only, AI-powered image cataloging and search for your NAS. Point it at a d
 - Live discovery progress during file walks on large directories
 - Browse subdirectories via a collapsible tree in the sidebar
 - "Refresh Metadata" rescans without Ollama (thumbnails only, no LLM)
+- HEIC/NEF conversion is opt-in and reversible: the copies are ordinary JPEGs, tagged with their origin in the grid and skipped as automatic keepers in the duplicate view
 
 ## Screenshot
 

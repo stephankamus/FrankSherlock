@@ -1,5 +1,12 @@
 # CLAUDE.md
 
+## Idioma / Language
+
+**As respostas dos agentes (chat, planos, TODOs e artefatos de planejamento) devem ser
+escritas em português do Brasil (pt-BR).** Código, identificadores, nomes de arquivos,
+mensagens de erro em `AppError`, logs e comentários de código seguem em inglês, como o
+resto do repositório.
+
 ## Project Overview
 
 Frank Sherlock is a local-only, AI-powered image cataloging and search system. The main application lives in `sherlock/` — a Tauri v2 desktop app with a Rust backend and React frontend. Everything else in this repo is research and prototyping that informed the final design.
@@ -68,6 +75,10 @@ WEBKIT_DISABLE_DMABUF_RENDERER=1 GDK_BACKEND=wayland,x11 npm run tauri:dev
 ## Architecture Principles
 
 - **Read-only**: Never writes to scanned directories. All data goes to `~/.local/share/frank_sherlock/`.
+  **Only exception, authorized by the user in the modal**: the opt-in HEIC/NEF conversion writes
+  JPEG copies into `FrankSherlock-JPG/` inside the directory of the original. No other feature
+  writes to a root, and there is deliberately no fallback to the app cache, so the library is
+  not spread across two places. See [`plans/heic-nef-conversion.md`](plans/heic-nef-conversion.md).
 - **Incremental**: Unchanged files (same mtime + size) skip fingerprinting and classification entirely — only a scan marker update.
 - **Move-aware**: Renamed/moved files detected by fingerprint, preserving all classification data.
 - **Resilient**: Scan jobs checkpoint after each file. Interrupted scans resume from last cursor.

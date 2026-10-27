@@ -79,6 +79,13 @@ Se 15% da biblioteca cair nesse caso: ~34 h + 0,15 × 51 h ≈ **41 h**.
 dos dois). Para medir, os arquivos foram convertidos em resolução cheia num venv isolado
 (`pillow-heif` + `rawpy`) por [`bench_big.py`](bench_big.py).
 
+> **Resolvido depois desta medição**, e não pelo pipeline: existe agora um fluxo opt-in que
+> converte HEIC/NEF em cópias JPEG ao lado dos originais
+> ([`plans/heic-nef-conversion.md`](../plans/heic-nef-conversion.md)). Medido com o sidecar
+> novo nos mesmos arquivos: HEIC 3,5 MB em 310 ms; NEF usando o **preview embutido de
+> 4608×3072** em 107 ms (o demosaico completo custa 629 ms). O que segue abaixo continua
+> válido como medição do pipeline de visão sobre imagens já convertidas.
+
 | Config | wall/foto | prefill | decode | gap (`wall − prefill − decode`) |
 |---|---|---|---|---|
 | 7b, original 9–14 MP, PRIMARY, ctx 16384 | **24,31 s** | 6,11 s (2801 tok) | 8,08 s (71) | **10,12 s** |

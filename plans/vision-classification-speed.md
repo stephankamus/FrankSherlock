@@ -300,10 +300,12 @@ com número na mão.
 
 ### 3.8 Fora de escopo (PRs separados)
 
-- **HEIC/NEF**: `SUPPORTED_EXTS` não tem `.heic` nem `.nef`, e o crate `image` não decodifica
-  nenhum dos dois. Nas pastas testadas, **24 de 27 fotos ficam invisíveis**. Exige `libheif`
-  (HEIC) e extração do preview JPEG embutido do NEF (mais leve que demosaicar). É feature,
-  não otimização.
+- ~~**HEIC/NEF**~~ — **resolvido fora do pipeline**, sem `libheif` e sem ensinar o `image` a
+  ler raw: um fluxo opt-in converte em cópias JPEG ao lado dos originais
+  ([`heic-nef-conversion.md`](./heic-nef-conversion.md)). A conversão roda em venv dedicado
+  (`pillow-heif` + `rawpy`), usa o preview embutido do NEF quando ele cobre a resolução
+  pedida (107 ms contra 629 ms do demosaico) e as cópias entram na varredura como JPEG
+  comum. `SUPPORTED_EXTS` continua sem `.heic`/`.nef`, de propósito.
 - **Vídeos**: não são descartados. `.mp4/.mkv/.mov/...` estão em `SUPPORTED_EXTS` e
   [`classify_video`](../sherlock/desktop/src-tauri/src/classify.rs:771) extrai 5 keyframes,
   classifica **1** com o VLM (~1 chamada) e soma legendas. Custo por vídeo ≈ 1 imagem grande
@@ -319,7 +321,8 @@ com número na mão.
 3. Gate do OCR + `ocr_engine`.
 4. `VisionSettings` + `list_vision_models`/`set_vision_model` + modal.
 5. Dedupe por dhash (com métrica antes/depois).
-6. (Separado) HEIC/NEF.
+6. ~~(Separado) HEIC/NEF~~ — feito por conversão opt-in
+   ([`heic-nef-conversion.md`](./heic-nef-conversion.md)).
 
 ## 5. Critérios de aceite
 
