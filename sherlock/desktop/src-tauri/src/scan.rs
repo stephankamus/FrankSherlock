@@ -884,7 +884,12 @@ fn run_scan_job_impl(
             );
         }
 
-        let rows = db::list_backlog_rows_for_scan(db_path, job.root_id, job.scan_marker)?;
+        let rows = db::list_backlog_rows_for_scan(
+            db_path,
+            job.root_id,
+            job.scan_marker,
+            ctx.face_detection,
+        )?;
         // Renames can only be seen here, while the vanished rows are still live: the
         // cleanup at the end of this job is what turns them into soft deletes.
         let moves = MoveIndex::build(db_path, job.root_id, job.scan_marker)?;
@@ -931,7 +936,8 @@ fn run_scan_job_impl(
         processed_files = total_files;
         log::info!(
             "Scan job {job_id}: pipeline complete — {} processed, {} classified ({} deduped), \
-             {} thumbnailed, {} moved, {} failed, {} deferred, {} unreadable",
+             {} thumbnailed, {} moved, {} failed, {} deferred, {} unreadable, \
+             {} face(s) stored ({} face failure(s))",
             outcome.processed,
             outcome.classified,
             outcome.deduped,
@@ -939,7 +945,9 @@ fn run_scan_job_impl(
             outcome.moved,
             outcome.failed,
             outcome.deferred,
-            outcome.unreadable
+            outcome.unreadable,
+            outcome.faces,
+            outcome.face_failures
         );
 
         if cancel_flag.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
@@ -1314,6 +1322,9 @@ pub struct BacklogTick {
     /// Rows that need a classification.
     pub classify_total: u64,
     pub deduped: u64,
+    /// Faces written by the producer, and the rows of this pass that needed them.
+    pub faces: u64,
+    pub faces_total: u64,
     pub failed: u64,
 }
 
@@ -1349,6 +1360,9 @@ struct BacklogCounters {
     unreadable: AtomicU64,
     /// Rows the producer recognised as renames and adopted from their old path.
     moved: AtomicU64,
+    /// Faces written by the producer, and rows whose detection failed.
+    faces: AtomicU64,
+    face_failures: AtomicU64,
 }
 
 /// Rename candidates of this scan, indexed by fingerprint.
@@ -1398,6 +1412,38 @@ impl MoveIndex {
     }
 }
 
+/// Split a faces-only block into one slice per face worker.
+///
+/// The producer is a single thread there because a single thread is what the consumer
+/// needs; with nothing to classify, the queue can be fed by several of them instead.
+/// Returns the slices plus the plan they came from, so the caller can log it.
+fn face_pool_slices(block: &CtxBlock, configured_threads: u32) -> (Vec<CtxBlock>, usize, usize) {
+    let budget = crate::face::thread_budget(configured_threads);
+    let (planned, intra_threads) = crate::face::plan_pool(budget);
+    let workers = planned.min(block.rows.len()).max(1);
+    let chunk = block.rows.len().div_ceil(workers).max(1);
+
+    let slices = block
+        .rows
+        .chunks(chunk)
+        .map(|rows| CtxBlock {
+            ctx: block.ctx,
+            probed: block.probed,
+            has_work: false,
+            rows: rows.to_vec(),
+        })
+        .collect::<Vec<_>>();
+
+    let started = slices.len();
+    (slices, started, intra_threads)
+}
+
+/// Cores the face detector may take inside a block that also has to classify.
+///
+/// Ollama's image preprocessor runs on the same cores and is the bottleneck this
+/// pipeline exists to fill, so faces get one thread and wait their turn.
+const FACE_THREADS_WITH_GPU_WORK: usize = 1;
+
 /// A group of backlog rows that resolve to the same context window.
 struct CtxBlock {
     /// `num_ctx` this block runs at. Ollama treats it as part of the runner
@@ -1406,6 +1452,12 @@ struct CtxBlock {
     /// True when the rows had no recorded dimensions and are measured on the fly:
     /// the producer keeps only the rows that fit `ctx` and defers the rest.
     probed: bool,
+    /// True when at least one row needs a thumbnail or a classification.
+    ///
+    /// Only used to order the blocks and to decide how much CPU the face detector
+    /// may take: a block whose rows are already classified leaves the GPU idle, so
+    /// there is nothing to starve and the detector can use the cores.
+    has_work: bool,
     rows: Vec<db::BacklogRow>,
 }
 
@@ -1417,16 +1469,25 @@ struct CtxBlock {
 /// `plans/pipeline-cpu-gpu-overlap.md`). Grouping by window means a pass pays at
 /// most one reload per block instead of one per file.
 ///
-/// Ascending order, so the cheapest window runs first. Rows with no recorded
-/// dimensions come last: the producer probes their header (a few KB, no decode),
-/// stores the size, and keeps only the rows that fit the window already loaded —
-/// the rest are deferred to the next pass, where their size is known and they get
-/// their own block.
+/// Order: rows with real work first, then the faces-only rows.
+///
+/// Faces made already-processed rows selectable again, and those rows are exactly the
+/// ones that have their dimensions recorded — so they landed in the *first* block. On a
+/// 58k library that meant the pass spent the first hour on faces while 54k files waited
+/// to be classified, with the GPU idle the whole time. Work blocks now come first;
+/// faces-only blocks close the pass, where nothing is left to starve.
+///
+/// Inside each group the windows are ascending, so the cheapest runs first, and rows
+/// with no recorded dimensions ride with the probed block: the producer measures their
+/// header (a few KB, no decode), keeps the ones that fit the window already loaded and
+/// defers the rest to the next pass.
 fn ctx_blocks(rows: &[db::BacklogRow], ctx: &ScanContext) -> Vec<CtxBlock> {
     let vision = ctx.vision_settings();
     let profile = vision.prompt_profile;
     let language = vision.description_language;
-    let mut known: std::collections::BTreeMap<u32, Vec<db::BacklogRow>> =
+    let mut work: std::collections::BTreeMap<u32, Vec<db::BacklogRow>> =
+        std::collections::BTreeMap::new();
+    let mut faces_only: std::collections::BTreeMap<u32, Vec<db::BacklogRow>> =
         std::collections::BTreeMap::new();
     let mut probed: Vec<db::BacklogRow> = Vec::new();
 
@@ -1435,32 +1496,35 @@ fn ctx_blocks(rows: &[db::BacklogRow], ctx: &ScanContext) -> Vec<CtxBlock> {
         // or pages inside the consumer; nothing here can predict their window, so
         // they ride with the probed block.
         let legacy = matches!(row.media_type.as_str(), "video" | "pdf");
+        let needs_work = row.needs_classification || row.thumb_path.is_none();
         match (row.image_width, row.image_height) {
-            (Some(width), Some(height)) if !legacy => known
-                .entry(classify::primary_ctx_for(
-                    width,
-                    height,
-                    ctx.image_max_side,
-                    profile,
-                    language,
-                ))
-                .or_default()
-                .push(row.clone()),
+            (Some(width), Some(height)) if !legacy => {
+                let needed =
+                    classify::primary_ctx_for(width, height, ctx.image_max_side, profile, language);
+                let bucket = if needs_work {
+                    &mut work
+                } else {
+                    &mut faces_only
+                };
+                bucket.entry(needed).or_default().push(row.clone());
+            }
             _ => probed.push(row.clone()),
         }
     }
 
-    let mut blocks: Vec<CtxBlock> = known
+    let mut blocks: Vec<CtxBlock> = work
         .into_iter()
         .map(|(ctx, rows)| CtxBlock {
             ctx,
             probed: false,
+            has_work: true,
             rows,
         })
         .collect();
+
     if !probed.is_empty() {
-        // The last known window is the largest one, so a probed row that fits it
-        // can run without changing the runner identity.
+        // The last work window is the largest one, so a probed row that fits it can
+        // run without changing the runner identity.
         let ctx = blocks
             .last()
             .map(|block| block.ctx)
@@ -1468,9 +1532,18 @@ fn ctx_blocks(rows: &[db::BacklogRow], ctx: &ScanContext) -> Vec<CtxBlock> {
         blocks.push(CtxBlock {
             ctx,
             probed: true,
+            has_work: true,
             rows: probed,
         });
     }
+
+    blocks.extend(faces_only.into_iter().map(|(ctx, rows)| CtxBlock {
+        ctx,
+        probed: false,
+        has_work: false,
+        rows,
+    }));
+
     blocks
 }
 
@@ -1494,6 +1567,8 @@ fn produce_backlog_items(
     counters: &BacklogCounters,
     scan_marker: i64,
     moves: Option<&MoveIndex>,
+    faces_enabled: bool,
+    face_threads: usize,
 ) {
     let vision = ctx.vision_settings();
     let profile = vision.prompt_profile;
@@ -1501,6 +1576,10 @@ fn produce_backlog_items(
     // Only video and PDF consult these caches, and seeding them would cost a `stat`
     // per indexed row; every still image is decoded here anyway.
     let mut legacy_caches = ThumbCaches::default();
+    // Filled on the first row that needs faces, so a pass with the toggle on but
+    // nothing pending never pays for the ~180 MB of models.
+    let mut detector: Option<crate::face::FaceDetector> = None;
+    let mut faces_unavailable = false;
 
     for original in &block.rows {
         if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
@@ -1685,6 +1764,23 @@ fn produce_backlog_items(
             None
         };
         let failed = row.needs_classification && prepared.is_none();
+
+        // Faces, on the buffer that is already in memory — no second read, no second
+        // decode. Off unless the scan was started with `face_detection`; rows left
+        // here keep `faces_scanned_at = NULL` and are exactly what Detect Faces picks
+        // up later.
+        if faces_enabled && row.needs_faces() {
+            faces_for_row(
+                ctx,
+                &row,
+                &decoded.image,
+                &mut detector,
+                &mut faces_unavailable,
+                face_threads,
+                counters,
+            );
+        }
+
         // Release the decoded buffer before blocking on the queue: one image in
         // flight per producer, not one per queued item.
         drop(decoded);
@@ -1698,6 +1794,122 @@ fn produce_backlog_items(
         };
         if tx.send(item).is_err() {
             break;
+        }
+    }
+}
+
+/// Detect and store the faces of one row, on the image the producer already decoded.
+///
+/// The detector is loaded on the first row that needs it and kept for the rest of the
+/// block, so a pass with the toggle on but nothing pending never pays for the models.
+/// The models are never downloaded from a scan — only `ensure_models` does that — so a
+/// missing `buffalo_l` directory just leaves the rows pending for Detect Faces.
+#[allow(clippy::too_many_arguments)]
+fn faces_for_row(
+    ctx: &ScanContext,
+    row: &db::BacklogRow,
+    image: &image::DynamicImage,
+    detector: &mut Option<crate::face::FaceDetector>,
+    unavailable: &mut bool,
+    intra_threads: usize,
+    counters: &BacklogCounters,
+) {
+    if *unavailable {
+        return;
+    }
+
+    if detector.is_none() {
+        let models_dir = match crate::face::engine_ready(&ctx.models_dir, &ctx.ort_lib_dir) {
+            Ok(dir) => dir,
+            Err(e) => {
+                *unavailable = true;
+                log::warn!("Backlog: faces skipped for this pass — {e}");
+                return;
+            }
+        };
+        // The runtime has to be initialised *before* any session: without this call
+        // `ort` looks for libonnxruntime.so on the loader search path and panics
+        // inside `setup_api` when it is not there, taking the producer with it.
+        match crate::face::init_ort_from_dir(&ctx.ort_lib_dir) {
+            Ok(true) => {}
+            Ok(false) => {
+                *unavailable = true;
+                log::warn!(
+                    "Backlog: ONNX Runtime not found in {}; faces skipped for this pass",
+                    ctx.ort_lib_dir.display()
+                );
+                return;
+            }
+            Err(e) => {
+                *unavailable = true;
+                log::warn!("Backlog: ONNX Runtime init failed ({e}); faces skipped");
+                return;
+            }
+        }
+        match crate::face::FaceDetector::from_model_dir_with_threads(&models_dir, intra_threads) {
+            Ok(loaded) => *detector = Some(loaded),
+            Err(e) => {
+                *unavailable = true;
+                log::warn!("Backlog: could not load the face models, skipping faces: {e}");
+                return;
+            }
+        }
+    }
+
+    let Some(detector) = detector.as_mut() else {
+        return;
+    };
+
+    // A panic in a native library must not be allowed to kill the whole pass: the
+    // producer dying closes the queue and the consumer stops after a handful of files,
+    // which is exactly how the first version of this ended a 26-file run.
+    let detected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::face::detect_and_crop(detector, image, &ctx.face_crops_dir, row.id)
+    }));
+
+    let (faces, crops) = match detected {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => {
+            log::warn!("Backlog: face detection failed for {}: {e}", row.rel_path);
+            counters.face_failures.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        Err(payload) => {
+            let reason = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            log::error!(
+                "Backlog: face detection panicked on {} ({reason}); the pass continues and \
+                 the row stays pending",
+                row.rel_path
+            );
+            counters.face_failures.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    };
+
+    if faces.is_empty() {
+        if let Err(e) = db::mark_faces_scanned(&ctx.db_path, row.id) {
+            log::warn!(
+                "Backlog: could not mark {} as scanned for faces: {e}",
+                row.rel_path
+            );
+            counters.face_failures.fetch_add(1, Ordering::Relaxed);
+        }
+        return;
+    }
+
+    match db::record_faces(&ctx.db_path, row.id, &faces, &crops) {
+        Ok(_) => {
+            counters
+                .faces
+                .fetch_add(faces.len() as u64, Ordering::Relaxed);
+        }
+        Err(e) => {
+            log::warn!("Backlog: could not store faces for {}: {e}", row.rel_path);
+            counters.face_failures.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -1922,7 +2134,18 @@ fn prepare_scan_rows(
         .filter(|probe| matches!(probe.status, FileStatus::Modified))
         .map(|probe| (probe.rel_path.clone(), probe.mtime_ns, probe.size_bytes))
         .collect();
-    db::stamp_modified_rows(db_path, job.root_id, job.scan_marker, &modified)?;
+    // The faces of a replaced file describe the picture that no longer exists. The
+    // rows are dropped inside the transaction; the crop files it returns are unlinked
+    // here, because SQLite cannot touch the filesystem.
+    for orphan in db::stamp_modified_rows(db_path, job.root_id, job.scan_marker, &modified)? {
+        if let Err(e) = std::fs::remove_file(&orphan) {
+            log::debug!(
+                "Scan {}: could not remove stale face crop {}: {e}",
+                job.root_id,
+                orphan.display()
+            );
+        }
+    }
 
     // Dead pointers drop to NULL, which is the pipeline's selection key, so the
     // producer regenerates them without a special "heal" path.
@@ -2019,6 +2242,9 @@ struct PipelineOutcome {
     unreadable: u64,
     thumbnailed: u64,
     moved: u64,
+    /// Faces stored by the producer, and rows whose detection or write failed.
+    faces: u64,
+    face_failures: u64,
     aborted_by_breaker: bool,
 }
 
@@ -2077,10 +2303,50 @@ fn run_pipeline_blocks(
 
     let classify_total = rows.iter().filter(|row| row.needs_classification).count() as u64;
     let thumbless = rows.iter().filter(|row| row.thumb_path.is_none()).count() as u64;
+
+    // Faces are opt-in per pass, and they need two things the scan cannot provide by
+    // itself: the models already on disk (a scan never downloads them) and an engine
+    // nobody else is using (the Detect Faces button takes the same one).
+    let faces_wanted = ctx.face_detection && rows.iter().any(|row| row.needs_faces());
+    // Availability is decided once, before any work: the models, the runtime library
+    // and the engine being free. A pass that cannot do faces says why in one line
+    // rather than discovering it row by row.
+    let faces_ready = if faces_wanted {
+        match crate::face::engine_ready(&ctx.models_dir, &ctx.ort_lib_dir) {
+            Ok(_) => true,
+            Err(reason) => {
+                log::warn!("Scan job {job_id}: faces disabled for this pass — {reason}");
+                false
+            }
+        }
+    } else {
+        false
+    };
+    let _face_guard = if faces_ready {
+        match crate::face::FaceEngineGuard::try_acquire() {
+            Some(guard) => Some(guard),
+            None => {
+                log::warn!(
+                    "Scan job {job_id}: a face pass is already running; this scan leaves faces pending"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let faces_enabled = _face_guard.is_some();
+    let faces_total = if faces_enabled {
+        rows.iter().filter(|row| row.needs_faces()).count() as u64
+    } else {
+        0
+    };
+
     on_tick(BacklogTick {
         total,
         thumbs_total: thumbless,
         classify_total,
+        faces_total,
         ..BacklogTick::default()
     });
 
@@ -2137,35 +2403,84 @@ fn run_pipeline_blocks(
         if cancelled() {
             break;
         }
-        let block_ref: &CtxBlock = block;
         let block_ctx = block.ctx;
-        log::info!(
-            "Scan job {job_id}: block {}/{} — {} file(s) at num_ctx {block_ctx}{}",
-            block_index + 1,
-            blocks.len(),
-            block.rows.len(),
-            if block.probed {
-                " (sizes measured now; rows that need more are deferred)"
-            } else {
-                ""
-            }
-        );
+
+        // A block whose rows are already classified has nothing for the consumer to do:
+        // every item arrives without a prepared image and the GPU idles for the whole
+        // block. Those blocks run a face pool instead — one session per worker, each
+        // with a slice of the rows — which is what turns the tail of a pass from one
+        // thread into the whole machine.
+        let (runs, open_producers) = if faces_enabled && !block.has_work {
+            let (slices, workers, intra_threads) = face_pool_slices(block, ctx.face_threads);
+            log::info!(
+                "Scan job {job_id}: block {}/{} — {} file(s) at num_ctx {block_ctx}, \
+                 already classified: {workers} face worker(s) with {intra_threads} thread(s) each",
+                block_index + 1,
+                blocks.len(),
+                block.rows.len()
+            );
+            (slices, true)
+        } else {
+            log::info!(
+                "Scan job {job_id}: block {}/{} — {} file(s) at num_ctx {block_ctx}{}",
+                block_index + 1,
+                blocks.len(),
+                block.rows.len(),
+                if block.probed {
+                    " (sizes measured now; rows that need more are deferred)"
+                } else {
+                    ""
+                }
+            );
+            (
+                vec![CtxBlock {
+                    ctx: block.ctx,
+                    probed: block.probed,
+                    has_work: block.has_work,
+                    rows: block.rows.clone(),
+                }],
+                false,
+            )
+        };
+        // The face pool only fills the budget when nothing else is running; a work block
+        // keeps its single producer so the GPU stays fed.
+        let face_threads = if open_producers {
+            crate::face::plan_pool(crate::face::thread_budget(ctx.face_threads)).1
+        } else {
+            FACE_THREADS_WITH_GPU_WORK
+        };
+
         let (tx, rx) = std::sync::mpsc::sync_channel::<BacklogItem>(QUEUE_DEPTH);
 
         std::thread::scope(|scope| -> AppResult<()> {
-            let producer = scope.spawn(move || {
-                produce_backlog_items(
-                    tx,
-                    ctx_ref,
-                    root_id,
-                    thumb_dir_ref,
-                    block_ref,
-                    cancel_flag,
-                    counters_ref,
-                    scan_marker,
-                    moves,
-                );
-            });
+            for run in &runs {
+                let sender = tx.clone();
+                scope.spawn(move || {
+                    // A panicking producer used to end the whole pass through the
+                    // implicit join of `thread::scope`; here it ends its own slice.
+                    let survived = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        produce_backlog_items(
+                            sender,
+                            ctx_ref,
+                            root_id,
+                            thumb_dir_ref,
+                            run,
+                            cancel_flag,
+                            counters_ref,
+                            scan_marker,
+                            moves,
+                            faces_enabled,
+                            face_threads,
+                        );
+                    }))
+                    .is_ok();
+                    if !survived {
+                        log::error!("Backlog: producer thread panicked");
+                    }
+                });
+            }
+            // The receiver only closes once the last sender is gone.
+            drop(tx);
 
             for item in rx.iter() {
                 if cancelled() {
@@ -2190,6 +2505,19 @@ fn run_pipeline_blocks(
                         Some(representative) => {
                             if db::copy_classification(db_path, item.row.id, representative).is_ok()
                             {
+                                // The duplicate is the same picture, so its faces are
+                                // the representative's faces: copy the rows instead of
+                                // paying for another SCRFD pass.
+                                if item.row.needs_faces() {
+                                    if let Err(e) =
+                                        db::copy_faces(db_path, item.row.id, representative)
+                                    {
+                                        log::warn!(
+                                            "Backlog: could not copy faces from {representative} to {}: {e}",
+                                            item.row.rel_path
+                                        );
+                                    }
+                                }
                                 deduped += 1;
                                 true
                             } else if classify_prepared_and_update(
@@ -2253,6 +2581,8 @@ fn run_pipeline_blocks(
                     classified,
                     classify_total,
                     deduped,
+                    faces: counters.faces.load(Ordering::Relaxed),
+                    faces_total,
                     failed: counters.failed.load(Ordering::Relaxed),
                 });
                 if processed % 25 == 0 {
@@ -2272,11 +2602,8 @@ fn run_pipeline_blocks(
             }
 
             // Closing the receiver unblocks a producer parked on `send`; without it a
-            // cancel would deadlock the join below.
+            // cancel would deadlock the join at the end of the scope.
             drop(rx);
-            if producer.join().is_err() {
-                log::error!("Backlog: producer thread panicked");
-            }
             Ok(())
         })?;
     }
@@ -2310,6 +2637,8 @@ fn run_pipeline_blocks(
         unreadable: counters.unreadable.load(Ordering::Relaxed),
         thumbnailed: counters.thumbnailed.load(Ordering::Relaxed),
         moved: counters.moved.load(Ordering::Relaxed),
+        faces: counters.faces.load(Ordering::Relaxed),
+        face_failures: counters.face_failures.load(Ordering::Relaxed),
         aborted_by_breaker,
     })
 }
@@ -2331,7 +2660,7 @@ fn run_backlog_pipeline(
     let rows = if only_failed {
         db::list_failed_rows(db_path, job.root_id)?
     } else {
-        db::list_backlog_rows(db_path, job.root_id)?
+        db::list_backlog_rows(db_path, job.root_id, ctx.face_detection)?
     };
     // The phase is what the sidebar uses to resume in the right mode, so a retry
     // must not be recorded as a backlog pass.
@@ -2398,7 +2727,8 @@ fn run_backlog_pipeline(
     }
     log::info!(
         "Backlog{}: {} processed, {} classified ({} deduped), {} thumbnailed, \
-         {} failed, {} deferred to the next pass, {} unreadable",
+         {} failed, {} deferred to the next pass, {} unreadable, {} face(s) stored \
+         ({} face failure(s))",
         if only_failed { " (retry failed)" } else { "" },
         outcome.processed,
         outcome.classified,
@@ -2406,8 +2736,17 @@ fn run_backlog_pipeline(
         outcome.thumbnailed,
         outcome.failed,
         outcome.deferred,
-        outcome.unreadable
+        outcome.unreadable,
+        outcome.faces,
+        outcome.face_failures
     );
+    if outcome.face_failures > 0 {
+        log::warn!(
+            "Backlog: {} image(s) could not have their faces stored; they stay pending \
+             for Detect Faces",
+            outcome.face_failures
+        );
+    }
     if outcome.unreadable > 0 {
         log::warn!(
             "Backlog: {} file(s) could not be opened; if they no longer exist \
@@ -3302,6 +3641,13 @@ mod tests {
             ocr_engine: vision.ocr_engine,
             pdfium_lib_path: tmp.path().join("lib"),
             dedupe_dhash_distance: 0,
+            // Faces are off in tests unless a test opts in, and even then the models
+            // are absent: the producer skips them instead of downloading 200 MB.
+            face_detection: false,
+            models_dir: tmp.path().join("models"),
+            face_crops_dir: tmp.path().join("face_crops"),
+            ort_lib_dir: tmp.path().join("lib"),
+            face_threads: 0,
         }
     }
 
@@ -3414,7 +3760,7 @@ mod tests {
     #[test]
     fn backlog_producer_thumbnails_and_queues_a_prepared_image() {
         let (ctx, root_id, root_path, _dirs) = backlog_fixture();
-        let rows = db::list_backlog_rows(&ctx.db_path, root_id).expect("backlog");
+        let rows = db::list_backlog_rows(&ctx.db_path, root_id, false).expect("backlog");
         assert_eq!(rows.len(), 1);
         assert!(rows[0].needs_classification);
 
@@ -3432,6 +3778,8 @@ mod tests {
             &counters,
             0,
             None,
+            false,
+            FACE_THREADS_WITH_GPU_WORK,
         );
 
         let item = rx.try_recv().expect("one item for one row");
@@ -3454,7 +3802,7 @@ mod tests {
 
         // The producer only fixes the thumbnail; the row stays pending until the
         // consumer records a classification.
-        let remaining = db::list_backlog_rows(&ctx.db_path, root_id).expect("backlog");
+        let remaining = db::list_backlog_rows(&ctx.db_path, root_id, false).expect("backlog");
         assert_eq!(remaining.len(), 1, "still unclassified");
         assert!(
             remaining[0].thumb_path.is_some(),
@@ -3467,7 +3815,7 @@ mod tests {
     #[test]
     fn backlog_producer_honours_cancellation() {
         let (ctx, root_id, root_path, _dirs) = backlog_fixture();
-        let rows = db::list_backlog_rows(&ctx.db_path, root_id).expect("backlog");
+        let rows = db::list_backlog_rows(&ctx.db_path, root_id, false).expect("backlog");
 
         let counters = BacklogCounters::default();
         let thumb_dir = ctx.thumb_dir_for(&thumbnail::root_key(&root_path));
@@ -3484,6 +3832,8 @@ mod tests {
             &counters,
             0,
             None,
+            false,
+            FACE_THREADS_WITH_GPU_WORK,
         );
 
         assert!(
@@ -3508,7 +3858,7 @@ mod tests {
         // 1280 px is the first prep size where a square image needs the next
         // window; at 768 every still image resolves to 4096.
         ctx.image_max_side = 1280;
-        let base = db::list_backlog_rows(&ctx.db_path, root_id)
+        let base = db::list_backlog_rows(&ctx.db_path, root_id, false)
             .expect("backlog")
             .remove(0);
 
@@ -3554,7 +3904,7 @@ mod tests {
     fn backlog_producer_defers_a_row_that_needs_a_bigger_window() {
         let (mut ctx, root_id, root_path, _dirs) = backlog_fixture();
         ctx.image_max_side = 1280;
-        let mut row = db::list_backlog_rows(&ctx.db_path, root_id)
+        let mut row = db::list_backlog_rows(&ctx.db_path, root_id, false)
             .expect("backlog")
             .remove(0);
         // A recorded 3000x3000: at 1280 px it becomes 1280x1280 and needs 8192.
@@ -3575,6 +3925,8 @@ mod tests {
             &counters,
             0,
             None,
+            false,
+            FACE_THREADS_WITH_GPU_WORK,
         );
 
         assert!(
@@ -3599,7 +3951,7 @@ mod tests {
     #[test]
     fn backlog_producer_records_the_dimensions_it_probed() {
         let (ctx, root_id, root_path, _dirs) = backlog_fixture();
-        let rows = db::list_backlog_rows(&ctx.db_path, root_id).expect("backlog");
+        let rows = db::list_backlog_rows(&ctx.db_path, root_id, false).expect("backlog");
         assert_eq!(
             (rows[0].image_width, rows[0].image_height),
             (None, None),
@@ -3619,6 +3971,8 @@ mod tests {
             &counters,
             0,
             None,
+            false,
+            FACE_THREADS_WITH_GPU_WORK,
         );
         assert!(
             rx.try_recv().is_ok(),
@@ -3626,7 +3980,7 @@ mod tests {
         );
         assert_eq!(counters.deferred.load(Ordering::Relaxed), 0);
 
-        let stored = db::list_backlog_rows(&ctx.db_path, root_id).expect("backlog");
+        let stored = db::list_backlog_rows(&ctx.db_path, root_id, false).expect("backlog");
         assert!(
             stored[0].image_width.is_some() && stored[0].image_height.is_some(),
             "the probed size must be cached on the row"
@@ -3681,6 +4035,7 @@ mod tests {
     fn block_of(rows: Vec<db::BacklogRow>, ctx: u32) -> CtxBlock {
         CtxBlock {
             ctx,
+            has_work: true,
             probed: false,
             rows,
         }
@@ -3712,6 +4067,149 @@ mod tests {
         db::upsert_file_record(&db_path, &record).expect("insert");
 
         (ctx, root_id, root_path, [root_dir, db_dir, cache_dir])
+    }
+
+    fn backlog_row(
+        id: i64,
+        rel: &str,
+        dims: Option<(u32, u32)>,
+        pending: bool,
+        thumb: bool,
+    ) -> db::BacklogRow {
+        db::BacklogRow {
+            id,
+            rel_path: rel.to_string(),
+            abs_path: format!("/tmp/{rel}"),
+            size_bytes: 1,
+            media_type: "photo".to_string(),
+            needs_classification: pending,
+            thumb_path: thumb.then(|| format!("/thumbs/{rel}")),
+            image_width: dims.map(|d| d.0),
+            image_height: dims.map(|d| d.1),
+            fingerprint: String::new(),
+            faces_scanned_at: None,
+            scan_marker: 0,
+            mtime_ns: 0,
+        }
+    }
+
+    /// Faces made already-processed rows selectable again, and those are exactly the
+    /// rows that carry recorded dimensions — so they used to land in the *first* block.
+    /// On a 58k library that cost the first hour of a pass on faces while 54k files
+    /// waited to be classified and the GPU sat idle.
+    #[test]
+    fn ctx_blocks_run_the_classification_work_before_the_faces_only_rows() {
+        let (ctx, _root_id, _root_path, _dirs) = backlog_fixture();
+
+        let faces_only = backlog_row(1, "a.jpg", Some((4000, 3000)), false, true);
+        let stale = backlog_row(2, "b.jpg", Some((4000, 3000)), true, true);
+        let unmeasured = backlog_row(3, "c.jpg", None, true, false);
+
+        let blocks = ctx_blocks(&[faces_only, stale, unmeasured], &ctx);
+
+        assert_eq!(
+            blocks.len(),
+            3,
+            "one known work, one probed, one faces only"
+        );
+        assert!(
+            blocks[0].has_work && !blocks[0].probed,
+            "the block that classifies comes first"
+        );
+        assert_eq!(blocks[0].rows[0].rel_path, "b.jpg");
+        assert!(
+            blocks[1].probed,
+            "rows without dimensions still run before the faces-only tail"
+        );
+        assert_eq!(blocks[1].rows[0].rel_path, "c.jpg");
+        assert!(
+            !blocks[2].has_work,
+            "the already-classified rows close the pass"
+        );
+        assert_eq!(blocks[2].rows[0].rel_path, "a.jpg");
+    }
+
+    /// The faces-only tail is the one place the pipeline may use the whole machine:
+    /// nothing is classified there, so the queue can be fed by several producers.
+    #[test]
+    fn face_pool_slices_split_a_faces_only_block_by_worker() {
+        let rows: Vec<db::BacklogRow> = (0..100)
+            .map(|id| backlog_row(id, &format!("{id}.jpg"), Some((4000, 3000)), false, true))
+            .collect();
+        let block = CtxBlock {
+            ctx: 4096,
+            probed: false,
+            has_work: false,
+            rows,
+        };
+
+        let (slices, workers, intra) = face_pool_slices(&block, 16);
+        assert_eq!(
+            (workers, intra),
+            (4, 4),
+            "16 threads as four sessions of four"
+        );
+        assert_eq!(slices.len(), 4);
+        assert!(slices.iter().all(|slice| !slice.has_work && !slice.probed));
+        // Every row is in exactly one slice: the pool must not lose or repeat work.
+        let total: usize = slices.iter().map(|slice| slice.rows.len()).sum();
+        assert_eq!(total, 100);
+
+        // A single-thread ceiling still yields one usable slice.
+        let (one, workers, intra) = face_pool_slices(&block, 1);
+        assert_eq!((workers, intra, one.len()), (1, 1, 1));
+        assert_eq!(one[0].rows.len(), 100);
+    }
+
+    /// A pass with the toggle on but no ONNX Runtime installed must not attempt faces.
+    ///
+    /// This is the shape of the crash that ended a 26-file run: `ort` panics when it
+    /// has to look for the dylib by itself, the producer dies, the queue closes and the
+    /// consumer stops. The pass has to survive and leave the row pending.
+    #[test]
+    fn faces_enabled_without_the_runtime_leaves_the_row_pending() {
+        let (mut ctx, root_id, root_path, _dirs) = backlog_fixture();
+        ctx.face_detection = true;
+
+        let rows = db::list_backlog_rows(&ctx.db_path, root_id, true).expect("backlog");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].needs_faces());
+
+        let counters = BacklogCounters::default();
+        let thumb_dir = ctx.thumb_dir_for(&thumbnail::root_key(&root_path));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<BacklogItem>(4);
+
+        produce_backlog_items(
+            tx,
+            &ctx,
+            root_id,
+            &thumb_dir,
+            &block_of(rows.clone(), crate::llm::MIN_NUM_CTX),
+            None,
+            &counters,
+            0,
+            None,
+            true,
+            FACE_THREADS_WITH_GPU_WORK,
+        );
+
+        assert!(
+            rx.try_recv().is_ok(),
+            "the producer must keep going instead of dying"
+        );
+        assert_eq!(counters.faces.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            counters.face_failures.load(Ordering::Relaxed),
+            0,
+            "nothing was attempted, so nothing failed"
+        );
+        assert!(
+            db::list_backlog_rows(&ctx.db_path, root_id, true)
+                .expect("backlog")
+                .iter()
+                .all(|row| row.needs_faces()),
+            "the row stays pending for Detect Faces"
+        );
     }
 
     /// Only still images are folded; a video sharing the hash would be a guess.
@@ -3827,7 +4325,7 @@ mod tests {
         paths.sort_unstable();
         assert_eq!(paths, vec!["a.jpg", "b.jpg"]);
 
-        let backlog = db::list_backlog_rows(&db_path, job.root_id).expect("backlog");
+        let backlog = db::list_backlog_rows(&db_path, job.root_id, false).expect("backlog");
         let unreadable_row = backlog
             .iter()
             .find(|row| row.rel_path == "a.jpg")
@@ -4381,7 +4879,7 @@ mod tests {
             "a cancelled scan must not soft-delete anything"
         );
         assert_eq!(
-            db::list_backlog_rows(&db_path, job.root_id)
+            db::list_backlog_rows(&db_path, job.root_id, false)
                 .expect("backlog")
                 .len(),
             3,
@@ -4528,7 +5026,7 @@ mod tests {
         prepare_scan_rows(&ctx, &job, &probes, &[]).expect("stamp");
 
         // The producer fills the identities and adopts the rename.
-        let rows = db::list_backlog_rows_for_scan(&db_path, root_id, marker).expect("rows");
+        let rows = db::list_backlog_rows_for_scan(&db_path, root_id, marker, false).expect("rows");
         assert_eq!(rows.len(), 2, "the unchanged row is not work");
         let moves = MoveIndex::build(&db_path, root_id, marker).expect("moves");
         assert_eq!(moves.len(), 1, "the vanished row is the rename candidate");
@@ -4546,6 +5044,8 @@ mod tests {
             &counters,
             marker,
             Some(&moves),
+            false,
+            FACE_THREADS_WITH_GPU_WORK,
         );
         let items: Vec<BacklogItem> = rx.try_iter().collect();
         assert_eq!(items.len(), 2);

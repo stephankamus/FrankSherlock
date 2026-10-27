@@ -52,6 +52,9 @@ type SidebarProps = {
   onRetryFailed?: (rootId?: number | null) => void;
   onDetectFaces: (root: RootInfo) => void;
   onCancelFaceDetect: () => void;
+  /** Read faces inside the next scan (the same field the Settings modal edits). */
+  faceDetection?: boolean;
+  onToggleFaceDetection?: () => void;
   onCancelScan: (scan: ScanJobStatus) => void;
   onResumeScan: (scan: ScanJobStatus) => void;
   /** Opens the settings modal (model, resize, OCR, dedupe, startup, chaining). */
@@ -83,6 +86,7 @@ export default function Sidebar({
   thumbRepair, onRepairThumbnails, onCancelThumbRepair, onProcessBacklog,
   backlog, onCancelBacklog, failedCount, onRetryFailed,
   onDetectFaces, onCancelFaceDetect,
+  faceDetection, onToggleFaceDetection,
   onCancelScan, onResumeScan, onOpenSettings,
   onSelectAlbum, onDeleteAlbum, onSelectSmartFolder, onDeleteSmartFolder,
   onReorderRoots, onReorderAlbums, onReorderSmartFolders, onFindDuplicates,
@@ -169,6 +173,10 @@ export default function Sidebar({
                   onCopyPath={() => onCopyRootPath(root)}
                   onRelink={!readOnly && onRelinkRoot ? () => onRelinkRoot(root) : undefined}
                   onDetectFaces={!readOnly ? () => onDetectFaces(root) : undefined}
+                  faceDetection={faceDetection}
+                  onToggleFaceDetection={
+                    !readOnly && onToggleFaceDetection ? onToggleFaceDetection : undefined
+                  }
                   onReclassify={
                     !readOnly && onReclassifyRoot ? () => onReclassifyRoot(root) : undefined
                   }
@@ -328,6 +336,16 @@ export default function Sidebar({
                     {backlogPct(backlog.classified, backlog.classifyTotal)}
                   </span>
                 </div>
+                {(backlog.facesTotal ?? 0) > 0 && (
+                  <div className="sidebar-item">
+                    Faces:
+                    <span>
+                      {(backlog.faces ?? 0).toLocaleString()} /{" "}
+                      {backlog.facesTotal.toLocaleString()}
+                      {backlogPct(backlog.faces ?? 0, backlog.facesTotal)}
+                    </span>
+                  </div>
+                )}
                 <div className="sidebar-item sidebar-item-muted">
                   {backlog.phase === "counting"
                     ? "Reading the index…"

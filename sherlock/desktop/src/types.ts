@@ -363,6 +363,10 @@ export type BacklogProgress = {
   /** Rows that actually need a classification. */
   classifyTotal: number;
   deduped: number;
+  /** Faces written by the producer; 0 unless `faceDetection` was on. */
+  faces: number;
+  /** Rows of this pass that needed face detection. */
+  facesTotal: number;
   failed: number;
   startedAt: number;
   phase: "counting" | "running" | "done" | "cancelled" | "failed";
@@ -437,6 +441,8 @@ export type ScanOverrides = {
   imageMaxSide?: number | null;
   promptProfile?: string | null;
   ocrEngine?: string | null;
+  /** Read faces during this scan, overriding `settings.toml` for one run. */
+  faceDetection?: boolean | null;
 };
 
 /** Startup behaviour for an already-indexed folder. */
@@ -470,6 +476,26 @@ export type VisionSettings = {
   dedupeDhashDistance: number;
   /** Continue a full scan into the pipeline (thumbnails + classification). */
   chainBacklog: boolean;
+  /**
+   * Read faces inside the scan pipeline, on the image it already decoded.
+   * Off by default: anything skipped here is still reachable from Detect Faces.
+   */
+  faceDetection: boolean;
+  /**
+   * Ceiling on the threads the face engine may use. `0` means every core.
+   *
+   * A ceiling, not an allocation: while a pass is also classifying, faces get one
+   * thread and the rest belongs to the vision model.
+   */
+  faceThreads: number;
+};
+
+/** What `faceThreads` resolves to on this machine. */
+export type FaceThreadPlan = {
+  cores: number;
+  budget: number;
+  workers: number;
+  intraThreads: number;
 };
 
 /**
@@ -488,6 +514,8 @@ export type SettingsUpdatePayload = {
   startupScan: StartupScanSetting;
   dedupeDhashDistance: number;
   chainBacklog: boolean;
+  faceDetection: boolean;
+  faceThreads: number;
 };
 
 export type VisionModelOption = {

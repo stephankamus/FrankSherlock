@@ -6,7 +6,7 @@ import {
   getCliFolderPath, getFailedClassifications, getFileMetadata, getFileProperties,
   getVisionSettings, listRoots,
   pendingScanSummary, relinkRoot, removeRoot, renameFile, reorderRoots,
-  resetRootClassifications, startScan, updateFileMetadata,
+  resetRootClassifications, startScan, updateFileMetadata, updateSettings,
 } from "./api";
 import type {
   DbStats,
@@ -20,6 +20,7 @@ import type {
   SetupStatus,
   SortField,
   SortOrder,
+  VisionSettings,
 } from "./types";
 import { errorMessage } from "./utils";
 import { fileName, formatBytes } from "./utils/format";
@@ -46,7 +47,7 @@ import EditMetadataModal from "./components/modals/EditMetadataModal";
 import PropertiesModal from "./components/modals/PropertiesModal";
 import ModelInfoModal from "./components/modals/ModelInfoModal";
 import ModelPickerModal from "./components/modals/ModelPickerModal";
-import SettingsModal from "./components/modals/SettingsModal";
+import SettingsModal, { toSettingsPayload } from "./components/modals/SettingsModal";
 import CreateAlbumModal from "./components/modals/CreateAlbumModal";
 import CreateSmartFolderModal from "./components/modals/CreateSmartFolderModal";
 import { useToast } from "./hooks/useToast";
@@ -98,6 +99,12 @@ export default function App() {
    * scan start; without it the modal is just a settings screen.
    */
   const [showSettings, setShowSettings] = useState(false);
+  /**
+   * Mirror of `settings.toml`, kept here so the root context menu can offer the
+   * "read faces during scans" switch without opening the Settings modal. Refreshed
+   * whenever the modal saves.
+   */
+  const [visionSettings, setVisionSettings] = useState<VisionSettings | null>(null);
   const [visionPicker, setVisionPicker] = useState<{
     rootPath: string | null;
     resolve: ((ok: boolean) => void) | null;
@@ -136,6 +143,42 @@ export default function App() {
   /* ── Feature hooks ── */
   const autoUpdate = useAutoUpdate({ onNotice: setNotice, onError: setError });
   const faces = useFaceDetection({ pollMs: POLL_MS, onNotice: setNotice, onError: setError });
+
+  // The root context menu offers the "read faces during scans" switch, so it needs the
+  // stored value before the Settings modal is ever opened.
+  useEffect(() => {
+    getVisionSettings()
+      .then(setVisionSettings)
+      .catch(() => {
+        /* the switch just stays off; the modal re-reads the file itself */
+      });
+  }, []);
+
+  /**
+   * Flip "read faces during scans" from the root context menu.
+   *
+   * Writes the whole settings struct back, exactly like the Settings modal, so the two
+   * entry points cannot drift and a rejected field leaves the file untouched.
+   */
+  const onToggleFaceDetection = useCallback(async () => {
+    if (!visionSettings) return;
+    try {
+      const saved = await updateSettings(
+        toSettingsPayload({
+          ...visionSettings,
+          faceDetection: !visionSettings.faceDetection,
+        }),
+      );
+      setVisionSettings(saved);
+      setNotice(
+        saved.faceDetection
+          ? "Scans will read faces on the image they already decode."
+          : "Scans will not read faces; Detect Faces still reads whatever is pending.",
+      );
+    } catch (err) {
+      setError(errorMessage(err));
+    }
+  }, [visionSettings, setNotice, setError]);
   const thumbRepair = useThumbRepair({
     pollMs: POLL_MS,
     onNotice: setNotice,
@@ -826,8 +869,11 @@ export default function App() {
         <SettingsModal
           onClose={() => setShowSettings(false)}
           // The runtime panel reads the model and the estimate, both of which depend
-          // on what was just saved.
-          onSaved={() => void scanManager.pollRuntimeAndScans()}
+          // on what was just saved; the context-menu switch reads the same value.
+          onSaved={(saved) => {
+            setVisionSettings(saved);
+            void scanManager.pollRuntimeAndScans();
+          }}
         />
       )}
       {visionPicker && (
@@ -1027,6 +1073,8 @@ export default function App() {
           faceProgress={faces.faceProgress}
           onDetectFaces={faces.onDetectFaces}
           onCancelFaceDetect={faces.onCancelFaceDetect}
+          faceDetection={Boolean(visionSettings?.faceDetection)}
+          onToggleFaceDetection={readOnly ? undefined : onToggleFaceDetection}
           onFindDuplicates={enterDuplicatesMode}
           onOpenPdfPasswords={enterPdfPasswordsMode}
           onOpenFaces={enterFacesMode}

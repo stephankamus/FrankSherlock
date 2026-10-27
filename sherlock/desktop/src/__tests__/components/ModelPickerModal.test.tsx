@@ -30,6 +30,8 @@ const settings: VisionSettings = {
   imageFilter: "auto",
   dedupeDhashDistance: 6,
   chainBacklog: true,
+  faceDetection: false,
+  faceThreads: 0,
 };
 
 const models: VisionModelOption[] = [

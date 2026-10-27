@@ -78,6 +78,8 @@ describe("RootCard", () => {
           classified: 30,
           classifyTotal: 80,
           deduped: 0,
+          faces: 0,
+          facesTotal: 0,
           failed: 0,
           startedAt: 0,
           phase: "running",
@@ -145,6 +147,27 @@ describe("RootCard", () => {
     const card = screen.getByText("photos").closest(".root-card")!;
     await userEvent.pointer({ keys: "[MouseRight]", target: card });
     expect(screen.getByRole("menuitem", { name: "Refresh Metadata" })).toBeInTheDocument();
+  });
+
+  it("offers the face switch with its current value and flips it", async () => {
+    const onToggleFaceDetection = vi.fn();
+    const { rerender } = render(
+      <RootCard root={sampleRoot} isSelected={false} scan={undefined} readOnly={false} faceDetection={false} onSelect={vi.fn()} onDelete={vi.fn()} onRescan={vi.fn()} onRefresh={vi.fn()} onCopyPath={vi.fn()} onToggleFaceDetection={onToggleFaceDetection} />
+    );
+    const card = screen.getByText("photos").closest(".root-card")!;
+    await userEvent.pointer({ keys: "[MouseRight]", target: card });
+    const item = screen.getByRole("menuitemcheckbox", { name: /Read faces during scans/ });
+    expect(item).toHaveAttribute("aria-checked", "false");
+    await userEvent.click(item);
+    expect(onToggleFaceDetection).toHaveBeenCalled();
+
+    rerender(
+      <RootCard root={sampleRoot} isSelected={false} scan={undefined} readOnly={false} faceDetection onSelect={vi.fn()} onDelete={vi.fn()} onRescan={vi.fn()} onRefresh={vi.fn()} onCopyPath={vi.fn()} onToggleFaceDetection={onToggleFaceDetection} />
+    );
+    await userEvent.pointer({ keys: "[MouseRight]", target: card });
+    expect(
+      screen.getByRole("menuitemcheckbox", { name: /Read faces during scans/ }),
+    ).toHaveAttribute("aria-checked", "true");
   });
 
   it("calls onRefresh from context menu", async () => {

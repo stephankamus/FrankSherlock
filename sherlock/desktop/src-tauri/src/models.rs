@@ -373,6 +373,22 @@ pub struct ScanContext {
     /// Hamming distance under which two photos are treated as the same picture
     /// during classification. `0` disables the dedupe.
     pub dedupe_dhash_distance: u32,
+    /// Run face detection inside the pipeline producer, on the image it has already
+    /// decoded. `false` leaves every row pending for the Detect Faces button.
+    pub face_detection: bool,
+    /// Where the buffalo_l ONNX models live. Only inspected, never downloaded from a
+    /// scan: without the files the pass skips faces and says so in the log.
+    pub models_dir: std::path::PathBuf,
+    /// Where the face crops are written.
+    pub face_crops_dir: std::path::PathBuf,
+    /// Directory holding `libonnxruntime.so`.
+    ///
+    /// Required, not decorative: `ort` with `load-dynamic` falls back to the loader
+    /// search path when nobody calls `init_from`, and a library missing there is a
+    /// `panic!` inside `ort::setup_api`, which killed the scan producer.
+    pub ort_lib_dir: std::path::PathBuf,
+    /// Ceiling on the threads the face engine may use; `0` means every core.
+    pub face_threads: u32,
 }
 
 impl ScanContext {
@@ -458,6 +474,9 @@ pub struct ScanOverrides {
     pub prompt_profile: Option<String>,
     /// `off` | `llm` | `surya`.
     pub ocr_engine: Option<String>,
+    /// Read faces during this scan. `None` keeps what `settings.toml` says, which is
+    /// what the context menu toggle overrides for a single run.
+    pub face_detection: Option<bool>,
 }
 
 impl ScanOverrides {
@@ -486,6 +505,9 @@ impl ScanOverrides {
             .and_then(crate::config::OcrEngine::parse)
         {
             ctx.ocr_engine = engine;
+        }
+        if let Some(face_detection) = self.face_detection {
+            ctx.face_detection = face_detection;
         }
     }
 }
@@ -709,6 +731,11 @@ pub struct BacklogProgress {
     pub classify_total: u64,
     /// Of those, how many were inherited instead of paying a vision request.
     pub deduped: u64,
+    /// Faces written by the producer. Non-zero only when `face_detection` is on.
+    pub faces: u64,
+    /// Rows of this pass that still need face detection, so the counter has a
+    /// denominator of its own instead of looking stuck at 0 %.
+    pub faces_total: u64,
     pub failed: u64,
     /// Unix seconds when the pass started, for rate and ETA.
     pub started_at: i64,

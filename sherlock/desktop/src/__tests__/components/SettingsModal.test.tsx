@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import {
   convertExistingDescriptions,
   getDescriptionLanguageStatus,
+  getFaceThreadPlan,
   getVisionSettings,
   updateSettings,
 } from "../../api";
@@ -16,6 +17,7 @@ vi.mock("../../api", () => ({
   convertExistingDescriptions: vi.fn(),
   getDescriptionLanguageStatus: vi.fn(),
   cancelDescriptionConversion: vi.fn(),
+  getFaceThreadPlan: vi.fn(),
 }));
 
 const settings: VisionSettings = {
@@ -28,6 +30,8 @@ const settings: VisionSettings = {
   startupScan: "ask",
   dedupeDhashDistance: 6,
   chainBacklog: true,
+  faceDetection: false,
+  faceThreads: 0,
 };
 
 describe("SettingsModal", () => {
@@ -39,6 +43,12 @@ describe("SettingsModal", () => {
     );
     (getDescriptionLanguageStatus as ReturnType<typeof vi.fn>).mockResolvedValue(null);
     (convertExistingDescriptions as ReturnType<typeof vi.fn>).mockResolvedValue(true);
+    (getFaceThreadPlan as ReturnType<typeof vi.fn>).mockResolvedValue({
+      cores: 16,
+      budget: 16,
+      workers: 4,
+      intraThreads: 4,
+    });
   });
 
   it("exposes the settings that had no UI before", async () => {
@@ -47,7 +57,13 @@ describe("SettingsModal", () => {
     expect(await screen.findByLabelText("Resize filter")).toHaveValue("auto");
     expect(screen.getByLabelText("Duplicate distance")).toHaveValue(6);
     expect(screen.getByLabelText("On startup")).toHaveValue("ask");
-    expect(screen.getByRole("checkbox")).toBeChecked();
+    // Both switches are checkboxes now: the chaining one and the face one.
+    expect(
+      screen.getByRole("checkbox", { name: /A full scan continues into the pipeline/ }),
+    ).toBeChecked();
+    expect(
+      screen.getByRole("checkbox", { name: /Read faces during the scan/ }),
+    ).not.toBeChecked();
   });
 
   it("sends the whole struct on save and reports what came back", async () => {
@@ -61,7 +77,9 @@ describe("SettingsModal", () => {
     const distance = screen.getByLabelText("Duplicate distance");
     await user.clear(distance);
     await user.type(distance, "4");
-    await user.click(screen.getByRole("checkbox"));
+    await user.click(
+      screen.getByRole("checkbox", { name: /A full scan continues into the pipeline/ }),
+    );
     await user.click(screen.getByRole("button", { name: "Save" }));
 
     await waitFor(() =>
@@ -75,10 +93,23 @@ describe("SettingsModal", () => {
         startupScan: "ask",
         dedupeDhashDistance: 4,
         chainBacklog: false,
+        faceDetection: false,
+        faceThreads: 0,
       }),
     );
     expect(onSaved).toHaveBeenCalled();
     expect(onClose).toHaveBeenCalled();
+  });
+
+  it("explains what the face thread ceiling resolves to", async () => {
+    render(<SettingsModal onClose={() => {}} />);
+
+    const field = await screen.findByLabelText("Face detection threads");
+    expect(field).toHaveValue(0);
+    // The hint states the machine, so "0" is not a guess.
+    expect(
+      await screen.findByText(/16 thread\(s\) as 4 session\(s\) of 4/),
+    ).toBeInTheDocument();
   });
 
   it("shows the backend error and stays open", async () => {

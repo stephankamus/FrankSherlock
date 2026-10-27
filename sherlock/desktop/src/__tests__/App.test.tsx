@@ -447,6 +447,8 @@ describe("App - API integration on init", () => {
       imageFilter: "auto",
       dedupeDhashDistance: 6,
       chainBacklog: true,
+      faceDetection: false,
+      faceThreads: 0,
     });
     mockInitApp.mockResolvedValueOnce(initResult({
       roots: [mockRoot],
@@ -477,6 +479,8 @@ describe("App - API integration on init", () => {
       imageFilter: "auto",
       dedupeDhashDistance: 6,
       chainBacklog: true,
+      faceDetection: false,
+      faceThreads: 0,
     });
     mockInitApp.mockResolvedValueOnce(initResult({ roots: [mockRoot] }));
     renderApp();
@@ -508,6 +512,8 @@ describe("App - API integration on init", () => {
       imageFilter: "auto",
       dedupeDhashDistance: 6,
       chainBacklog: true,
+      faceDetection: false,
+      faceThreads: 0,
     });
     mockInitApp.mockResolvedValueOnce(initResult({ roots: [mockRoot] }));
     renderApp();

@@ -17,6 +17,9 @@ type RootCardProps = {
   onCopyPath: () => void;
   onRelink?: () => void;
   onDetectFaces?: () => void;
+  /** Read faces inside the next scan (mirrors the Settings field). */
+  faceDetection?: boolean;
+  onToggleFaceDetection?: () => void;
   /** Clear the classification of this folder so it can be sent to the model again. */
   onReclassify?: () => void;
   onCancelScan?: () => void;
@@ -24,7 +27,7 @@ type RootCardProps = {
   onCancelFaceDetect?: () => void;
 };
 
-export default function RootCard({ root, isSelected, scan, readOnly, faceProgress, backlogProgress, onSelect, onDelete, onRescan, onRefresh, onCopyPath, onRelink, onDetectFaces, onReclassify, onCancelScan, onResumeScan, onCancelFaceDetect }: RootCardProps) {
+export default function RootCard({ root, isSelected, scan, readOnly, faceProgress, backlogProgress, onSelect, onDelete, onRescan, onRefresh, onCopyPath, onRelink, onDetectFaces, faceDetection, onToggleFaceDetection, onReclassify, onCancelScan, onResumeScan, onCancelFaceDetect }: RootCardProps) {
   const [showMenu, setShowMenu] = useState(false);
   const [menuPos, setMenuPos] = useState({ x: 0, y: 0 });
   const menuRef = useRef<HTMLDivElement>(null);
@@ -215,6 +218,9 @@ export default function RootCard({ root, isSelected, scan, readOnly, faceProgres
           <div className="root-card-scan-stats">
             {backlogProgress.thumbnailed.toLocaleString()} thumbnail(s),{" "}
             {backlogProgress.classified.toLocaleString()} classified
+            {(backlogProgress.faces ?? 0) > 0
+              ? `, ${backlogProgress.faces.toLocaleString()} face(s)`
+              : ""}
             {backlogProgress.failed > 0 ? `, ${backlogProgress.failed} failed` : ""}
           </div>
           {!readOnly && onCancelScan && (
@@ -264,6 +270,16 @@ export default function RootCard({ root, isSelected, scan, readOnly, faceProgres
           )}
           <button role="menuitem" onClick={(e) => { e.stopPropagation(); onRefresh(); setShowMenu(false); }}>Refresh Metadata</button>
           <button role="menuitem" onClick={(e) => { e.stopPropagation(); onRescan(); setShowMenu(false); }}>Rescan</button>
+          {onToggleFaceDetection && (
+            <button
+              role="menuitemcheckbox"
+              aria-checked={Boolean(faceDetection)}
+              title="Read faces while scanning, on the image the pipeline already decoded. Off by default; Detect Faces reads whatever is left."
+              onClick={(e) => { e.stopPropagation(); onToggleFaceDetection(); setShowMenu(false); }}
+            >
+              {faceDetection ? "✓ " : "  "}Read faces during scans
+            </button>
+          )}
           {onDetectFaces && (
             <button role="menuitem" onClick={(e) => { e.stopPropagation(); onDetectFaces(); setShowMenu(false); }}>Detect Faces</button>
           )}

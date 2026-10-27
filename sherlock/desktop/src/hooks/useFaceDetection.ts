@@ -38,8 +38,12 @@ export function useFaceDetection({ pollMs, onNotice, onError }: FaceDetectionCal
 
   async function onDetectFaces(root: RootInfo) {
     try {
-      await detectFaces(root.id);
-      onNotice(`Face detection started for "${root.rootName}"`);
+      const pending = await detectFaces(root.id);
+      onNotice(
+        pending > 0
+          ? `Face detection started for "${root.rootName}" — ${pending.toLocaleString()} image(s) pending`
+          : `No images pending face detection in "${root.rootName}"`,
+      );
     } catch (err) {
       onError(errorMessage(err));
     }

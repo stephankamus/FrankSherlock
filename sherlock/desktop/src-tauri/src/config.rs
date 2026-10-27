@@ -209,6 +209,22 @@ dedupe_dhash_distance = 6
 # Set to false for the old shape: a sequential thumbnail pass followed by the
 # sequential classification loop. "Refresh" is the thumbnail-only mode either way.
 chain_backlog = true
+
+# Read faces during the scan, on the image the pipeline has already decoded.
+# The switch exists to be flipped: it is the only honest way to see what SCRFD costs
+# on a real folder. Anything left pending is picked up by Detect Faces in the Faces
+# view, which reads on its own and in parallel.
+# - false  default: the scan only thumbnails and classifies
+# - true   the scan also writes face_detections and starts grouping people
+face_detection = false
+
+# Ceiling on the threads the face engine may use. 0 = every core of the machine.
+# It is a ceiling, not an allocation: while a pass is also classifying, faces get one
+# thread and the rest belongs to the vision model; a pass that only has faces left runs
+# GPU-idle and is allowed the whole budget. Lower it when the machine is busy with
+# something else. Each worker carries its own copy of the models (~180 MB), so the
+# engine starts at most 8 of them.
+face_threads = 0
 "#;
 
 /// Default longest-side for images sent to the vision model.
@@ -429,6 +445,21 @@ pub struct RuntimeSettings {
     /// what classifies with the producer/consumer overlap. Chaining them makes one
     /// action index and classify a folder, instead of asking for a second click.
     pub chain_backlog: bool,
+    /// Run face detection inside the scan pipeline, on the image the producer has
+    /// already decoded.
+    ///
+    /// Off by default: it is extra CPU inside the pass, the models are a 200 MB
+    /// download, and the whole point of the switch is to be able to run the same
+    /// folder with it on and off and compare. Anything left pending is picked up by
+    /// the Detect Faces button, which reads on its own.
+    pub face_detection: bool,
+    /// Ceiling on the threads the face engine may use; `0` means every core.
+    ///
+    /// It is a ceiling, not an allocation: a pass that is also classifying gets one
+    /// thread for faces and leaves the rest to Ollama, while a pass that only has
+    /// faces left (GPU idle) is allowed the whole budget. Lower it when the machine is
+    /// busy with something else.
+    pub face_threads: u32,
 }
 
 impl Default for RuntimeSettings {
@@ -443,6 +474,8 @@ impl Default for RuntimeSettings {
             startup_scan: StartupScan::Ask,
             dedupe_dhash_distance: DEFAULT_DEDUPE_DHASH_DISTANCE,
             chain_backlog: true,
+            face_detection: false,
+            face_threads: 0,
         }
     }
 }
@@ -466,6 +499,8 @@ pub struct SettingsUpdate {
     pub startup_scan: String,
     pub dedupe_dhash_distance: u32,
     pub chain_backlog: bool,
+    pub face_detection: bool,
+    pub face_threads: u32,
 }
 
 impl RuntimeSettings {
@@ -509,7 +544,14 @@ impl RuntimeSettings {
         self.startup_scan = startup_scan;
         self.dedupe_dhash_distance = Self::normalize_dedupe_distance(update.dedupe_dhash_distance);
         self.chain_backlog = update.chain_backlog;
+        self.face_detection = update.face_detection;
+        self.face_threads = Self::normalize_face_threads(update.face_threads);
         Ok(())
+    }
+
+    /// `0` keeps "all cores"; anything else is clamped to the supported ceiling.
+    pub fn normalize_face_threads(value: u32) -> u32 {
+        value.min(crate::face::MAX_FACE_THREADS)
     }
 
     /// `0` is preserved (meaning "original bytes"); anything else is clamped to the
@@ -654,6 +696,26 @@ fn parse_runtime_settings(data: &str) -> AppResult<RuntimeSettings> {
                     ),
                 }
             }
+            "face_detection" => {
+                let parsed = parse_settings_string(value.trim())?;
+                match parsed.to_ascii_lowercase().as_str() {
+                    "true" | "yes" | "1" | "on" => settings.face_detection = true,
+                    "false" | "no" | "0" | "off" => settings.face_detection = false,
+                    _ => log::warn!(
+                        "settings.toml: ignoring face_detection '{parsed}' (expected: true | false)"
+                    ),
+                }
+            }
+            "face_threads" => {
+                let parsed = parse_settings_string(value.trim())?;
+                match parsed.trim().parse::<u32>() {
+                    Ok(v) => settings.face_threads = RuntimeSettings::normalize_face_threads(v),
+                    Err(_) => log::warn!(
+                        "settings.toml: ignoring face_threads '{parsed}' (expected: 0..={})",
+                        crate::face::MAX_FACE_THREADS
+                    ),
+                }
+            }
             _ => {}
         }
     }
@@ -680,6 +742,8 @@ pub fn save_runtime_settings(settings: &RuntimeSettings) -> AppResult<()> {
         "startup_scan",
         "dedupe_dhash_distance",
         "chain_backlog",
+        "face_detection",
+        "face_threads",
     ];
 
     let model_line = match &settings.model_override {
@@ -740,6 +804,17 @@ pub fn save_runtime_settings(settings: &RuntimeSettings) -> AppResult<()> {
     replacements.insert(
         "chain_backlog",
         format!("chain_backlog = {}", settings.chain_backlog),
+    );
+    replacements.insert(
+        "face_detection",
+        format!("face_detection = {}", settings.face_detection),
+    );
+    replacements.insert(
+        "face_threads",
+        format!(
+            "face_threads = {}",
+            RuntimeSettings::normalize_face_threads(settings.face_threads)
+        ),
     );
 
     let mut out = String::new();
@@ -1080,6 +1155,8 @@ mod tests {
             startup_scan: "classify_only".to_string(),
             dedupe_dhash_distance: 4,
             chain_backlog: false,
+            face_detection: true,
+            face_threads: 6,
         }
     }
 
@@ -1146,6 +1223,8 @@ mod tests {
             startup_scan: StartupScan::ClassifyOnly,
             dedupe_dhash_distance: 4,
             chain_backlog: false,
+            face_detection: true,
+            face_threads: 6,
         };
         save_runtime_settings(&settings).expect("save");
 

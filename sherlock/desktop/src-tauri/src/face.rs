@@ -5,6 +5,7 @@
 //! buffalo_l pack) are downloaded on first use to `~/.local/share/frank_sherlock/models/buffalo_l/`.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use image::imageops::FilterType;
 use image::RgbImage;
@@ -37,6 +38,90 @@ const SCORE_THRESHOLD: f32 = 0.5;
 const NMS_THRESHOLD: f32 = 0.4;
 const STRIDES: [u32; 3] = [8, 16, 32];
 
+/// Smallest face kept, in original-image pixels.
+///
+/// Below this the ArcFace embedding is noise and what it does is pollute a person with
+/// a smear from a background. `_face_ab_test/docs/RESULTS.md` §4 measured 32 px as the
+/// floor for the faces this library actually contains.
+const MIN_FACE_SIZE_PX: f32 = 32.0;
+
+/// Smallest variance of the Laplacian, over the 112×112 aligned crop, that is still a
+/// face rather than motion blur. The same A/B keeps 70 % of the detections at
+/// `confidence ≥ 0.5, size ≥ 32 px, blur ≥ 50` and calls that a good starting point.
+const MIN_BLUR: f32 = 50.0;
+
+/// Thread budget of a detector built without an explicit one.
+const DEFAULT_INTRA_THREADS: usize = 4;
+
+/// Threads one session asks ONNX Runtime for, per worker.
+///
+/// ORT parallelizes inside a session, and that scaling flattens quickly on a graph the
+/// size of SCRFD: 1→2 threads is a big step, 4→8 is small, 8→16 is noise plus memory
+/// pressure. Four threads per session is the knee; the rest of the budget buys more
+/// sessions instead, which is what actually puts more images in flight.
+const THREADS_PER_WORKER: usize = 4;
+
+/// Most workers the pool will ever start.
+///
+/// Each worker owns a full copy of both ONNX sessions — roughly 180 MB of weights plus
+/// ORT arenas — so this is a memory ceiling as much as a CPU one: 8 workers ≈ 1,5 GB.
+pub const MAX_FACE_WORKERS: usize = 8;
+
+/// Largest value accepted for `face_threads`.
+pub const MAX_FACE_THREADS: u32 = 32;
+
+/// Total threads the face engine may use, resolved from the configured ceiling.
+///
+/// `0` means "everything the machine has". Callers decide how much of that budget each
+/// context may take: one thread while the GPU is classifying, the whole budget when the
+/// GPU is idle.
+pub fn thread_budget(configured: u32) -> usize {
+    if configured == 0 {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    } else {
+        (configured as usize).clamp(1, MAX_FACE_THREADS as usize)
+    }
+}
+
+/// How many sessions to run and how many threads each one gets.
+///
+/// `workers * intra` stays inside `budget`. One worker per `THREADS_PER_WORKER` of
+/// budget, capped at [`MAX_FACE_WORKERS`]; whatever is left over goes to the sessions.
+pub fn plan_pool(budget: usize) -> (usize, usize) {
+    let budget = budget.max(1);
+    let workers = (budget / THREADS_PER_WORKER).clamp(1, MAX_FACE_WORKERS);
+    let intra = (budget / workers).clamp(1, 8);
+    (workers, intra)
+}
+
+/// Serializes the whole face engine across the app.
+///
+/// Two passes at once — the Detect Faces button and a scan with `face_detection` on —
+/// would each load their own copies of the models and write `face_detections` for the
+/// same rows. Whichever starts first wins and the other one backs off for that run.
+static FACE_ENGINE_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// Held for the duration of a face pass.
+pub struct FaceEngineGuard;
+
+impl FaceEngineGuard {
+    /// `None` when another pass already holds the engine.
+    pub fn try_acquire() -> Option<Self> {
+        FACE_ENGINE_BUSY
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| FaceEngineGuard)
+    }
+}
+
+impl Drop for FaceEngineGuard {
+    fn drop(&mut self) {
+        FACE_ENGINE_BUSY.store(false, Ordering::SeqCst);
+    }
+}
+
 const BUFFALO_L_URL: &str =
     "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip";
 
@@ -50,6 +135,45 @@ const ARCFACE_REF: [[f32; 2]; 5] = [
 ];
 
 // ── Model management ────────────────────────────────────────────────
+
+/// The buffalo_l directory, when both ONNX files are already on disk.
+///
+/// `ensure_models` downloads ~200 MB, which a scan must never do behind the user's
+/// back: the pipeline uses this check and simply skips faces when the models are not
+/// there yet.
+pub fn models_present(models_dir: &Path) -> Option<PathBuf> {
+    let buffalo_dir = models_dir.join("buffalo_l");
+    let det = buffalo_dir.join("det_10g.onnx");
+    let rec = buffalo_dir.join("w600k_r50.onnx");
+    (det.exists() && rec.exists()).then_some(buffalo_dir)
+}
+
+/// Everything a face pass needs from the filesystem, checked without side effects.
+///
+/// Returns the buffalo_l directory when both the models and the ONNX Runtime library
+/// are present. The runtime check is not paranoia: `ort` with `load-dynamic` falls
+/// back to loading `libonnxruntime.so` from the loader search path when nobody calls
+/// `init_from`, and a missing library there is `expect("Failed to load ONNX Runtime
+/// dylib")` — a panic inside `setup_api`, not an `Err`. That panic took the scan
+/// producer down and the pass ended after 26 files.
+pub fn engine_ready(models_dir: &Path, ort_lib_dir: &Path) -> Result<PathBuf, String> {
+    let models = models_present(models_dir).ok_or_else(|| {
+        format!(
+            "the buffalo_l models are not installed in {} (Detect Faces downloads them)",
+            models_dir.display()
+        )
+    })?;
+
+    let lib = ort_lib_dir.join(onnxruntime_lib_name());
+    if !lib.exists() {
+        return Err(format!(
+            "ONNX Runtime is missing at {} (run scripts/download-onnxruntime.sh)",
+            lib.display()
+        ));
+    }
+
+    Ok(models)
+}
 
 pub fn ensure_models(models_dir: &Path) -> AppResult<PathBuf> {
     let buffalo_dir = models_dir.join("buffalo_l");
@@ -116,19 +240,33 @@ impl FaceDetector {
     /// Create a detector from a directory that already contains the ONNX model files.
     /// Call `ensure_models()` first to download them if needed.
     pub fn from_model_dir(buffalo_dir: &Path) -> AppResult<Self> {
+        Self::from_model_dir_with_threads(buffalo_dir, DEFAULT_INTRA_THREADS)
+    }
+
+    /// Same, with an explicit thread budget per session.
+    ///
+    /// A worker pool runs one detector per thread (see the caller in `lib.rs`), so the
+    /// budget is per worker: `workers × threads` must not exceed the cores, or the
+    /// pool competes with itself. Inside a scan it must also leave room for Ollama's
+    /// image preprocessor, which is the actual bottleneck of that pass.
+    pub fn from_model_dir_with_threads(
+        buffalo_dir: &Path,
+        intra_threads: usize,
+    ) -> AppResult<Self> {
         let det_path = buffalo_dir.join("det_10g.onnx");
         let rec_path = buffalo_dir.join("w600k_r50.onnx");
+        let intra_threads = intra_threads.max(1);
 
         let scrfd_session = Session::builder()
             .map_err(|e| AppError::Config(format!("SCRFD session builder: {e}")))?
-            .with_intra_threads(4)
+            .with_intra_threads(intra_threads)
             .map_err(|e| AppError::Config(format!("SCRFD intra threads: {e}")))?
             .commit_from_file(&det_path)
             .map_err(|e| AppError::Config(format!("SCRFD load failed: {e}")))?;
 
         let arcface_session = Session::builder()
             .map_err(|e| AppError::Config(format!("ArcFace session builder: {e}")))?
-            .with_intra_threads(4)
+            .with_intra_threads(intra_threads)
             .map_err(|e| AppError::Config(format!("ArcFace intra threads: {e}")))?
             .commit_from_file(&rec_path)
             .map_err(|e| AppError::Config(format!("ArcFace load failed: {e}")))?;
@@ -139,16 +277,31 @@ impl FaceDetector {
         })
     }
 
+    /// Detect and embed every face of a file, reading and decoding it here.
+    ///
+    /// Kept for tests and tools. Every in-app caller already holds the decoded image
+    /// (the scan producer decodes it for the thumbnail) and must use
+    /// [`FaceDetector::detect_decoded`] instead: decoding a 12–14 MP photo twice is
+    /// the largest single cost of a face pass.
+    #[allow(dead_code)]
     pub fn detect(&mut self, image_path: &Path) -> AppResult<Vec<FaceDetection>> {
         let raw_img = image::open(image_path)
             .map_err(|e| AppError::Config(format!("Failed to open image: {e}")))?;
         let orientation = crate::exif::extract_orientation(image_path);
-        let img = crate::exif::apply_orientation(raw_img, orientation).to_rgb8();
+        let img = crate::exif::apply_orientation(raw_img, orientation);
+        self.detect_decoded(&img)
+    }
 
-        let (orig_w, orig_h) = (img.width(), img.height());
+    /// Detect and embed every face of an image that is already decoded and oriented.
+    ///
+    /// Bounding boxes and keypoints are in the coordinates of `img`, which are the
+    /// original image coordinates because orientation was applied before the call.
+    pub fn detect_decoded(&mut self, img: &image::DynamicImage) -> AppResult<Vec<FaceDetection>> {
+        let rgb = as_rgb8(img);
+        let (orig_w, orig_h) = (rgb.width(), rgb.height());
 
         // 1. Preprocess for SCRFD
-        let (tensor, scale, pad_x, pad_y) = preprocess_scrfd(&img);
+        let (tensor, scale, pad_x, pad_y) = preprocess_scrfd(&rgb);
 
         // 2. Create input Value and run SCRFD
         let input_value = ort::value::Tensor::from_array(tensor)
@@ -169,10 +322,23 @@ impl FaceDetector {
             nms(&raw_dets, NMS_THRESHOLD)
         }; // outputs dropped here
 
-        // 5. Extract embeddings for each kept face
+        // 5. Align, gate and embed each kept face
         let mut results = Vec::with_capacity(kept.len());
         for det in &kept {
-            let embedding = self.compute_embedding(&img, det)?;
+            let face_w = det.bbox[2] - det.bbox[0];
+            let face_h = det.bbox[3] - det.bbox[1];
+            if face_w.min(face_h) < MIN_FACE_SIZE_PX {
+                continue;
+            }
+
+            // The aligned crop is what ArcFace consumes, so measuring its sharpness
+            // costs nothing extra and keeps a motion-blurred smudge out of a person.
+            let aligned = align_face(&rgb, &det.keypoints);
+            if laplacian_variance(&aligned) < MIN_BLUR {
+                continue;
+            }
+
+            let embedding = self.embed(&aligned)?;
             results.push(FaceDetection {
                 bbox: det.bbox,
                 confidence: det.confidence,
@@ -184,12 +350,9 @@ impl FaceDetector {
         Ok(results)
     }
 
-    fn compute_embedding(&mut self, img: &RgbImage, det: &RawDetection) -> AppResult<Vec<f32>> {
-        // Align face using 5 keypoints
-        let aligned = align_face(img, &det.keypoints);
-
+    fn embed(&mut self, aligned: &RgbImage) -> AppResult<Vec<f32>> {
         // Preprocess for ArcFace
-        let tensor = preprocess_arcface(&aligned);
+        let tensor = preprocess_arcface(aligned);
 
         // Create input Value and run ArcFace
         let input_value = ort::value::Tensor::from_array(tensor)
@@ -217,6 +380,51 @@ impl FaceDetector {
     }
 }
 
+/// Borrow an RGB buffer when the decoded image already is one.
+///
+/// `to_rgb8()` on a 12 MP RGBA photo allocates and copies 36 MB; the pipeline producer
+/// hands us whatever the decoder produced.
+fn as_rgb8(img: &image::DynamicImage) -> std::borrow::Cow<'_, RgbImage> {
+    use std::borrow::Cow;
+    match img {
+        image::DynamicImage::ImageRgb8(rgb) => Cow::Borrowed(rgb),
+        other => Cow::Owned(other.to_rgb8()),
+    }
+}
+
+/// Variance of the Laplacian over the aligned crop, the standard sharpness proxy.
+fn laplacian_variance(img: &RgbImage) -> f32 {
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    if w < 3 || h < 3 {
+        return 0.0;
+    }
+    let gray = |x: i32, y: i32| -> f32 {
+        let px = img.get_pixel(x as u32, y as u32);
+        0.299 * px[0] as f32 + 0.587 * px[1] as f32 + 0.114 * px[2] as f32
+    };
+
+    let mut sum = 0f64;
+    let mut sum_sq = 0f64;
+    let mut count = 0u32;
+    for y in 1..h - 1 {
+        for x in 1..w - 1 {
+            let lap = -4.0 * gray(x, y)
+                + gray(x - 1, y)
+                + gray(x + 1, y)
+                + gray(x, y - 1)
+                + gray(x, y + 1);
+            sum += lap as f64;
+            sum_sq += (lap * lap) as f64;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return 0.0;
+    }
+    let mean = sum / count as f64;
+    (sum_sq / count as f64 - mean * mean).max(0.0) as f32
+}
+
 // ── SCRFD preprocessing ─────────────────────────────────────────────
 
 fn preprocess_scrfd(img: &RgbImage) -> (Array4<f32>, f32, f32, f32) {
@@ -235,17 +443,30 @@ fn preprocess_scrfd(img: &RgbImage) -> (Array4<f32>, f32, f32, f32) {
     let pad_left = pad_x.floor() as u32;
     let pad_top = pad_y.floor() as u32;
 
-    // Build NCHW tensor [1, 3, 640, 640]
-    let mut tensor = Array4::<f32>::zeros((1, 3, target as usize, target as usize));
-    for y in 0..new_h {
-        for x in 0..new_w {
-            let px = resized.get_pixel(x, y);
-            let ty = (y + pad_top) as usize;
-            let tx = (x + pad_left) as usize;
-            if ty < target as usize && tx < target as usize {
-                tensor[[0, 0, ty, tx]] = (px[0] as f32 - 127.5) / 128.0;
-                tensor[[0, 1, ty, tx]] = (px[1] as f32 - 127.5) / 128.0;
-                tensor[[0, 2, ty, tx]] = (px[2] as f32 - 127.5) / 128.0;
+    // Build NCHW tensor [1, 3, 640, 640] over one flat slice: the padding stays at
+    // 0.0, which after this normalization is the 127.5 grey SCRFD expects.
+    let side = target as usize;
+    let plane = side * side;
+    let mut tensor = Array4::<f32>::zeros((1, 3, side, side));
+    {
+        let flat = tensor
+            .as_slice_mut()
+            .expect("freshly built Array4 is contiguous");
+        let row_bytes = new_w as usize * 3;
+        for (y, row) in resized.as_raw().chunks_exact(row_bytes.max(1)).enumerate() {
+            let ty = y + pad_top as usize;
+            if ty >= side {
+                break;
+            }
+            let row_start = ty * side + pad_left as usize;
+            for (x, px) in row.chunks_exact(3).enumerate() {
+                let index = row_start + x;
+                if index >= plane {
+                    break;
+                }
+                flat[index] = (px[0] as f32 - 127.5) / 128.0;
+                flat[plane + index] = (px[1] as f32 - 127.5) / 128.0;
+                flat[2 * plane + index] = (px[2] as f32 - 127.5) / 128.0;
             }
         }
     }
@@ -437,23 +658,48 @@ fn align_face(img: &RgbImage, keypoints: &[[f32; 2]; 5]) -> RgbImage {
     let ia = tfm_a[0] * inv_det;
     let ib = tfm_a[1] * inv_det;
 
+    // Bilinear instead of nearest: the transform is a rotation plus a scale, so every
+    // source pixel lands between four destination pixels. Nearest kept the aliasing
+    // and it ends up in the embedding, which is the only thing ArcFace sees.
     for dy in 0..out_size {
         for dx in 0..out_size {
             let px = dx as f32 - tfm_b[0];
             let py = dy as f32 - tfm_b[1];
             let sx = ia * px + ib * py;
             let sy = -ib * px + ia * py;
-
-            let sx_i = sx.round() as i32;
-            let sy_i = sy.round() as i32;
-            if sx_i >= 0 && sy_i >= 0 && (sx_i as u32) < img.width() && (sy_i as u32) < img.height()
-            {
-                aligned.put_pixel(dx, dy, *img.get_pixel(sx_i as u32, sy_i as u32));
-            }
+            aligned.put_pixel(dx, dy, sample_bilinear(img, sx, sy));
         }
     }
 
     aligned
+}
+
+/// Bilinear sample of `img` at `(x, y)`, black outside the image.
+fn sample_bilinear(img: &RgbImage, x: f32, y: f32) -> image::Rgb<u8> {
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    if x < 0.0 || y < 0.0 || x > (w - 1) as f32 || y > (h - 1) as f32 {
+        return image::Rgb([0, 0, 0]);
+    }
+
+    let x0 = x.floor() as i32;
+    let y0 = y.floor() as i32;
+    let x1 = (x0 + 1).min(w - 1);
+    let y1 = (y0 + 1).min(h - 1);
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+
+    let p00 = img.get_pixel(x0 as u32, y0 as u32);
+    let p10 = img.get_pixel(x1 as u32, y0 as u32);
+    let p01 = img.get_pixel(x0 as u32, y1 as u32);
+    let p11 = img.get_pixel(x1 as u32, y1 as u32);
+
+    let mut out = [0u8; 3];
+    for channel in 0..3 {
+        let top = p00[channel] as f32 * (1.0 - fx) + p10[channel] as f32 * fx;
+        let bottom = p01[channel] as f32 * (1.0 - fx) + p11[channel] as f32 * fx;
+        out[channel] = (top * (1.0 - fy) + bottom * fy).round().clamp(0.0, 255.0) as u8;
+    }
+    image::Rgb(out)
 }
 
 fn estimate_similarity_transform(
@@ -555,13 +801,19 @@ fn crop_center(img: &RgbImage, size: u32) -> RgbImage {
 
 fn preprocess_arcface(img: &RgbImage) -> Array4<f32> {
     let size = ARCFACE_INPUT_SIZE as usize;
+    let plane = size * size;
     let mut tensor = Array4::<f32>::zeros((1, 3, size, size));
-    for y in 0..size {
-        for x in 0..size {
-            let px = img.get_pixel(x as u32, y as u32);
-            tensor[[0, 0, y, x]] = (px[0] as f32 - 127.5) / 128.0;
-            tensor[[0, 1, y, x]] = (px[1] as f32 - 127.5) / 128.0;
-            tensor[[0, 2, y, x]] = (px[2] as f32 - 127.5) / 128.0;
+    {
+        let flat = tensor
+            .as_slice_mut()
+            .expect("freshly built Array4 is contiguous");
+        for (index, px) in img.as_raw().chunks_exact(3).enumerate() {
+            if index >= plane {
+                break;
+            }
+            flat[index] = (px[0] as f32 - 127.5) / 128.0;
+            flat[plane + index] = (px[1] as f32 - 127.5) / 128.0;
+            flat[2 * plane + index] = (px[2] as f32 - 127.5) / 128.0;
         }
     }
     tensor
@@ -609,6 +861,20 @@ pub fn crop_face_from_image(
     output_dir: &Path,
     face_id: i64,
 ) -> AppResult<PathBuf> {
+    crop_face_to_file(img, bbox, output_dir, &face_id.to_string())
+}
+
+/// Crop one face to `<output_dir>/<stem>.jpg`.
+///
+/// The stem is chosen by the caller: a face id when the id already exists (crop
+/// regeneration), or a deterministic `<file_id>_<index>` when the crops are written
+/// before the rows, which is what lets the whole file be recorded in one transaction.
+pub fn crop_face_to_file(
+    img: &image::DynamicImage,
+    bbox: &[f32; 4],
+    output_dir: &Path,
+    stem: &str,
+) -> AppResult<PathBuf> {
     let (img_w, img_h) = (img.width() as f32, img.height() as f32);
     let face_w = bbox[2] - bbox[0];
     let face_h = bbox[3] - bbox[1];
@@ -631,12 +897,46 @@ pub fn crop_face_from_image(
     let new_h = ((crop_h as f32 * scale).round() as u32).max(1);
     let resized = cropped.resize_exact(new_w, new_h, image::imageops::FilterType::Lanczos3);
 
-    let out_path = output_dir.join(format!("{face_id}.jpg"));
+    let out_path = output_dir.join(format!("{stem}.jpg"));
     resized
         .to_rgb8()
         .save_with_format(&out_path, image::ImageFormat::Jpeg)
         .map_err(|e| AppError::Config(format!("Failed to save face crop: {e}")))?;
     Ok(out_path)
+}
+
+/// Detect the faces of an already decoded image and write their crops.
+///
+/// The whole point of the pair: one decode produces the detection, the embedding and
+/// the crop files. Returns the detections and one crop path per face (`None` when a
+/// crop could not be written), ready for a single `record_faces` transaction.
+///
+/// Crop names are `<file_id>_<index>` rather than the face id, because the rows are
+/// written *after* the files and using the id would need an UPDATE per face.
+pub fn detect_and_crop(
+    detector: &mut FaceDetector,
+    image: &image::DynamicImage,
+    output_dir: &Path,
+    file_id: i64,
+) -> AppResult<(Vec<FaceDetection>, Vec<Option<String>>)> {
+    let faces = detector.detect_decoded(image)?;
+    if faces.is_empty() {
+        return Ok((faces, Vec::new()));
+    }
+
+    let mut crops = Vec::with_capacity(faces.len());
+    for (index, face) in faces.iter().enumerate() {
+        let stem = format!("{file_id}_{index}");
+        match crop_face_to_file(image, &face.bbox, output_dir, &stem) {
+            Ok(path) => crops.push(Some(path.to_string_lossy().into_owned())),
+            Err(e) => {
+                log::warn!("Failed to write face crop {index} of file {file_id}: {e}");
+                crops.push(None);
+            }
+        }
+    }
+
+    Ok((faces, crops))
 }
 
 /// Result from a single face crop within a batch.
@@ -907,6 +1207,53 @@ mod tests {
         // SessionBuilder::new() performs the OrtApi version handshake.
         ort::session::builder::SessionBuilder::new()
             .expect("OrtApi handshake with bundled ONNX Runtime must succeed");
+    }
+
+    /// The budget is the ceiling, and the split keeps `workers * intra` inside it.
+    #[test]
+    fn plan_pool_splits_the_budget_into_sessions() {
+        // A single core gets one session with one thread.
+        assert_eq!(plan_pool(1), (1, 1));
+        // One session until there is enough budget for a second one.
+        assert_eq!(plan_pool(4), (1, 4));
+        assert_eq!(plan_pool(8), (2, 4));
+        // 16 cores: four sessions of four, the shape the old hardcoded numbers gave.
+        assert_eq!(plan_pool(16), (4, 4));
+        // Above the worker cap the extra threads stay inside the sessions.
+        assert_eq!(plan_pool(32), (MAX_FACE_WORKERS, 4));
+        // A huge budget cannot start more workers than the memory ceiling allows.
+        assert_eq!(plan_pool(64).0, MAX_FACE_WORKERS);
+    }
+
+    #[test]
+    fn thread_budget_zero_means_every_core() {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        assert_eq!(thread_budget(0), cores);
+        assert_eq!(thread_budget(3), 3);
+        assert_eq!(thread_budget(MAX_FACE_THREADS + 10), 32);
+    }
+
+    /// A pass may only start when both halves exist. The runtime half is the one that
+    /// bit: `ort` panics — not errors — when it has to look for the dylib on its own.
+    #[test]
+    fn engine_ready_requires_the_models_and_the_runtime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let error = engine_ready(dir.path(), dir.path()).expect_err("no models, no runtime");
+        assert!(error.contains("buffalo_l"), "{error}");
+
+        let buffalo = dir.path().join("buffalo_l");
+        std::fs::create_dir_all(&buffalo).expect("buffalo");
+        std::fs::write(buffalo.join("det_10g.onnx"), b"stub").expect("det");
+        std::fs::write(buffalo.join("w600k_r50.onnx"), b"stub").expect("rec");
+
+        let error = engine_ready(dir.path(), dir.path()).expect_err("models but no runtime");
+        assert!(error.contains("ONNX Runtime"), "{error}");
+
+        std::fs::write(dir.path().join(onnxruntime_lib_name()), b"stub").expect("lib");
+        assert!(engine_ready(dir.path(), dir.path()).is_ok());
     }
 
     #[test]

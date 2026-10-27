@@ -24,7 +24,7 @@ mod bench_cost;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use config::{prepare_dirs, resolve_paths, AppPaths};
@@ -37,6 +37,12 @@ use models::{
 };
 use tauri::Manager;
 use tauri::State;
+
+/// Cosine distance used to fold faces into the same person.
+///
+/// Lives here until it becomes a setting: the value was hardcoded in two places (this
+/// file and the tests) and the clustering pass now has to read the same one.
+const FACE_CLUSTER_THRESHOLD: f32 = 0.30;
 
 #[derive(Debug, Clone)]
 struct ModelSelection {
@@ -482,6 +488,8 @@ fn start_scan_job(
             classified: 0,
             classify_total: 0,
             deduped: 0,
+            faces: 0,
+            faces_total: 0,
             failed: 0,
             started_at: unix_now_secs(),
             phase: "counting".to_string(),
@@ -1439,8 +1447,14 @@ fn detect_faces(
     root_id: i64,
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     require_writable(state.inner())?;
+
+    // How much there is to do, answered before the work starts: the toast is the only
+    // place the user sees the queue, and "started" alone says nothing about whether
+    // the scan left 3 or 30 000 images behind.
+    let pending =
+        db::pending_face_count(&state.paths.db_file, &[root_id]).map_err(|e| e.to_string())?;
 
     // Check if already running (a lingering "failed" state does not block a retry)
     {
@@ -1468,6 +1482,11 @@ fn detect_faces(
     tauri::async_runtime::spawn(async move {
         let progress_cleanup = progress_arc.clone();
         let result = tauri::async_runtime::spawn_blocking(move || {
+            // One engine for the whole app: a scan with `face_detection` on holds the
+            // same guard, and two passes would load two copies of the models and write
+            // face_detections for the same rows.
+            let _guard = face::FaceEngineGuard::try_acquire()
+                .ok_or_else(|| "Face detection is already running".to_string())?;
             run_face_detection(
                 &db_path,
                 &models_dir,
@@ -1501,7 +1520,7 @@ fn detect_faces(
         }
     });
 
-    Ok(())
+    Ok(pending)
 }
 
 #[tauri::command]
@@ -1537,9 +1556,55 @@ fn get_face_stats(
     db::get_face_stats(&state.paths.db_file, &root_scope).map_err(|e| e.to_string())
 }
 
+/// How many images of the current scope are still pending face detection.
+///
+/// This is what the Detect Faces button shows, and it is the same predicate the pass
+/// selects on: a scan with `face_detection` off leaves everything here on purpose.
+#[tauri::command]
+fn get_pending_face_count(root_scope: Vec<i64>, state: State<'_, AppState>) -> Result<u64, String> {
+    db::pending_face_count(&state.paths.db_file, &root_scope).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn cluster_faces(state: State<'_, AppState>) -> Result<models::ClusterResult, String> {
-    db::cluster_faces(&state.paths.db_file, 0.30).map_err(|e| e.to_string())
+    db::cluster_faces(&state.paths.db_file, FACE_CLUSTER_THRESHOLD).map_err(|e| e.to_string())
+}
+
+/// What `face_threads` resolves to on this machine.
+///
+/// The settings screen shows it so "0 = all cores" is not a guess: the number of cores,
+/// how many sessions the budget buys and how many threads each one gets.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FaceThreadPlan {
+    cores: usize,
+    /// Threads the engine may use, after resolving the configured ceiling.
+    budget: usize,
+    /// Sessions the pool starts, each with its own copy of the models.
+    workers: usize,
+    intra_threads: usize,
+}
+
+fn face_thread_plan_for(configured: u32) -> FaceThreadPlan {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let budget = face::thread_budget(configured);
+    let (workers, intra_threads) = face::plan_pool(budget);
+    FaceThreadPlan {
+        cores,
+        budget,
+        workers,
+        intra_threads,
+    }
+}
+
+#[tauri::command]
+fn get_face_thread_plan() -> FaceThreadPlan {
+    let configured = config::load_runtime_settings()
+        .map(|settings| settings.face_threads)
+        .unwrap_or(0);
+    face_thread_plan_for(configured)
 }
 
 #[tauri::command]
@@ -1838,16 +1903,11 @@ fn run_face_detection(
             ));
         }
     }
-    let mut detector = face::FaceDetector::from_model_dir(&buffalo_dir).map_err(|e| {
-        set_failed(
-            &progress_arc,
-            root_id,
-            format!("Failed to load face detection model: {e}"),
-        )
-    })?;
+    // The sessions are built by each worker, once the work list says there is
+    // something to do: loading 180 MB of models to find an empty queue is pure loss.
 
     // Get list of files to process
-    let files = db::list_files_needing_face_scan(db_path, root_id)
+    let files = db::list_files_needing_face_scan(db_path, Some(root_id))
         .map_err(|e| set_failed(&progress_arc, root_id, format!("Failed to list files: {e}")))?;
 
     let total = files.len() as u64;
@@ -1865,89 +1925,100 @@ fn run_face_detection(
         });
     }
 
-    let mut processed = 0u64;
-    let mut faces_found = 0u64;
+    if total == 0 {
+        let mut progress = progress_arc.lock().expect("face progress mutex poisoned");
+        *progress = None;
+        log::info!("Face detection: nothing pending for root {root_id}");
+        return Ok(());
+    }
 
-    for file in &files {
-        if cancel_flag.load(Ordering::Relaxed) {
-            log::info!("Face detection cancelled at {processed}/{total}");
-            break;
-        }
+    // One detector per worker. `Session::run` takes `&mut self`, so a single shared
+    // detector would serialize every inference and leave the workers waiting on a
+    // lock; separate sessions cost their model load once and then run truly in
+    // parallel. `plan_pool` keeps `workers * intra` inside the configured ceiling, and
+    // this is exactly the place that may spend all of it: the button runs alone.
+    let budget = face::thread_budget(
+        config::load_runtime_settings()
+            .map(|settings| settings.face_threads)
+            .unwrap_or(0),
+    );
+    let (planned_workers, intra_threads) = face::plan_pool(budget);
+    let workers = planned_workers.min(files.len()).max(1);
 
-        let abs_path = std::path::Path::new(&file.abs_path);
-        if !abs_path.exists() {
-            processed += 1;
-            // Mark as scanned with no faces so we don't retry
-            let _ = db::mark_no_faces(db_path, file.id);
-            continue;
-        }
+    log::info!(
+        "Face detection: {total} file(s), {workers} worker(s), {intra_threads} thread(s) per session \
+         (budget {budget})"
+    );
 
-        match detector.detect(abs_path) {
-            Ok(faces) => {
-                if faces.is_empty() {
-                    let _ = db::mark_no_faces(db_path, file.id);
-                } else {
-                    faces_found += faces.len() as u64;
-                    match db::insert_face_detections(db_path, file.id, &faces) {
-                        Ok(face_ids) => {
-                            // Open image ONCE for all face crops in this file
-                            let crop_img = image::open(abs_path).ok().map(|raw| {
-                                let orientation = crate::exif::extract_orientation(abs_path);
-                                crate::exif::apply_orientation(raw, orientation)
-                            });
-                            if let Some(ref img) = crop_img {
-                                for (face, face_id) in faces.iter().zip(face_ids.iter()) {
-                                    match face::crop_face_from_image(
-                                        img,
-                                        &face.bbox,
-                                        face_crops_dir,
-                                        *face_id,
-                                    ) {
-                                        Ok(crop_path) => {
-                                            let _ = db::update_face_crop_path(
-                                                db_path,
-                                                *face_id,
-                                                &crop_path.to_string_lossy(),
-                                            );
-                                        }
-                                        Err(e) => {
-                                            log::warn!(
-                                                "Failed to generate face crop for face {}: {e}",
-                                                face_id
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to insert faces for {}: {e}", file.rel_path);
-                        }
+    let processed = AtomicU64::new(0);
+    let faces_found = AtomicU64::new(0);
+    let next = AtomicUsize::new(0);
+
+    // Progress is published by whichever worker finishes a file. The mutex is the one
+    // the UI already polls, so the percent moves without a second channel.
+    let publish = |processed: u64, found: u64| {
+        let mut progress = progress_arc.lock().expect("face progress mutex poisoned");
+        *progress = Some(models::FaceDetectProgress {
+            root_id,
+            total,
+            processed,
+            faces_found: found,
+            phase: "detecting".into(),
+            error: None,
+        });
+    };
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                // `ort` and ONNX Runtime are native code: a missing library or a bad
+                // driver panics instead of returning an error, and a panic here would
+                // abort the whole scope — and the pass — through the implicit join.
+                let loaded = std::panic::catch_unwind(|| {
+                    face::FaceDetector::from_model_dir_with_threads(&buffalo_dir, intra_threads)
+                });
+                let mut detector = match loaded {
+                    Ok(Ok(detector)) => detector,
+                    Ok(Err(e)) => {
+                        log::error!("Face detection worker could not load the models: {e}");
+                        return;
                     }
+                    Err(_) => {
+                        log::error!("Face detection worker panicked while loading the models");
+                        return;
+                    }
+                };
+
+                loop {
+                    if cancel_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(file) = files.get(index) else {
+                        break;
+                    };
+
+                    // One bad file (or one native panic) must not end the pass.
+                    let survived = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        detect_one_file(&mut detector, db_path, face_crops_dir, file, &faces_found);
+                    }))
+                    .is_ok();
+                    if !survived {
+                        log::error!(
+                            "Face detection panicked on {}; the row stays pending",
+                            file.rel_path
+                        );
+                    }
+
+                    let done = processed.fetch_add(1, Ordering::Relaxed) + 1;
+                    publish(done, faces_found.load(Ordering::Relaxed));
                 }
-            }
-            Err(e) => {
-                log::warn!("Face detection failed for {}: {e}", file.rel_path);
-                // Mark as scanned so we don't retry
-                let _ = db::mark_no_faces(db_path, file.id);
-            }
-        }
-
-        processed += 1;
-
-        // Update progress
-        {
-            let mut progress = progress_arc.lock().expect("face progress mutex poisoned");
-            *progress = Some(models::FaceDetectProgress {
-                root_id,
-                total,
-                processed,
-                faces_found,
-                phase: "detecting".into(),
-                error: None,
             });
         }
-    }
+    });
+
+    let processed = processed.load(Ordering::Relaxed);
+    let faces_found = faces_found.load(Ordering::Relaxed);
 
     // Clear progress to signal completion
     {
@@ -1955,11 +2026,14 @@ fn run_face_detection(
         *progress = None;
     }
 
+    if cancel_flag.load(Ordering::Relaxed) {
+        log::info!("Face detection cancelled at {processed}/{total}");
+    }
     log::info!("Face detection complete: {processed}/{total} images, {faces_found} faces found");
 
     // Auto-cluster faces into person groups
     if faces_found > 0 {
-        match db::cluster_faces(db_path, 0.30) {
+        match db::cluster_faces(db_path, FACE_CLUSTER_THRESHOLD) {
             Ok(result) => {
                 log::info!(
                     "Face clustering: {} new persons, {} faces assigned",
@@ -1974,6 +2048,59 @@ fn run_face_detection(
     }
 
     Ok(())
+}
+
+/// Detect, crop and store the faces of one file.
+///
+/// Shared by the parallel manual pass. Everything happens on a single decode: the
+/// crops come from the same buffer the detector saw, which is what removed the second
+/// `image::open` that used to run for every photo with a face.
+fn detect_one_file(
+    detector: &mut face::FaceDetector,
+    db_path: &std::path::Path,
+    face_crops_dir: &std::path::Path,
+    file: &models::UnclassifiedFile,
+    faces_found: &AtomicU64,
+) {
+    let abs_path = std::path::Path::new(&file.abs_path);
+    let decoded = match image::open(abs_path) {
+        Ok(raw) => {
+            let orientation = crate::exif::extract_orientation(abs_path);
+            crate::exif::apply_orientation(raw, orientation)
+        }
+        Err(e) => {
+            // A read failure is not an answer. The row stays pending so the next pass
+            // retries it; the old code recorded it as "scanned, no faces" and the
+            // photo never came back.
+            log::warn!("Face detection could not read {}: {e}", file.rel_path);
+            return;
+        }
+    };
+
+    let (faces, crop_paths) =
+        match face::detect_and_crop(detector, &decoded, face_crops_dir, file.id) {
+            Ok(result) => result,
+            Err(e) => {
+                log::warn!("Face detection failed for {}: {e}", file.rel_path);
+                return;
+            }
+        };
+
+    if faces.is_empty() {
+        if let Err(e) = db::mark_faces_scanned(db_path, file.id) {
+            log::warn!("Could not mark {} as scanned for faces: {e}", file.rel_path);
+        }
+        return;
+    }
+
+    match db::record_faces(db_path, file.id, &faces, &crop_paths) {
+        Ok(_) => {
+            faces_found.fetch_add(faces.len() as u64, Ordering::Relaxed);
+        }
+        Err(e) => {
+            log::warn!("Failed to store faces for {}: {e}", file.rel_path);
+        }
+    }
 }
 
 fn compute_setup_status(app_state: &AppState) -> SetupStatus {
@@ -2196,6 +2323,11 @@ fn build_scan_context(app_state: &AppState, app_handle: &tauri::AppHandle) -> mo
         ocr_engine: vision.ocr_engine,
         pdfium_lib_path,
         dedupe_dhash_distance: runtime.dedupe_dhash_distance,
+        face_detection: runtime.face_detection,
+        models_dir: app_state.paths.models_dir.clone(),
+        face_crops_dir: app_state.paths.face_crops_dir.clone(),
+        ort_lib_dir: resolve_ort_lib(app_handle),
+        face_threads: runtime.face_threads,
     }
 }
 
@@ -2372,6 +2504,8 @@ fn spawn_scan_worker_if_needed(
                 classified: 0,
                 classify_total: 0,
                 deduped: 0,
+                faces: 0,
+                faces_total: 0,
                 failed: 0,
                 started_at: unix_now_secs(),
                 phase: "running".to_string(),
@@ -2386,6 +2520,8 @@ fn spawn_scan_worker_if_needed(
             progress.classified = tick.classified;
             progress.classify_total = tick.classify_total;
             progress.deduped = tick.deduped;
+            progress.faces = tick.faces;
+            progress.faces_total = tick.faces_total;
             progress.failed = tick.failed;
             progress.phase = "running".to_string();
         }
@@ -2670,6 +2806,8 @@ pub fn run() {
             get_face_detect_status,
             cancel_face_detect,
             get_face_stats,
+            get_pending_face_count,
+            get_face_thread_plan,
             list_files_with_faces,
             cluster_faces,
             recluster_faces,

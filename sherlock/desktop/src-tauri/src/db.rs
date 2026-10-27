@@ -380,6 +380,27 @@ fn run_migrations(conn: &mut Connection) -> AppResult<()> {
             CREATE INDEX IF NOT EXISTS idx_files_description_lang ON files(description_lang);
             "#,
         ),
+        // Migration 18: one honest marker for "this row has been through face
+        // detection".
+        //
+        // Why: `face_count` was overloaded as a tri-state (`0` never scanned, `-1`
+        // scanned with no faces, `>0` has faces) and nothing could select the pending
+        // rows without knowing that convention — the manual pass asked for
+        // `face_count = 0` and therefore could never see a row that a failed read had
+        // parked at `-1`. `faces_scanned_at` is the state; `face_count` goes back to
+        // being only a count.
+        //
+        // Backfill: a row with faces, or one that was explicitly marked as having
+        // none, is already scanned. Rows at `0` stay `NULL` — they are the pending
+        // ones, exactly what the old selection meant.
+        M::up(
+            r#"
+            ALTER TABLE files ADD COLUMN faces_scanned_at INTEGER;
+            CREATE INDEX IF NOT EXISTS idx_files_faces_scanned_at ON files(faces_scanned_at);
+            UPDATE files SET faces_scanned_at = updated_at WHERE face_count <> 0;
+            UPDATE files SET face_count = 0 WHERE face_count < 0;
+            "#,
+        ),
     ]);
 
     migrations
@@ -1193,6 +1214,46 @@ pub fn copy_classification(db_path: &Path, target_id: i64, source_id: i64) -> Ap
     Ok(())
 }
 
+/// Give `target_id` the faces of its near-duplicate representative.
+///
+/// A dHash match means the same picture stored again, so SCRFD would answer with the
+/// same faces. The rows are copied and the new ones point at the representative's crop
+/// files — those are written once and only read afterwards, so sharing them by path is
+/// safe and one JPEG serves both rows.
+///
+/// The person assignment comes along too: a duplicate of a known photo belongs to the
+/// same people, and copying it is what keeps the clustering pass from having to place
+/// the same face twice.
+pub fn copy_faces(db_path: &Path, target_id: i64, source_id: i64) -> AppResult<()> {
+    let conn = open_conn(db_path)?;
+    let tx = conn.unchecked_transaction()?;
+    let now = now_epoch_secs();
+
+    tx.execute(
+        "DELETE FROM face_detections WHERE file_id = ?1",
+        params![target_id],
+    )?;
+    tx.execute(
+        "INSERT INTO face_detections
+             (file_id, person_id, bbox_x, bbox_y, bbox_w, bbox_h, confidence,
+              embedding, crop_path, created_at)
+         SELECT ?1, person_id, bbox_x, bbox_y, bbox_w, bbox_h, confidence,
+                embedding, crop_path, ?3
+           FROM face_detections WHERE file_id = ?2",
+        params![target_id, source_id, now],
+    )?;
+    tx.execute(
+        "UPDATE files SET
+             face_count = (SELECT COUNT(*) FROM face_detections WHERE file_id = ?1),
+             faces_scanned_at = COALESCE(
+                 (SELECT faces_scanned_at FROM files WHERE id = ?2), ?3)
+           WHERE id = ?1",
+        params![target_id, source_id, now],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// One row of the thumbnail repair work list.
 #[derive(Debug, Clone)]
 pub struct ThumbRepairRow {
@@ -1264,6 +1325,13 @@ pub struct BacklogRow {
     /// ([`set_file_identity`]) and that is what makes `moved` detection possible
     /// without a second fingerprint pass over the whole folder.
     pub fingerprint: String,
+    /// When face detection last ran on this row; `None` means it is pending.
+    ///
+    /// Replaces the old `face_count = -1` sentinel. Two consequences that matter:
+    /// a file whose read failed stays pending (it is retried instead of being hidden
+    /// forever), and the in-scan detection and the Detect Faces button can agree on
+    /// what "nothing left to do" means.
+    pub faces_scanned_at: Option<i64>,
     /// Marker of the scan that last visited this row.
     ///
     /// The producer writes it back for every row it touches. Without it the
@@ -1277,6 +1345,14 @@ pub struct BacklogRow {
     pub mtime_ns: i64,
 }
 
+impl BacklogRow {
+    /// True when face detection has never run on this row — the same predicate the
+    /// pipeline producer uses to decide whether to spend CPU on SCRFD.
+    pub fn needs_faces(&self) -> bool {
+        self.faces_scanned_at.is_none()
+    }
+}
+
 /// Rows of `root_id` that still need a classification or have no thumbnail at all.
 ///
 /// Pure SQL: no filesystem access, so this is cheap even on a 53k-row index. The
@@ -1286,13 +1362,29 @@ pub struct BacklogRow {
 /// Rows marked failed are **excluded**: they already burned every attempt, and
 /// sending them again on every pass is what kept a backlog from ever converging.
 /// [`list_failed_rows`] is the way back in, through an explicit retry.
-pub fn list_backlog_rows(db_path: &Path, root_id: i64) -> AppResult<Vec<BacklogRow>> {
-    query_backlog_rows(db_path, root_id, None, "AND classify_state <> 'failed'")
+pub fn list_backlog_rows(
+    db_path: &Path,
+    root_id: i64,
+    include_faces: bool,
+) -> AppResult<Vec<BacklogRow>> {
+    query_backlog_rows(
+        db_path,
+        root_id,
+        None,
+        "AND classify_state <> 'failed'",
+        include_faces,
+    )
 }
 
 /// Rows that gave up: every attempt failed. Used by `Retry failed`.
 pub fn list_failed_rows(db_path: &Path, root_id: i64) -> AppResult<Vec<BacklogRow>> {
-    query_backlog_rows(db_path, root_id, None, "AND classify_state = 'failed'")
+    query_backlog_rows(
+        db_path,
+        root_id,
+        None,
+        "AND classify_state = 'failed'",
+        false,
+    )
 }
 
 /// The rows a `full` scan visited and that still need work.
@@ -1308,12 +1400,14 @@ pub fn list_backlog_rows_for_scan(
     db_path: &Path,
     root_id: i64,
     scan_marker: i64,
+    include_faces: bool,
 ) -> AppResult<Vec<BacklogRow>> {
     query_backlog_rows(
         db_path,
         root_id,
         Some(scan_marker),
         "AND classify_state <> 'failed'",
+        include_faces,
     )
 }
 
@@ -1359,16 +1453,26 @@ fn query_backlog_rows(
     root_id: i64,
     scan_marker: Option<i64>,
     filter: &str,
+    include_faces: bool,
 ) -> AppResult<Vec<BacklogRow>> {
     let conn = open_conn(db_path)?;
+    // `include_faces` is what the scan's face toggle turns on: with it off the
+    // selection is exactly what it was before faces existed, so an index full of
+    // rows without faces does not turn every pass into a face pass.
+    let face_clause = if include_faces {
+        " OR faces_scanned_at IS NULL"
+    } else {
+        ""
+    };
     let sql = format!(
         "SELECT id, rel_path, abs_path, size_bytes, media_type,
                 {PENDING_CLASSIFICATION_SQL} AS pending, thumb_path,
-                image_width, image_height, fingerprint, scan_marker, mtime_ns
+                image_width, image_height, fingerprint, scan_marker, mtime_ns,
+                faces_scanned_at
          FROM files
          WHERE deleted_at IS NULL AND root_id = ?1
            AND (?2 IS NULL OR scan_marker = ?2)
-           AND ({PENDING_CLASSIFICATION_SQL} OR thumb_path IS NULL)
+           AND ({PENDING_CLASSIFICATION_SQL} OR thumb_path IS NULL{face_clause})
            {filter}
          ORDER BY rel_path"
     );
@@ -1387,6 +1491,7 @@ fn query_backlog_rows(
             fingerprint: row.get(9)?,
             scan_marker: row.get(10)?,
             mtime_ns: row.get(11)?,
+            faces_scanned_at: row.get(12)?,
         })
     })?;
     let mut out = Vec::new();
@@ -1486,25 +1591,35 @@ pub fn set_video_metadata(
 /// Refresh the filesystem facts of rows discovery found modified.
 ///
 /// A modified file is a different file at the same path: description, OCR text,
-/// mentions, confidence, dedupe hash and thumbnail all describe the previous
-/// content, so they are cleared here instead of being left to the classifier (which
-/// may never run, e.g. with `chain_backlog = false`).
+/// mentions, confidence, dedupe hash, thumbnail **and faces** all describe the
+/// previous content, so they are cleared here instead of being left to the classifier
+/// (which may never run, e.g. with `chain_backlog = false`).
+///
+/// Faces are the case that used to leak: `face_detections` survived the write, so a
+/// replaced photo kept showing the people of the picture it had replaced, and it was
+/// never re-detected because the old `face_count` was still non-zero. The rows are
+/// deleted here and `faces_scanned_at` goes back to `NULL`, which is the same marker
+/// the face pass selects on.
 ///
 /// `fingerprint` is cleared rather than rewritten: the producer recomputes it from
 /// the file it is about to read anyway ( [`set_file_identity`] ), and a stale hash
 /// would make the next rename adopt the wrong row.
+///
+/// Returns the crop files that belonged to the deleted detections; SQLite cannot
+/// unlink them, and the caller already knows where they live.
 pub fn stamp_modified_rows(
     db_path: &Path,
     root_id: i64,
     scan_marker: i64,
     rows: &[(String, i64, i64)],
-) -> AppResult<()> {
+) -> AppResult<Vec<std::path::PathBuf>> {
     if rows.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let conn = open_conn(db_path)?;
     let tx = conn.unchecked_transaction()?;
     let now = now_epoch_secs();
+    let mut orphan_crops: Vec<std::path::PathBuf> = Vec::new();
     {
         let mut stmt = tx.prepare(
             "UPDATE files
@@ -1514,8 +1629,17 @@ pub fn stamp_modified_rows(
                     confidence = 0.0, lang_hint = 'unknown', fingerprint = '',
                     dhash = NULL, thumb_path = NULL, document_hint = '',
                     classify_state = '', failure_kind = '', failure_detail = '',
-                    failed_at = NULL
+                    failed_at = NULL, face_count = 0, faces_scanned_at = NULL
               WHERE root_id = ?6 AND rel_path = ?1 AND deleted_at IS NULL",
+        )?;
+        let mut crops = tx.prepare(
+            "SELECT fd.crop_path FROM face_detections fd
+               JOIN files f ON f.id = fd.file_id
+              WHERE f.root_id = ?1 AND f.rel_path = ?2 AND fd.crop_path IS NOT NULL",
+        )?;
+        let mut drop_faces = tx.prepare(
+            "DELETE FROM face_detections WHERE file_id IN (
+                 SELECT id FROM files WHERE root_id = ?1 AND rel_path = ?2)",
         )?;
         for (rel_path, mtime_ns, size_bytes) in rows {
             stmt.execute(params![
@@ -1526,6 +1650,14 @@ pub fn stamp_modified_rows(
                 now,
                 root_id
             ])?;
+            {
+                let mut query =
+                    crops.query_map(params![root_id, rel_path], |row| row.get::<_, String>(0))?;
+                for crop in query.by_ref() {
+                    orphan_crops.push(std::path::PathBuf::from(crop?));
+                }
+            }
+            drop_faces.execute(params![root_id, rel_path])?;
         }
     }
     for (rel_path, _, _) in rows {
@@ -1541,7 +1673,7 @@ pub fn stamp_modified_rows(
         }
     }
     tx.commit()?;
-    Ok(())
+    Ok(orphan_crops)
 }
 
 /// Bring back a row that an earlier scan soft-deleted at a path that exists again.
@@ -1581,7 +1713,9 @@ pub fn revive_deleted_rows(
                     classify_state = CASE WHEN files.size_bytes = ?4 THEN files.classify_state ELSE '' END,
                     failure_kind = CASE WHEN files.size_bytes = ?4 THEN files.failure_kind ELSE '' END,
                     failure_detail = CASE WHEN files.size_bytes = ?4 THEN files.failure_detail ELSE '' END,
-                    failed_at = CASE WHEN files.size_bytes = ?4 THEN files.failed_at ELSE NULL END
+                    failed_at = CASE WHEN files.size_bytes = ?4 THEN files.failed_at ELSE NULL END,
+                    face_count = CASE WHEN files.size_bytes = ?4 THEN files.face_count ELSE 0 END,
+                    faces_scanned_at = CASE WHEN files.size_bytes = ?4 THEN files.faces_scanned_at ELSE NULL END
               WHERE root_id = ?1 AND rel_path = ?7 AND deleted_at IS NOT NULL",
         )?;
         for (rel_path, abs_path, mtime_ns, size_bytes) in rows {
@@ -3989,6 +4123,74 @@ pub fn list_protected_pdfs(db_path: &Path) -> AppResult<Vec<ProtectedPdfInfo>> {
 
 // ── Face detection ──────────────────────────────────────────────────
 
+/// Persist the result of one image's face detection in a single transaction.
+///
+/// Replaces the `insert_face_detections` + one-`update_face_crop_path`-per-face
+/// sequence, which opened a connection per call, left a window where the rows existed
+/// without their crops, and wrote `face_count` without ever marking the row as scanned
+/// — the reason a file that reported no faces had to be encoded as `-1`.
+///
+/// Detections already recorded for the file are replaced, so re-detecting a file is
+/// idempotent instead of duplicating its people. `crop_paths` runs parallel to
+/// `faces` and may be shorter or contain `None` when a crop could not be written.
+pub fn record_faces(
+    db_path: &Path,
+    file_id: i64,
+    faces: &[crate::face::FaceDetection],
+    crop_paths: &[Option<String>],
+) -> AppResult<Vec<i64>> {
+    let conn = open_conn(db_path)?;
+    let tx = conn.unchecked_transaction()?;
+    let now = now_epoch_secs();
+
+    tx.execute(
+        "DELETE FROM face_detections WHERE file_id = ?1",
+        params![file_id],
+    )?;
+
+    let mut ids = Vec::with_capacity(faces.len());
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO face_detections
+                 (file_id, bbox_x, bbox_y, bbox_w, bbox_h, confidence, embedding,
+                  crop_path, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )?;
+
+        for (index, face) in faces.iter().enumerate() {
+            let w = face.bbox[2] - face.bbox[0];
+            let h = face.bbox[3] - face.bbox[1];
+            let blob = crate::face::embedding_to_blob(&face.embedding);
+            stmt.execute(params![
+                file_id,
+                face.bbox[0],
+                face.bbox[1],
+                w,
+                h,
+                face.confidence,
+                blob,
+                crop_paths.get(index).and_then(|path| path.as_deref()),
+                now,
+            ])?;
+            ids.push(tx.last_insert_rowid());
+        }
+    }
+
+    tx.execute(
+        "UPDATE files SET face_count = ?1, faces_scanned_at = ?2 WHERE id = ?3",
+        params![faces.len() as i64, now, file_id],
+    )?;
+    tx.commit()?;
+
+    Ok(ids)
+}
+
+/// Compatibility wrapper for callers and tests that only have the detections.
+/// Append detections without replacing what the file already has.
+///
+/// Kept for tests and any future partial write; the two real passes use
+/// [`record_faces`], which mirrors the file exactly.
+#[allow(dead_code)]
 pub fn insert_face_detections(
     db_path: &Path,
     file_id: i64,
@@ -3996,36 +4198,32 @@ pub fn insert_face_detections(
 ) -> AppResult<Vec<i64>> {
     let conn = open_conn(db_path)?;
     let now = now_epoch_secs();
-
-    let mut stmt = conn.prepare(
-        "INSERT INTO face_detections (file_id, bbox_x, bbox_y, bbox_w, bbox_h, confidence, embedding, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-    )?;
-
     let mut ids = Vec::with_capacity(faces.len());
-    for face in faces {
-        let w = face.bbox[2] - face.bbox[0];
-        let h = face.bbox[3] - face.bbox[1];
-        let blob = crate::face::embedding_to_blob(&face.embedding);
-        stmt.execute(params![
-            file_id,
-            face.bbox[0],
-            face.bbox[1],
-            w,
-            h,
-            face.confidence,
-            blob,
-            now,
-        ])?;
-        ids.push(conn.last_insert_rowid());
+    {
+        let mut stmt = conn.prepare(
+            "INSERT INTO face_detections
+                 (file_id, bbox_x, bbox_y, bbox_w, bbox_h, confidence, embedding, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?;
+        for face in faces {
+            let blob = crate::face::embedding_to_blob(&face.embedding);
+            stmt.execute(params![
+                file_id,
+                face.bbox[0],
+                face.bbox[1],
+                face.bbox[2] - face.bbox[0],
+                face.bbox[3] - face.bbox[1],
+                face.confidence,
+                blob,
+                now,
+            ])?;
+            ids.push(conn.last_insert_rowid());
+        }
     }
-
-    // Update face_count on the files table
     conn.execute(
-        "UPDATE files SET face_count = ?1 WHERE id = ?2",
-        params![faces.len() as i64, file_id],
+        "UPDATE files SET face_count = ?1, faces_scanned_at = ?2 WHERE id = ?3",
+        params![faces.len() as i64, now, file_id],
     )?;
-
     Ok(ids)
 }
 
@@ -4038,34 +4236,37 @@ pub fn update_face_crop_path(db_path: &Path, face_id: i64, crop_path: &str) -> A
     Ok(())
 }
 
-#[allow(dead_code)] // Used when re-scanning faces for a file
-/// List files that haven't been scanned for faces yet for a specific root.
-/// Includes any image file (by extension or classified media_type), regardless
-/// of whether it has been through LLM classification yet.
+/// Rows still pending face detection, optionally limited to one root.
+///
+/// The pending marker is `faces_scanned_at IS NULL` — one state, not the old
+/// `face_count` tri-state. The media gate keeps the pass away from what cannot have a
+/// face: a row the classifier already called a document, a video or a PDF is skipped
+/// before it is opened, and an unclassified row is judged by its extension.
 pub fn list_files_needing_face_scan(
     db_path: &Path,
-    root_id: i64,
+    root_id: Option<i64>,
 ) -> AppResult<Vec<crate::models::UnclassifiedFile>> {
     let conn = open_conn(db_path)?;
 
-    // face_count = 0 means never scanned; -1 means scanned with no faces; >0 means has faces.
-    // Include files that are either:
-    //   (a) classified as image types, OR
-    //   (b) have an image extension (not yet classified)
     let sql = "SELECT f.id, f.rel_path, f.abs_path, f.media_type, f.dhash
          FROM files f
          WHERE f.deleted_at IS NULL
-           AND f.face_count = 0
-           AND f.root_id = ?1
+           AND f.faces_scanned_at IS NULL
+           AND (?1 IS NULL OR f.root_id = ?1)
            AND (
-             f.media_type IN ('photo', 'screenshot', 'meme', 'anime', 'illustration')
-             OR LOWER(f.rel_path) LIKE '%.jpg'
-             OR LOWER(f.rel_path) LIKE '%.jpeg'
-             OR LOWER(f.rel_path) LIKE '%.png'
-             OR LOWER(f.rel_path) LIKE '%.webp'
-             OR LOWER(f.rel_path) LIKE '%.bmp'
-             OR LOWER(f.rel_path) LIKE '%.tiff'
-             OR LOWER(f.rel_path) LIKE '%.tif'
+             f.media_type IN ('photo', 'screenshot', 'meme', 'anime', 'illustration', 'artwork')
+             OR (
+               f.media_type IN ('', 'other')
+               AND (
+                 LOWER(f.rel_path) LIKE '%.jpg'
+                 OR LOWER(f.rel_path) LIKE '%.jpeg'
+                 OR LOWER(f.rel_path) LIKE '%.png'
+                 OR LOWER(f.rel_path) LIKE '%.webp'
+                 OR LOWER(f.rel_path) LIKE '%.bmp'
+                 OR LOWER(f.rel_path) LIKE '%.tiff'
+                 OR LOWER(f.rel_path) LIKE '%.tif'
+               )
+             )
            )
          ORDER BY f.rel_path";
 
@@ -4085,6 +4286,31 @@ pub fn list_files_needing_face_scan(
         files.push(row?);
     }
     Ok(files)
+}
+
+/// How many visible rows of the scope are still pending face detection.
+pub fn pending_face_count(db_path: &Path, root_scope: &[i64]) -> AppResult<u64> {
+    let conn = open_conn(db_path)?;
+    let (scope_clause, scope_params) = if root_scope.is_empty() {
+        ("".to_string(), vec![])
+    } else {
+        let placeholders: Vec<String> = root_scope.iter().map(|_| "?".to_string()).collect();
+        (
+            format!(" AND f.root_id IN ({})", placeholders.join(",")),
+            root_scope.iter().map(|id| Value::from(*id)).collect(),
+        )
+    };
+    let sql = format!(
+        "SELECT COUNT(*) FROM files f
+          WHERE f.deleted_at IS NULL
+            AND f.faces_scanned_at IS NULL
+            AND f.media_type IN ('photo', 'screenshot', 'meme', 'anime', 'illustration', 'artwork')
+            {scope_clause}"
+    );
+    let count: i64 = conn.query_row(&sql, params_from_iter(scope_params.iter()), |row| {
+        row.get(0)
+    })?;
+    Ok(count as u64)
 }
 
 /// List files that have detected faces, for display in FacesView.
@@ -4162,7 +4388,7 @@ pub fn get_face_stats(db_path: &Path, root_scope: &[i64]) -> AppResult<FaceStats
         )
     };
 
-    let base_where = "f.deleted_at IS NULL AND f.confidence > 0 AND f.media_type IN ('photo', 'screenshot', 'meme', 'anime', 'illustration')";
+    let base_where = "f.deleted_at IS NULL AND f.confidence > 0 AND f.media_type IN ('photo', 'screenshot', 'meme', 'anime', 'illustration', 'artwork')";
 
     // images_with_faces: face_count > 0
     let sql = format!(
@@ -4178,21 +4404,16 @@ pub fn get_face_stats(db_path: &Path, root_scope: &[i64]) -> AppResult<FaceStats
     let total_faces: u64 =
         conn.query_row(&sql, params_from_iter(scope_params.iter()), |r| r.get(0))?;
 
-    // images_scanned: face_count >= 0 AND has been through face detection
-    // We mark files as scanned by setting face_count to 0 (no faces) or > 0.
-    // But initially face_count defaults to 0, so we need another way...
-    // Actually: we count all image files that have at least one face_detections row OR face_count > 0.
-    // Simpler: count files where id exists in face_detections OR face_count > 0.
-    // Simplest: files with face_count > 0 count as scanned with faces.
-    // For "scanned but no faces" we look at face_count = -1 as a sentinel... but that's ugly.
-    // Let's just use: scanned = total image files - pending
+    // scanned = every image of the scope minus the ones still pending. The marker is
+    // `faces_scanned_at`: a row either went through detection or it did not, which is
+    // the question the UI asks. `face_count` is only a count and says nothing about
+    // whether a zero means "no faces" or "never looked".
     let sql = format!("SELECT COUNT(*) FROM files f WHERE {base_where}{scope_clause}");
     let total_images: u64 =
         conn.query_row(&sql, params_from_iter(scope_params.iter()), |r| r.get(0))?;
 
-    // pending: face_count = 0 (never scanned for faces; -1 means scanned with no faces)
     let sql = format!(
-        "SELECT COUNT(*) FROM files f WHERE {base_where} AND f.face_count = 0{scope_clause}"
+        "SELECT COUNT(*) FROM files f WHERE {base_where} AND f.faces_scanned_at IS NULL{scope_clause}"
     );
     let images_pending: u64 =
         conn.query_row(&sql, params_from_iter(scope_params.iter()), |r| r.get(0))?;
@@ -4207,13 +4428,16 @@ pub fn get_face_stats(db_path: &Path, root_scope: &[i64]) -> AppResult<FaceStats
     })
 }
 
-/// Mark a file as face-scanned with zero faces found.
-/// Sets face_count to -1 to distinguish from "never scanned" (0).
-pub fn mark_no_faces(db_path: &Path, file_id: i64) -> AppResult<()> {
+/// Mark a file as face-scanned with no faces found.
+///
+/// This is an *answer* ("there are no faces here"), not a failure. A file that could
+/// not be read must stay pending instead: the old code called this on the decode error
+/// path too, so a single SMB hiccup hid a photo from face detection forever.
+pub fn mark_faces_scanned(db_path: &Path, file_id: i64) -> AppResult<()> {
     let conn = open_conn(db_path)?;
     conn.execute(
-        "UPDATE files SET face_count = -1 WHERE id = ?1",
-        params![file_id],
+        "UPDATE files SET face_count = 0, faces_scanned_at = ?1 WHERE id = ?2",
+        params![now_epoch_secs(), file_id],
     )?;
     Ok(())
 }
@@ -5484,7 +5708,9 @@ mod tests {
         upsert_file_record(&db_path, &sample_record(root_id, "b.jpg", "fp2")).expect("b");
 
         assert_eq!(
-            list_backlog_rows(&db_path, root_id).expect("backlog").len(),
+            list_backlog_rows(&db_path, root_id, false)
+                .expect("backlog")
+                .len(),
             2
         );
 
@@ -5496,7 +5722,7 @@ mod tests {
         )
         .expect("mark");
 
-        let backlog = list_backlog_rows(&db_path, root_id).expect("backlog");
+        let backlog = list_backlog_rows(&db_path, root_id, false).expect("backlog");
         assert_eq!(
             backlog.len(),
             1,
@@ -5540,7 +5766,7 @@ mod tests {
         // Both rows are still backlog work — the fixture has no thumbnails, and a row
         // needing one belongs there by definition. What matters is that the recovered
         // row is no longer pending a *classification*.
-        let backlog = list_backlog_rows(&db_path, root_id).expect("backlog");
+        let backlog = list_backlog_rows(&db_path, root_id, false).expect("backlog");
         assert!(backlog
             .iter()
             .find(|row| row.rel_path == "a.jpg")
@@ -5688,9 +5914,14 @@ mod tests {
         stale.scan_marker = 11;
         upsert_file_record(&db_path, &stale).expect("row");
 
-        assert_eq!(list_backlog_rows(&db_path, root_id).expect("all").len(), 2);
+        assert_eq!(
+            list_backlog_rows(&db_path, root_id, false)
+                .expect("all")
+                .len(),
+            2
+        );
 
-        let this_scan = list_backlog_rows_for_scan(&db_path, root_id, 77).expect("rows");
+        let this_scan = list_backlog_rows_for_scan(&db_path, root_id, 77, false).expect("rows");
         assert_eq!(this_scan.len(), 1, "only the rows this scan stamped");
         let row = &this_scan[0];
         assert_eq!(row.id, scanned_id);
@@ -5922,7 +6153,7 @@ mod tests {
             upsert_file_record(&db_path, &sample_record(root_id, "a.jpg", "fp-a")).expect("row");
         update_file_thumb_path(&db_path, root_id, "a.jpg", "/cache/a.jpg").expect("thumb");
         assert!(
-            list_backlog_rows(&db_path, root_id)
+            list_backlog_rows(&db_path, root_id, false)
                 .expect("backlog")
                 .is_empty(),
             "a classified row with a thumbnail is not backlog work"
@@ -5930,7 +6161,7 @@ mod tests {
 
         null_dead_thumb_pointers(&db_path, &[id]).expect("null");
 
-        let rows = list_backlog_rows(&db_path, root_id).expect("backlog");
+        let rows = list_backlog_rows(&db_path, root_id, false).expect("backlog");
         assert_eq!(rows.len(), 1);
         assert!(rows[0].thumb_path.is_none());
     }
@@ -6923,11 +7154,11 @@ mod tests {
         init_database(&db_path).expect("init");
 
         let conn = open_conn(&db_path).expect("open");
-        // Verify user_version is set (18 migrations applied → version 18)
+        // Verify user_version is set (19 migrations applied → version 19)
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 18);
+        assert_eq!(version, 19);
 
         // Migration 17 records the language each description was written in.
         let columns: Vec<String> = conn
@@ -6996,8 +7227,8 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        // We have 18 migrations (indices 0..17), so user_version should be 18
-        assert_eq!(version, 18);
+        // We have 19 migrations (indices 0..18), so user_version should be 19
+        assert_eq!(version, 19);
     }
 
     #[test]
@@ -7659,7 +7890,7 @@ mod tests {
         let inserted = insert_pending_rows(&db_path, &[known, fresh]).expect("insert");
         assert_eq!(inserted, 1, "only the path that was missing gets a row");
 
-        let rows = list_backlog_rows(&db_path, root_id).expect("backlog");
+        let rows = list_backlog_rows(&db_path, root_id, false).expect("backlog");
         let a = rows.iter().find(|row| row.rel_path == "a.jpg").expect("a");
         assert!(
             !a.needs_classification,
@@ -8346,6 +8577,186 @@ mod tests {
         };
         let ids = insert_face_detections(db_path, file_id, &[face]).expect("insert faces");
         ids[0]
+    }
+
+    fn face_with_bbox(x: f32) -> crate::face::FaceDetection {
+        crate::face::FaceDetection {
+            bbox: [x, 10.0, x + 40.0, 50.0],
+            confidence: 0.9,
+            keypoints: [[0.0; 2]; 5],
+            embedding: vec![0.5; 512],
+        }
+    }
+
+    /// A re-detection mirrors the file: it does not double the rows and it records the
+    /// crop that belongs to the detection that just ran.
+    #[test]
+    fn record_faces_replaces_the_previous_detections() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/faces-record").expect("root");
+        upsert_file_record(&db_path, &sample_record(root_id, "a.jpg", "fp-rec")).expect("file");
+        let file_id = file_id_by_path(&db_path, root_id, "a.jpg");
+
+        record_faces(
+            &db_path,
+            file_id,
+            &[face_with_bbox(10.0), face_with_bbox(80.0)],
+            &[Some("/c/1_0.jpg".to_string()), None],
+        )
+        .expect("first pass");
+
+        record_faces(
+            &db_path,
+            file_id,
+            &[face_with_bbox(12.0)],
+            &[Some("/c/1_0b.jpg".to_string())],
+        )
+        .expect("second pass");
+
+        let conn = open_conn(&db_path).expect("open");
+        let (count, crop): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(crop_path) FROM face_detections WHERE file_id = ?1",
+                params![file_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("detections");
+        assert_eq!(count, 1, "the file has one face after the second pass");
+        assert_eq!(crop.as_deref(), Some("/c/1_0b.jpg"));
+
+        let (face_count, scanned): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT face_count, faces_scanned_at FROM files WHERE id = ?1",
+                params![file_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(face_count, 1);
+        assert!(scanned.is_some(), "the row must be marked as scanned");
+    }
+
+    /// "No faces here" is an answer, so it clears the pending marker and the file stops
+    /// being selected — which is exactly what a failed read must NOT do.
+    #[test]
+    fn mark_faces_scanned_clears_the_pending_marker() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/faces-none").expect("root");
+        upsert_file_record(&db_path, &sample_record(root_id, "a.jpg", "fp-none")).expect("file");
+        let file_id = file_id_by_path(&db_path, root_id, "a.jpg");
+
+        assert!(
+            list_files_needing_face_scan(&db_path, Some(root_id))
+                .expect("pending")
+                .iter()
+                .any(|file| file.id == file_id),
+            "a fresh image is pending"
+        );
+
+        mark_faces_scanned(&db_path, file_id).expect("mark");
+
+        assert!(
+            !list_files_needing_face_scan(&db_path, Some(root_id))
+                .expect("pending")
+                .iter()
+                .any(|file| file.id == file_id),
+            "an explicit no-faces answer must leave the queue"
+        );
+    }
+
+    /// A replaced file is a different picture: the detections go away, the crops come
+    /// back as orphans for the caller to unlink, and the row becomes pending again.
+    #[test]
+    fn stamp_modified_rows_drops_the_faces_and_returns_their_crops() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/faces-modified").expect("root");
+        upsert_file_record(&db_path, &sample_record(root_id, "a.jpg", "fp-mod")).expect("file");
+        let file_id = file_id_by_path(&db_path, root_id, "a.jpg");
+
+        let face_id = insert_test_face(&db_path, file_id, &vec![0.5_f32; 512]);
+        update_face_crop_path(&db_path, face_id, "/cache/face_crops/7.jpg").expect("crop");
+
+        let orphans = stamp_modified_rows(&db_path, root_id, 9, &[("a.jpg".to_string(), 2, 3)])
+            .expect("stamp");
+
+        assert_eq!(
+            orphans,
+            vec![std::path::PathBuf::from("/cache/face_crops/7.jpg")],
+            "the crop file must be handed back to be removed"
+        );
+        assert!(
+            list_files_needing_face_scan(&db_path, Some(root_id))
+                .expect("pending")
+                .iter()
+                .any(|file| file.id == file_id),
+            "a modified file has to be detected again"
+        );
+    }
+
+    /// The near-duplicate inherits the detections, including the shared crop file.
+    #[test]
+    fn copy_faces_inherits_the_representative_detections() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/faces-copy").expect("root");
+        upsert_file_record(&db_path, &sample_record(root_id, "rep.jpg", "fp-rep")).expect("rep");
+        upsert_file_record(&db_path, &sample_record(root_id, "dup.jpg", "fp-dup")).expect("dup");
+        let rep_id = file_id_by_path(&db_path, root_id, "rep.jpg");
+        let dup_id = file_id_by_path(&db_path, root_id, "dup.jpg");
+
+        let face_id = insert_test_face(&db_path, rep_id, &vec![0.25_f32; 512]);
+        update_face_crop_path(&db_path, face_id, "/cache/face_crops/rep_0.jpg").expect("crop");
+
+        copy_faces(&db_path, dup_id, rep_id).expect("copy");
+
+        let conn = open_conn(&db_path).expect("open");
+        let (count, crop, scanned): (i64, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(fd.crop_path), MAX(f.faces_scanned_at)
+                   FROM face_detections fd JOIN files f ON f.id = fd.file_id
+                  WHERE fd.file_id = ?1",
+                params![dup_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("detections");
+        assert_eq!(count, 1);
+        assert_eq!(crop.as_deref(), Some("/cache/face_crops/rep_0.jpg"));
+        assert!(scanned.is_some());
+    }
+
+    /// The face selection is opt-in: with the toggle off the backlog is what it always
+    /// was, so an index without faces does not turn every pass into a face pass.
+    #[test]
+    fn backlog_selects_face_pending_rows_only_when_asked() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/faces-backlog").expect("root");
+        upsert_file_record(&db_path, &sample_record(root_id, "done.jpg", "fp-done")).expect("file");
+        let file_id = file_id_by_path(&db_path, root_id, "done.jpg");
+        // Classified and thumbnailed: the only thing missing is face detection.
+        update_file_thumb_and_dhash(
+            &db_path,
+            root_id,
+            "done.jpg",
+            "/tmp/demo/thumbs/done.jpg",
+            None,
+        )
+        .expect("thumb");
+
+        assert!(
+            list_backlog_rows(&db_path, root_id, false)
+                .expect("backlog")
+                .iter()
+                .all(|row| row.id != file_id),
+            "a classified, thumbnailed row is not backlog work on its own"
+        );
+
+        let rows = list_backlog_rows(&db_path, root_id, true).expect("backlog with faces");
+        let row = rows.iter().find(|row| row.id == file_id).expect("row");
+        assert!(row.needs_faces(), "and it is pending for faces");
+        assert!(!row.needs_classification);
     }
 
     #[test]

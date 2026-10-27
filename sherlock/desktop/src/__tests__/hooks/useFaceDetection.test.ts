@@ -25,7 +25,7 @@ describe("useFaceDetection", () => {
     vi.useFakeTimers();
     vi.clearAllMocks();
     vi.mocked(getFaceDetectStatus).mockResolvedValue(null);
-    vi.mocked(detectFaces).mockResolvedValue(undefined);
+    vi.mocked(detectFaces).mockResolvedValue(3);
     vi.mocked(cancelFaceDetect).mockResolvedValue(true);
   });
 
@@ -53,7 +53,22 @@ describe("useFaceDetection", () => {
       await result.current.onDetectFaces(mockRoot);
     });
     expect(detectFaces).toHaveBeenCalledWith(mockRoot.id);
-    expect(callbacks.onNotice).toHaveBeenCalledWith(`Face detection started for "${mockRoot.rootName}"`);
+    // The notice carries the size of the queue, which is the only place the user
+    // learns how much the scan left behind.
+    expect(callbacks.onNotice).toHaveBeenCalledWith(
+      `Face detection started for "${mockRoot.rootName}" — 3 image(s) pending`,
+    );
+  });
+
+  it("says so when nothing is pending", async () => {
+    vi.mocked(detectFaces).mockResolvedValue(0);
+    const { result } = renderHook(() => useFaceDetection(callbacks));
+    await act(async () => {
+      await result.current.onDetectFaces(mockRoot);
+    });
+    expect(callbacks.onNotice).toHaveBeenCalledWith(
+      `No images pending face detection in "${mockRoot.rootName}"`,
+    );
   });
 
   it("shows error when detectFaces fails", async () => {

@@ -9,6 +9,7 @@ import type {
   DescriptionLanguageProgress,
   DuplicatesResponse,
   FaceDetectProgress,
+  FaceThreadPlan,
   FaceInfo,
   FileMetadata,
   FileProperties,
@@ -395,8 +396,27 @@ export async function getVideoStreamUrl(absPath: string): Promise<string> {
 
 // ── Face Detection ──────────────────────────────────────────────────
 
-export async function detectFaces(rootId: number): Promise<void> {
-  return invoke<void>("detect_faces", { rootId });
+/**
+ * Start the face pass for a folder.
+ *
+ * Resolves with how many images were pending, which is what the notice shows: the
+ * pass reads on its own and nothing left behind by a scan is skipped.
+ */
+export async function detectFaces(rootId: number): Promise<number> {
+  return invoke<number>("detect_faces", { rootId });
+}
+
+/** Images of the scope still waiting for face detection. */
+export async function getPendingFaceCount(rootScope: number[]): Promise<number> {
+  return invoke<number>("get_pending_face_count", { rootScope });
+}
+
+/**
+ * What the configured thread ceiling resolves to here: cores, the budget after
+ * resolving `0`, and how many sessions with how many threads each.
+ */
+export async function getFaceThreadPlan(): Promise<FaceThreadPlan> {
+  return invoke<FaceThreadPlan>("get_face_thread_plan");
 }
 
 export async function getFaceDetectStatus(): Promise<FaceDetectProgress | null> {

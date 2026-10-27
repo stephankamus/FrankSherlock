@@ -3,12 +3,14 @@ import {
   cancelDescriptionConversion,
   convertExistingDescriptions,
   getDescriptionLanguageStatus,
+  getFaceThreadPlan,
   getVisionSettings,
   updateSettings,
 } from "../../api";
 import type {
   DescriptionLanguageProgress,
   DescriptionLanguageSetting,
+  FaceThreadPlan,
   ImageFilterSetting,
   SettingsUpdatePayload,
   StartupScanSetting,
@@ -56,7 +58,7 @@ const STARTUP_SCANS: { value: StartupScanSetting; label: string }[] = [
 ];
 
 /** Turn the loaded settings into the payload the command expects. */
-function toPayload(settings: VisionSettings): SettingsUpdatePayload {
+export function toSettingsPayload(settings: VisionSettings): SettingsUpdatePayload {
   return {
     model: settings.modelOverride,
     imageMaxSide: settings.imageMaxSide,
@@ -67,6 +69,8 @@ function toPayload(settings: VisionSettings): SettingsUpdatePayload {
     startupScan: settings.startupScan,
     dedupeDhashDistance: settings.dedupeDhashDistance,
     chainBacklog: settings.chainBacklog,
+    faceDetection: settings.faceDetection,
+    faceThreads: settings.faceThreads,
   };
 }
 
@@ -86,6 +90,8 @@ export default function SettingsModal({ onClose, onSaved }: Props) {
   /** Last known state of the description conversion pass (polled while it runs). */
   const [conversion, setConversion] = useState<DescriptionLanguageProgress | null>(null);
   const [converting, setConverting] = useState(false);
+  /** Cores and the session split `faceThreads` resolves to, so the hint is concrete. */
+  const [threadPlan, setThreadPlan] = useState<FaceThreadPlan | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -105,6 +111,13 @@ export default function SettingsModal({ onClose, onSaved }: Props) {
       })
       .catch(() => {
         // The status command is best-effort; a failure here must not block the form.
+      });
+    getFaceThreadPlan()
+      .then((plan) => {
+        if (!cancelled) setThreadPlan(plan);
+      })
+      .catch(() => {
+        // Same: the hint degrades to "0 = all cores" without the numbers.
       });
     return () => {
       cancelled = true;
@@ -134,7 +147,7 @@ export default function SettingsModal({ onClose, onSaved }: Props) {
     if (!settings) return;
     setError(null);
     try {
-      const saved = await updateSettings(toPayload(settings));
+      const saved = await updateSettings(toSettingsPayload(settings));
       setSettings(saved);
       onSaved?.(saved);
       setConverting(true);
@@ -158,7 +171,7 @@ export default function SettingsModal({ onClose, onSaved }: Props) {
     setSaving(true);
     setError(null);
     try {
-      const saved = await updateSettings(toPayload(settings));
+      const saved = await updateSettings(toSettingsPayload(settings));
       setSettings(saved);
       onSaved?.(saved);
       onClose();
@@ -343,6 +356,42 @@ export default function SettingsModal({ onClose, onSaved }: Props) {
                 two-phase scan.
               </span>
             </label>
+
+            <label className="modal-checkbox settings-checkbox">
+              <input
+                type="checkbox"
+                checked={settings.faceDetection}
+                onChange={(e) => patch({ faceDetection: e.target.checked })}
+              />
+              <span>
+                Read faces during the scan, on the image the pipeline has already
+                decoded. Off by default: it costs CPU inside the pass, and everything it
+                skips is still reachable from “Detect Faces”. This is the switch to flip
+                when comparing a folder with and without faces.
+              </span>
+            </label>
+
+            <div className="settings-field">
+              <label htmlFor="settings-face-threads">Face detection threads</label>
+              <input
+                id="settings-face-threads"
+                type="number"
+                min={0}
+                max={32}
+                value={settings.faceThreads}
+                onChange={(e) => patch({ faceThreads: Number(e.target.value) })}
+              />
+              <span className="settings-hint">
+                0 = every core ({threadPlan?.cores ?? "?"} on this machine). It is a
+                ceiling, not a reservation: while a scan is also classifying, faces get
+                one thread and the rest stays with the vision model; a pass that only has
+                faces left runs with the whole budget. Lower it when the computer is busy
+                with something else.
+                {threadPlan
+                  ? ` Right now: ${threadPlan.budget} thread(s) as ${threadPlan.workers} session(s) of ${threadPlan.intraThreads}.`
+                  : ""}
+              </span>
+            </div>
 
             <div className="modal-actions">
               <button type="button" onClick={onClose}>Cancel</button>
