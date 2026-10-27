@@ -1986,6 +1986,7 @@ fn classify_prepared_and_update(
         &classification.canonical_mentions,
         classification.confidence,
         &classification.lang_hint,
+        &classification.document_hint,
     ) {
         Ok(_) => true,
         Err(e) => {
@@ -2266,6 +2267,26 @@ fn run_pipeline_blocks(
             }
             Ok(())
         })?;
+    }
+
+    // Second block of the document story: the rows the model flagged as documents are
+    // the population the OCR pass (and its Surya/num_predict A/B) runs over, so the
+    // count belongs in the log next to the classification numbers.
+    if let Ok(documents) = db::list_document_rows(db_path, job.root_id) {
+        let mut by_kind: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
+        for document in &documents {
+            *by_kind.entry(document.hint.as_str()).or_default() += 1;
+        }
+        log::info!(
+            "Scan job {job_id}: {} document row(s) in the bucket ({})",
+            documents.len(),
+            by_kind
+                .iter()
+                .map(|(kind, count)| format!("{kind}: {count}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
 
     Ok(PipelineOutcome {
@@ -2790,6 +2811,7 @@ fn classify_and_update(ctx: &ScanContext, file_id: i64, abs_path: &str) -> bool 
         &classification.canonical_mentions,
         classification.confidence,
         &classification.lang_hint,
+        &classification.document_hint,
     ) {
         Ok(_) => true,
         Err(e) => {
@@ -4254,8 +4276,10 @@ mod tests {
         // Pretend the file was already classified.
         let indexed = db::load_existing_files(&db_path, first.root_id).expect("load");
         for file in indexed {
-            db::update_file_classification(&db_path, file.id, "photo", "done", "", "", 0.9, "en")
-                .expect("mark classified");
+            db::update_file_classification(
+                &db_path, file.id, "photo", "done", "", "", 0.9, "en", "none",
+            )
+            .expect("mark classified");
         }
 
         let job = start_or_resume_scan_job(&db_path, &root).expect("job");

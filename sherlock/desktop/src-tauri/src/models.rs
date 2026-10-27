@@ -423,6 +423,15 @@ pub struct ClassificationResult {
     pub canonical_mentions: String,
     pub confidence: f32,
     pub lang_hint: String,
+    /// What the picture itself is, when it is a document: `receipt`, `invoice`,
+    /// `statement`, `other`, or `none` for everything else.
+    ///
+    /// Persisted as `files.document_hint`. It is the signal that decides whether the
+    /// OCR pass runs ([`crate::classify::should_run_document_enrichment`]) and the key
+    /// of the document bucket an A/B over documents iterates. Empty means "not
+    /// evaluated" (a row written before the column existed), which is why the bucket
+    /// filters `NOT IN ('', 'none')` instead of `<> 'none'`.
+    pub document_hint: String,
     /// Why nothing usable came back, as a short taxonomy (`repeat_limit`,
     /// `ctx_overflow`, `empty_frame`, `parse`, `io`, `prepare`, ...). Empty on
     /// success. Persisted as `files.failure_kind` so a retry can be aimed at the

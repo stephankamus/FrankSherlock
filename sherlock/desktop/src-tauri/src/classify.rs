@@ -20,7 +20,7 @@ const PRIMARY_PROMPT_DETAILED: &str = concat!(
     r#"{"media_type":"screenshot|anime|manga|photo|document|artwork|other","#,
     r#""contains_text":true,"#,
     r#""is_anime_related":false,"#,
-    r#""is_document_like":false,"#,
+    r#""document_photo":"none|receipt|invoice|statement|other","#,
     r#""description":"short factual description","#,
     r#""series_candidates":["name"],"#,
     r#""character_candidates":["name"],"#,
@@ -28,7 +28,7 @@ const PRIMARY_PROMPT_DETAILED: &str = concat!(
     " Rules: ",
     "1) Use null-like empty arrays when unknown. ",
     "2) If image has visible text (UI, receipt, scan, subtitles), contains_text=true. ",
-    "3) is_document_like=true for receipts/invoices/forms/scanned docs/screenshots of documents. ",
+    "3) document_photo describes the picture ITSELF: a photographed receipt is \"receipt\", a scanned invoice is \"invoice\". A scene that only shows a sign, a logo or a price is \"none\" — never infer a document from brand names. ",
     "4) series_candidates and character_candidates must be unique and max 5 items each. ",
     "5) Keep description under 24 words. ",
     "6) Favor precision over guesswork.",
@@ -42,12 +42,14 @@ const PRIMARY_PROMPT_CONCISE: &str = concat!(
     "Analyze this image. Return ONLY compact JSON, no markdown. Schema: ",
     r#"{"media_type":"screenshot|anime|manga|photo|document|artwork|other","#,
     r#""contains_text":true,"#,
+    r#""document_photo":"none|receipt|invoice|statement|other","#,
     r#""description":"max 12 words","#,
     r#""confidence":0.0}"#,
     " Rules: ",
     "1) contains_text=true only when text is clearly visible (UI, receipt, scan, subtitles). ",
-    "2) description must be factual and under 12 words. ",
-    "3) Favor precision over guesswork.",
+    "2) document_photo=receipt|invoice|statement|other only when the picture IS that document; a scene showing signs, logos or prices is \"none\". ",
+    "3) description must be factual and under 12 words. ",
+    "4) Favor precision over guesswork.",
 );
 
 // The old `PRIMARY_PROMPT_FALLBACK` lived here: a second wording of the same schema
@@ -116,6 +118,42 @@ const VALID_MEDIA_TYPES: &[&str] = &[
     "other",
 ];
 
+/// What the model is allowed to answer for `document_photo`.
+///
+/// Deliberately **not** the taxonomy of [`RECEIPT_PROMPT`] (`bank_transfer` and the
+/// like): this field answers one question — is the picture itself that document? —
+/// and it is what the OCR gate and the document bucket read.
+pub const VALID_DOCUMENT_PHOTOS: &[&str] = &["none", "receipt", "invoice", "statement", "other"];
+
+/// The document kind the primary pass named, when it named one of ours.
+///
+/// `none` is a real answer here (it means "this is a scene") and must survive
+/// [`clean_nullable_str`], which drops the string "none" — hence the raw read.
+fn document_photo_of(primary: &Value) -> Option<String> {
+    let value = primary
+        .get("document_photo")?
+        .as_str()?
+        .trim()
+        .to_ascii_lowercase();
+    VALID_DOCUMENT_PHOTOS
+        .contains(&value.as_str())
+        .then_some(value)
+}
+
+/// The `document_photo` value in a raw body whose JSON did not parse.
+fn extract_document_photo(raw: &str) -> Option<String> {
+    let re = Regex::new(r#"(?i)"document_photo"\s*:\s*"([^"]*)""#).ok()?;
+    let value = re
+        .captures(raw)?
+        .get(1)?
+        .as_str()
+        .trim()
+        .to_ascii_lowercase();
+    VALID_DOCUMENT_PHOTOS
+        .contains(&value.as_str())
+        .then_some(value)
+}
+
 /// Regex-based salvage when all JSON attempts fail.
 pub fn salvage_primary_from_raw(raw: &str) -> Option<Value> {
     if raw.is_empty() {
@@ -146,11 +184,13 @@ pub fn salvage_primary_from_raw(raw: &str) -> Option<Value> {
         "is_anime_related",
         matches!(media_type.as_str(), "anime" | "manga" | "artwork"),
     );
-    let is_doc = extract_bool(
-        raw,
-        "is_document_like",
-        matches!(media_type.as_str(), "document" | "screenshot"),
-    );
+    let document_photo = extract_document_photo(raw).unwrap_or_else(|| {
+        if matches!(media_type.as_str(), "document" | "screenshot") {
+            "other".to_string()
+        } else {
+            "none".to_string()
+        }
+    });
 
     let desc_re = Regex::new(r#"(?i)"description"\s*:\s*"([^"]*)""#).ok()?;
     let desc = desc_re
@@ -173,7 +213,7 @@ pub fn salvage_primary_from_raw(raw: &str) -> Option<Value> {
         "media_type": media_type,
         "contains_text": contains_text,
         "is_anime_related": is_anime,
-        "is_document_like": is_doc,
+        "document_photo": document_photo,
         "description": desc,
         "series_candidates": series,
         "character_candidates": chars,
@@ -263,16 +303,20 @@ pub fn should_run_anime_enrichment(primary: &Value) -> bool {
 ///
 /// `contains_text` alone must **not** trigger OCR: anime frames with burned-in
 /// subtitles and fan art with text used to pay ~8 s of Surya per image for no
-/// benefit. Surya spawns a fresh Python interpreter (torch + models) per file,
-/// so it is only worth it for actual documents.
+/// benefit. Surya spawns a fresh Python interpreter (torch + models) per file, so it
+/// is only worth it for actual documents.
 ///
-/// A **scene** never triggers it either, not even when the model offers
-/// `is_document_like: true`: a beach-volleyball photo with the sponsor boards of
-/// Banco do Brasil and GOL came back as `[Doc: bank_transfer] [Issuer: GOL]`
-/// (2026-10-26), and the whole OCR pass (~13 s of GPU with the LLM engine) was paid
-/// for a picture of a court. The recall cost is deliberate — a *photographed* receipt
-/// is a scene too and stops here — and the escape hatch is a retry with overrides
-/// ([`crate::models::ScanOverrides`]) once a folder is known to hold receipts.
+/// The routing signal is `document_photo`, the question the model is actually able to
+/// answer — "is the picture itself this document?". The boolean it used to be
+/// (`is_document_like`) was a guess: a beach-volleyball photo with the sponsor boards
+/// of Banco do Brasil and GOL came back as `[Doc: bank_transfer] [Issuer: GOL]`
+/// (2026-10-26) and paid the whole ~13 s OCR pass for a picture of a court. With the
+/// explicit field a scene answers `none`, and a *photographed* receipt answers
+/// `receipt` and does get its fields extracted — the recall the old rule traded away.
+///
+/// Anime, manga, artwork and video stay excluded no matter what the model says:
+/// burned-in subtitles and logos are not documents, and those are the frames that
+/// paid the most for nothing.
 pub fn should_run_document_enrichment(primary: &Value, ocr_engine: OcrEngine) -> bool {
     if ocr_engine == OcrEngine::Off {
         return false;
@@ -281,17 +325,18 @@ pub fn should_run_document_enrichment(primary: &Value, ocr_engine: OcrEngine) ->
         .get("media_type")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if matches!(
-        media_type,
-        "anime" | "manga" | "artwork" | "photo" | "video"
-    ) {
+    if matches!(media_type, "anime" | "manga" | "artwork" | "video") {
         return false;
     }
-    let is_doc = primary
-        .get("is_document_like")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    matches!(media_type, "document" | "screenshot") || is_doc
+    // A scan or a screenshot of a document is a document even when the model calls the
+    // picture a "photo": `document_photo` can add to this, never remove from it.
+    if matches!(media_type, "document" | "screenshot") {
+        return true;
+    }
+    matches!(
+        document_photo_of(primary).as_deref(),
+        Some("receipt" | "invoice" | "statement" | "other")
+    )
 }
 
 /// Char-boundary-safe truncation for prompt payloads.
@@ -701,7 +746,7 @@ fn classify_primary(
             "media_type": "other",
             "contains_text": false,
             "is_anime_related": false,
-            "is_document_like": false,
+            "document_photo": "none",
             "description": "",
             "series_candidates": [],
             "character_candidates": [],
@@ -1099,6 +1144,8 @@ pub fn classify_image(
                 canonical_mentions: String::new(),
                 confidence: 0.0,
                 lang_hint: String::new(),
+                // The file was never read, so nothing was evaluated.
+                document_hint: String::new(),
                 failure_kind: "prepare".to_string(),
             };
         }
@@ -1146,6 +1193,16 @@ pub fn classify_image_prepared(
         .get("confidence")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0) as f32;
+    // `none` is the model saying "this is a scene". A document or a screenshot without
+    // the field (old prompt, salvaged body) still belongs to the bucket, so it reads
+    // `other` instead of `none`.
+    let document_hint = document_photo_of(&primary).unwrap_or_else(|| {
+        if matches!(media_type.as_str(), "document" | "screenshot") {
+            "other".to_string()
+        } else {
+            "none".to_string()
+        }
+    });
 
     let mut full_description = description.clone();
     let mut extracted_text = String::new();
@@ -1222,6 +1279,7 @@ pub fn classify_image_prepared(
         canonical_mentions,
         confidence,
         lang_hint,
+        document_hint,
         failure_kind: primary_failure.unwrap_or_default().to_string(),
     }
 }
@@ -1277,6 +1335,8 @@ pub fn classify_video(
             canonical_mentions: String::new(),
             confidence: 0.1,
             lang_hint: String::new(),
+            // A video is a scene, never a document: no OCR pass for it.
+            document_hint: "none".to_string(),
             // A degraded but usable answer, not a failure.
             failure_kind: String::new(),
         };
@@ -1462,6 +1522,7 @@ pub fn classify_video(
         canonical_mentions,
         confidence: final_confidence,
         lang_hint,
+        document_hint: "none".to_string(),
         failure_kind: String::new(),
     }
 }
@@ -1493,6 +1554,8 @@ pub fn classify_pdf(
             canonical_mentions: String::new(),
             confidence: 0.0,
             lang_hint: String::new(),
+            // A PDF is a document by construction, even when it cannot be opened.
+            document_hint: "other".to_string(),
             failure_kind: String::new(),
         };
     }
@@ -1674,6 +1737,8 @@ pub fn classify_pdf(
         canonical_mentions,
         confidence,
         lang_hint,
+        // A PDF is a document by construction; the bucket is the point of this row.
+        document_hint: "other".to_string(),
         failure_kind: String::new(),
     }
 }
@@ -1819,11 +1884,12 @@ mod tests {
 
     #[test]
     fn salvage_primary_with_all_fields() {
-        let raw = r#"blah "media_type": "anime", "contains_text": true, "is_anime_related": true, "is_document_like": false, "description": "A girl", "confidence": 0.85, "series_candidates": ["Ranma"], "character_candidates": ["Akane"] blah"#;
+        let raw = r#"blah "media_type": "anime", "contains_text": true, "is_anime_related": true, "document_photo": "none", "description": "A girl", "confidence": 0.85, "series_candidates": ["Ranma"], "character_candidates": ["Akane"] blah"#;
         let v = salvage_primary_from_raw(raw).unwrap();
         assert_eq!(v["media_type"], "anime");
         assert_eq!(v["contains_text"], true);
         assert_eq!(v["is_anime_related"], true);
+        assert_eq!(v["document_photo"], "none");
         assert_eq!(v["description"], "A girl");
         assert!((v["confidence"].as_f64().unwrap() - 0.85).abs() < 0.01);
     }
@@ -1852,6 +1918,7 @@ mod tests {
             canonical_mentions: String::new(),
             confidence: 0.0,
             lang_hint: String::new(),
+            document_hint: String::new(),
             failure_kind: "repeat_limit".to_string(),
         };
         assert!(is_empty_result(&failed));
@@ -1911,34 +1978,68 @@ mod tests {
 
     #[test]
     fn should_run_document_for_doc_type() {
-        let p = serde_json::json!({"media_type": "document", "contains_text": false, "is_document_like": false});
+        let p = serde_json::json!({"media_type": "document", "contains_text": false});
         assert!(should_run_document_enrichment(&p, OcrEngine::Llm));
     }
 
+    /// The recall the old boolean could not give: a receipt that was *photographed* is
+    /// still a `photo`, and the model now says so in `document_photo`.
     #[test]
-    fn should_run_document_for_document_like() {
-        // `other` is the open bucket: nothing about the picture says "scene", so the
-        // model's own `is_document_like` decides.
-        let p = serde_json::json!({"media_type": "other", "contains_text": true, "is_document_like": true});
+    fn should_run_document_for_a_photographed_receipt() {
+        let p = serde_json::json!({
+            "media_type": "photo",
+            "contains_text": true,
+            "document_photo": "receipt",
+        });
         assert!(should_run_document_enrichment(&p, OcrEngine::Llm));
     }
 
-    /// A scene with text in it is not a document, even when the model says it is: the
-    /// sponsor boards of a beach-volleyball court came back as a `bank_transfer`
-    /// because they said "BANCO DO BRASIL" and "GOL" (2026-10-26).
+    /// The beach-volleyball case: a scene with logos answers `none`, so the ~13 s OCR
+    /// pass is not paid for a picture of a court (2026-10-26).
     #[test]
     fn should_not_run_document_for_a_scene_with_logos() {
-        for media_type in ["photo", "video", "artwork", "anime", "manga"] {
+        for media_type in ["photo", "other"] {
             let p = serde_json::json!({
                 "media_type": media_type,
                 "contains_text": true,
-                "is_document_like": true,
+                "document_photo": "none",
             });
             assert!(
                 !should_run_document_enrichment(&p, OcrEngine::Llm),
-                "{media_type} is a scene: a logo is not a document"
+                "{media_type} with document_photo=none must not pay for OCR"
             );
         }
+    }
+
+    /// Anime, manga, artwork and video never trigger OCR, whatever the model answers:
+    /// burned-in subtitles used to cost a full Surya run (~8 s/image).
+    #[test]
+    fn document_photo_cannot_override_a_scene_media_type() {
+        for media_type in ["anime", "manga", "artwork", "video"] {
+            let p = serde_json::json!({
+                "media_type": media_type,
+                "contains_text": true,
+                "document_photo": "receipt",
+            });
+            assert!(
+                !should_run_document_enrichment(&p, OcrEngine::Surya),
+                "{media_type} must never trigger OCR"
+            );
+        }
+    }
+
+    /// `document_photo` has to survive the regex salvage, including the "none" answer
+    /// that [`clean_nullable_str`] would have dropped.
+    #[test]
+    fn salvage_keeps_document_photo() {
+        let receipt =
+            salvage_primary_from_raw(r#"{"media_type":"photo","document_photo":"receipt""#)
+                .expect("salvage");
+        assert_eq!(receipt["document_photo"], "receipt");
+
+        let scene = salvage_primary_from_raw(r#"{"media_type":"photo","document_photo":"none""#)
+            .expect("salvage");
+        assert_eq!(scene["document_photo"], "none");
     }
 
     /// The suffix only goes in when the OCR text carries a document signal, so brand
@@ -1962,28 +2063,20 @@ mod tests {
         assert!(!document_fields_are_real(&none, "R$ 10,00 2024-01-15"));
     }
 
-    /// Burned-in subtitles used to trigger a full Surya OCR run (~8 s/image).
-    #[test]
-    fn should_not_run_document_for_anime_with_text() {
-        for media_type in ["anime", "manga", "artwork"] {
-            let p = serde_json::json!({"media_type": media_type, "contains_text": true, "is_document_like": false});
-            assert!(
-                !should_run_document_enrichment(&p, OcrEngine::Surya),
-                "{media_type} with text must not trigger OCR"
-            );
-        }
-    }
-
     #[test]
     fn should_not_run_document_when_ocr_is_off() {
-        let p = serde_json::json!({"media_type": "document", "contains_text": true, "is_document_like": true});
+        let p = serde_json::json!({"media_type": "document", "document_photo": "receipt"});
         assert!(!should_run_document_enrichment(&p, OcrEngine::Off));
     }
 
     #[test]
     fn should_not_run_document_for_plain_photo() {
-        let p = serde_json::json!({"media_type": "photo", "contains_text": false, "is_document_like": false});
+        // A partial body without `document_photo` says nothing about being a document.
+        let p = serde_json::json!({"media_type": "photo", "contains_text": false});
         assert!(!should_run_document_enrichment(&p, OcrEngine::Llm));
+
+        let explicit = serde_json::json!({"media_type": "photo", "document_photo": "none"});
+        assert!(!should_run_document_enrichment(&explicit, OcrEngine::Llm));
     }
 
     #[test]

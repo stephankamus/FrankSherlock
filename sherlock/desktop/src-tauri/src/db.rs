@@ -343,6 +343,25 @@ fn run_migrations(conn: &mut Connection) -> AppResult<()> {
             CREATE INDEX IF NOT EXISTS idx_files_classify_state ON files(classify_state);
             "#,
         ),
+        // Migration 16: what the picture itself is, when it is a document.
+        //
+        // Why: the boolean the OCR gate used (`is_document_like`) is not a question the
+        // model answers reliably. A beach-volleyball court with the sponsor boards of
+        // Banco do Brasil and GOL came back as a bank transfer and paid the whole ~13 s
+        // OCR pass for a picture of a court (2026-10-26). The primary prompt now asks
+        // `document_photo` (`none|receipt|invoice|statement|other`) and this column
+        // keeps that answer, so the OCR gate and the document bucket read one field.
+        //
+        // `''` means "not evaluated" — every row written before this migration, plus
+        // the rows a failed classification left behind. That is why the bucket filters
+        // `NOT IN ('', 'none')` instead of `<> 'none'`: an old index must not look like
+        // it is full of documents, and `none` is the model explicitly saying "a scene".
+        M::up(
+            r#"
+            ALTER TABLE files ADD COLUMN document_hint TEXT NOT NULL DEFAULT '';
+            CREATE INDEX IF NOT EXISTS idx_files_document_hint ON files(document_hint);
+            "#,
+        ),
     ]);
 
     migrations
@@ -1146,6 +1165,7 @@ pub fn copy_classification(db_path: &Path, target_id: i64, source_id: i64) -> Ap
              canonical_mentions = (SELECT canonical_mentions FROM files WHERE id = ?2), \
              confidence = (SELECT confidence FROM files WHERE id = ?2), \
              lang_hint = (SELECT lang_hint FROM files WHERE id = ?2), \
+             document_hint = (SELECT document_hint FROM files WHERE id = ?2), \
              extracted_text = '', \
              updated_at = ?3 \
          WHERE id = ?1",
@@ -1472,7 +1492,7 @@ pub fn stamp_modified_rows(
                 SET mtime_ns = ?2, size_bytes = ?3, scan_marker = ?4, updated_at = ?5,
                     description = '', extracted_text = '', canonical_mentions = '',
                     confidence = 0.0, lang_hint = 'unknown', fingerprint = '',
-                    dhash = NULL, thumb_path = NULL,
+                    dhash = NULL, thumb_path = NULL, document_hint = '',
                     classify_state = '', failure_kind = '', failure_detail = '',
                     failed_at = NULL
               WHERE root_id = ?6 AND rel_path = ?1 AND deleted_at IS NULL",
@@ -2474,7 +2494,7 @@ pub fn reset_root_classifications(
             &format!(
                 "UPDATE files
                  SET description = '', extracted_text = '', canonical_mentions = '',
-                     confidence = 0, lang_hint = '', updated_at = ?2
+                     confidence = 0, lang_hint = '', document_hint = '', updated_at = ?2
                  WHERE root_id = ?1 AND deleted_at IS NULL AND NOT {PENDING_CLASSIFICATION_SQL}"
             ),
             params![root_id, now],
@@ -2967,6 +2987,7 @@ pub fn update_file_classification(
     canonical_mentions: &str,
     confidence: f32,
     lang_hint: &str,
+    document_hint: &str,
 ) -> AppResult<()> {
     let conn = open_conn(db_path)?;
     let tx = conn.unchecked_transaction()?;
@@ -2977,6 +2998,7 @@ pub fn update_file_classification(
         // selection. `classify_attempts` is kept: it is history, not state.
         "UPDATE files SET media_type = ?2, description = ?3, extracted_text = ?4,
                 canonical_mentions = ?5, confidence = ?6, lang_hint = ?7, updated_at = ?8,
+                document_hint = ?9,
                 classify_state = '', failure_kind = '', failure_detail = '', failed_at = NULL
          WHERE id = ?1 AND deleted_at IS NULL",
         params![
@@ -2987,12 +3009,59 @@ pub fn update_file_classification(
             canonical_mentions,
             confidence,
             lang_hint,
-            now
+            now,
+            document_hint
         ],
     )?;
     refresh_fts(&tx, file_id)?;
     tx.commit()?;
     Ok(())
+}
+
+/// A row the model flagged as a document.
+///
+/// `id` and `abs_path` are what the enrichment block and the OCR A/B need in order to
+/// open the original file. Today the pass only logs the count and the kind breakdown,
+/// so the whole type carries the `allow` until that block lands.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct DocumentRow {
+    pub id: i64,
+    pub rel_path: String,
+    pub abs_path: String,
+    /// `receipt`, `invoice`, `statement` or `other`.
+    pub hint: String,
+}
+
+/// Rows of `root_id` that are documents: the population the OCR pass and its A/B
+/// iterate over.
+///
+/// The predicate is `NOT IN ('', 'none')` on purpose. `''` is "not evaluated" (a row
+/// written before the column existed, or one whose classification failed) and must
+/// not swell the bucket, while `none` is the model explicitly saying "this is a
+/// scene".
+pub fn list_document_rows(db_path: &Path, root_id: i64) -> AppResult<Vec<DocumentRow>> {
+    let conn = open_conn(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, rel_path, abs_path, document_hint
+           FROM files
+          WHERE root_id = ?1 AND deleted_at IS NULL
+            AND document_hint NOT IN ('', 'none')
+          ORDER BY rel_path",
+    )?;
+    let rows = stmt.query_map(params![root_id], |row| {
+        Ok(DocumentRow {
+            id: row.get(0)?,
+            rel_path: row.get(1)?,
+            abs_path: row.get(2)?,
+            hint: row.get(3)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 pub fn update_file_thumb_path_by_id(
@@ -5356,8 +5425,10 @@ mod tests {
 
         // A successful classification clears the failure, so the row stops counting
         // as failed without ever leaving the index.
-        update_file_classification(&db_path, failed, "photo", "a beach", "", "", 0.4, "en")
-            .expect("classify");
+        update_file_classification(
+            &db_path, failed, "photo", "a beach", "", "", 0.4, "en", "none",
+        )
+        .expect("classify");
         assert_eq!(
             failed_classification_count(&db_path, root_id).expect("count"),
             0
@@ -5393,23 +5464,71 @@ mod tests {
             "mentions",
             0.9,
             "pt",
+            "receipt",
         )
         .expect("classify");
 
         copy_classification(&db_path, target, source).expect("copy");
 
         let conn = open_conn(&db_path).expect("open");
-        let (media, description, text, confidence): (String, String, String, f64) = conn
+        let (media, description, text, confidence, document_hint): (
+            String,
+            String,
+            String,
+            f64,
+            String,
+        ) = conn
             .query_row(
-                "SELECT media_type, description, extracted_text, confidence FROM files WHERE id = ?1",
+                "SELECT media_type, description, extracted_text, confidence, document_hint
+                   FROM files WHERE id = ?1",
                 params![target],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .expect("row");
         assert_eq!(media, "document");
         assert_eq!(description, "a scanned page");
         assert!(text.is_empty(), "OCR text is not copied");
         assert!((confidence - 0.9).abs() < 1e-6);
+        assert_eq!(
+            document_hint, "receipt",
+            "the bucket membership travels with a deduped classification"
+        );
+    }
+
+    /// The bucket is `NOT IN ('', 'none')`: `''` is "not evaluated" and `none` is the
+    /// model saying "a scene", so neither may show up as a document.
+    #[test]
+    fn document_bucket_excludes_scenes_and_unevaluated_rows() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/documents").expect("root");
+
+        let rows = [
+            ("receipt.jpg", "receipt"),
+            ("invoice.jpg", "invoice"),
+            ("scene.jpg", "none"),
+            ("legacy.jpg", ""),
+        ];
+        for (rel, hint) in rows {
+            let id =
+                upsert_file_record(&db_path, &sample_record(root_id, rel, &format!("fp-{rel}")))
+                    .expect("row");
+            update_file_classification(&db_path, id, "photo", "described", "", "", 0.8, "en", hint)
+                .expect("classify");
+        }
+
+        let bucket = list_document_rows(&db_path, root_id).expect("bucket");
+        let names: Vec<&str> = bucket.iter().map(|row| row.rel_path.as_str()).collect();
+        assert_eq!(names, vec!["invoice.jpg", "receipt.jpg"]);
+        assert_eq!(bucket[1].hint, "receipt");
     }
 
     fn sample_record(root_id: i64, rel: &str, fp: &str) -> FileRecordUpsert {
@@ -6620,11 +6739,11 @@ mod tests {
         init_database(&db_path).expect("init");
 
         let conn = open_conn(&db_path).expect("open");
-        // Verify user_version is set (16 migrations applied → version 16)
+        // Verify user_version is set (17 migrations applied → version 17)
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 16);
+        assert_eq!(version, 17);
 
         // Migration 13 adds the non-destructive root availability columns.
         let root_columns: Vec<String> = {
@@ -6683,8 +6802,8 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        // We have 16 migrations (indices 0..15), so user_version should be 16
-        assert_eq!(version, 16);
+        // We have 17 migrations (indices 0..16), so user_version should be 17
+        assert_eq!(version, 17);
     }
 
     #[test]
@@ -7335,8 +7454,10 @@ mod tests {
 
         let classified =
             upsert_file_record(&db_path, &sample_record(root_id, "a.jpg", "fp-a")).expect("a");
-        update_file_classification(&db_path, classified, "photo", "a beach", "", "", 0.4, "en")
-            .expect("classify");
+        update_file_classification(
+            &db_path, classified, "photo", "a beach", "", "", 0.4, "en", "none",
+        )
+        .expect("classify");
 
         // The walk found both files again; the classified one comes back blank.
         let known = sample_record(root_id, "a.jpg", "");

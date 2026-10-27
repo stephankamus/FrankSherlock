@@ -757,12 +757,23 @@ Um scan cancelado **não** encadeia: cancelar significa parar, não continuar de
 
 **Filtro de documento.** Uma foto de vôlei de areia com as placas de "BANCO DO BRASIL" e
 "GOL" saiu como `[Doc: bank_transfer] [Issuer: GOL]`. A causa era o modelo responder
-`is_document_like: true` para uma cena, e o portão aceitar isso. Agora: cena (`photo`,
-`video`, `artwork`, `anime`, `manga`) **nunca** dispara o enriquecimento, `document_kind`
-ganhou `"none"` no schema, e o sufixo `[Doc]/[Issuer]` só entra quando o texto do OCR tem
-sinal de documento (valor + data, ou moeda). O custo de recall é explícito: um comprovante
-*fotografado* também é cena e para ali — a saída é um retry com overrides numa pasta que se
-sabe ser de comprovantes.
+`is_document_like: true` para uma cena, e o portão aceitar isso. O schema primário agora
+pede `"document_photo":"none|receipt|invoice|statement|other"` — a pergunta que o modelo
+consegue responder ("a *foto* é esse documento?") — e o portão do OCR lê só esse campo:
+uma cena responde `none` e não paga os ~13 s; um comprovante **fotografado** responde
+`receipt` e volta a ser enriquecido, que era o recall que a regra anterior abria mão. Anime,
+manga, artwork e vídeo continuam excluídos independentemente da resposta, e `document_kind`
+mantém o `"none"` para o sufixo `[Doc]/[Issuer]` só entrar quando o texto do OCR tem sinal
+de documento (valor + data, ou moeda).
+
+O valor é persistido em `files.document_hint` (migration 16), com `''` = "não avaliado" e
+`none` = "cena"; o bucket de documentos é `document_hint NOT IN ('', 'none')`
+([`list_document_rows`](../sherlock/desktop/src-tauri/src/db.rs:3026)), que é a população
+onde o A/B de OCR do §10 roda (LLM com 1500 tokens contra `num_predict` menor e contra o
+surya).
+
+**A/B de documentos (pendente).** Os 133 arquivos que disparavam o passe de 13 s em §5.8
+ainda não foram medidos com os três braços; o bucket acima é onde eles aparecem.
 
 ### 5.12 `full` = descoberta + pipeline (implementado)
 

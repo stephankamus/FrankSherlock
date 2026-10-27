@@ -1164,6 +1164,7 @@ async fn retry_protected_pdfs(
                     &classification.canonical_mentions,
                     classification.confidence,
                     &classification.lang_hint,
+                    &classification.document_hint,
                 );
 
                 if let Some(ref tr) = thumb_result {
@@ -1244,6 +1245,7 @@ async fn reclassify_pdf(
             &classification.canonical_mentions,
             classification.confidence,
             &classification.lang_hint,
+            &classification.document_hint,
         );
 
         if let Some(ref tr) = thumb_result {
