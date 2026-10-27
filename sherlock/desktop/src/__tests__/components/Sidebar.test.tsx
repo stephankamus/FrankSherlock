@@ -196,6 +196,40 @@ describe("Sidebar", () => {
     expect(screen.getByRole("button", { name: /Stop Backlog/ })).toBeInTheDocument();
   });
 
+  it("shows the pipeline counters for a full scan without taking over the backlog button", () => {
+    render(
+      <Sidebar
+        {...defaultProps}
+        roots={[sampleRoot]}
+        onProcessBacklog={vi.fn()}
+        onCancelBacklog={vi.fn()}
+        backlog={{
+          jobId: 7,
+          rootId: 1,
+          mode: "full",
+          total: 1000,
+          processed: 120,
+          thumbnailed: 100,
+          thumbsTotal: 125,
+          classified: 80,
+          classifyTotal: 800,
+          deduped: 10,
+          failed: 0,
+          startedAt: Math.floor(Date.now() / 1000) - 60,
+          phase: "running",
+          error: null,
+        }}
+      />,
+    );
+
+    // A `full` runs the same pipeline, so the numbers must show up there too — but
+    // the button says "Scanning", not "Processing backlog", and the pass is paused
+    // from the root card instead of a second stop button here.
+    expect(screen.getByText(/Scan .* files/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Scanning…/ })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: /Stop Backlog/ })).not.toBeInTheDocument();
+  });
+
   it("says nothing is missing instead of showing 0% when the cache is healthy", () => {
     render(
       <Sidebar
@@ -349,7 +383,7 @@ describe("Sidebar", () => {
 
   it("renders running scan with pause button inside RootCard", () => {
     render(<Sidebar {...defaultProps} roots={[sampleRoot]} activeScans={[mockRunningScan]} />);
-    expect(screen.getByText("Classifying 50/100")).toBeInTheDocument();
+    expect(screen.getByText("Processing 50/100")).toBeInTheDocument();
     expect(screen.getByText("Pause")).toBeInTheDocument();
   });
 

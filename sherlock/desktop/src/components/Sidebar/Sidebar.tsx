@@ -289,9 +289,13 @@ export default function Sidebar({
                 title="Classify pending files and fill missing thumbnails in one pass"
               >
                 {backlogRunning
-                  ? backlog?.phase === "counting"
-                    ? "Counting backlog…"
-                    : "Processing backlog…"
+                  ? backlog?.mode === "full"
+                    // A `full` scan runs the same pipeline; the button must not look
+                    // like the backlog pass was the thing that started.
+                    ? "Scanning…"
+                    : backlog?.phase === "counting"
+                      ? "Counting backlog…"
+                      : "Processing backlog…"
                   : "Process Backlog"}
               </button>
             )}
@@ -327,7 +331,7 @@ export default function Sidebar({
                 <div className="sidebar-item sidebar-item-muted">
                   {backlog.phase === "counting"
                     ? "Reading the index…"
-                    : `${backlog.processed.toLocaleString()} / ${backlog.total.toLocaleString()} files`}
+                    : `${backlog.mode === "full" ? "Scan" : "Backlog"} ${backlog.processed.toLocaleString()} / ${backlog.total.toLocaleString()} files`}
                 </div>
                 {backlog.failed > 0 && (
                   <div className="sidebar-item sidebar-item-muted">
@@ -337,7 +341,9 @@ export default function Sidebar({
                 )}
               </div>
             )}
-            {backlogRunning && onCancelBacklog && (
+            {/* A `full` scan has its own Pause on the root card; a second stop button
+                here would cancel the same job under a name that no longer applies. */}
+            {backlogRunning && backlog?.mode !== "full" && onCancelBacklog && (
               <button
                 type="button"
                 className="sidebar-tool-btn"

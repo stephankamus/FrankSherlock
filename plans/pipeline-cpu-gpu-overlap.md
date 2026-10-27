@@ -166,7 +166,9 @@ rows do backlog (ordenados por rel_path)
   por arquivo custaria uma escrita por request. O pipeline reporta por um canal
   em memória (`BacklogTick` → `models::BacklogProgress`), pollado pela sidebar:
   **thumbnails** e **classified**, cada um com o seu percentual, mais
-  `processed/total`, `deduped` e `failed`.
+  `processed/total`, `deduped` e `failed`. O `full` usa o mesmo registro
+  (`mode = "full"`), criado no primeiro tick — antes disso ele está na descoberta,
+  que já tem contador próprio no cartão da raiz.
 - Denominadores separados (`thumbs_total`, `classify_total`): a maioria das
   linhas precisa de só uma das duas etapas. Dividir pelo backlog inteiro fazia o
   contador de thumbnails parecer travado em 0 % depois de um
@@ -176,10 +178,14 @@ rows do backlog (ordenados por rel_path)
   ponteiro morto (só o `stat` revela).
 - Parar: o botão usa o `cancel_scan(job_id)` que já existe (um passe de backlog é
   um scan job), então o cancelamento e o desbloqueio do produtor são os mesmos
-  de qualquer scan.
-- Retomada após interrupção: o `phase` do job fica gravado como `backlog`, e o
-  `onResumeScan` do frontend usa esse valor para retomar no modo certo em vez de
-  virar um `full`.
+  de qualquer scan. No `full` o botão é o **Pause** do cartão da raiz, que passou a
+  renderizar a fase `processing`; a sidebar não mostra um segundo "Stop".
+- Retomada após interrupção: o `phase` do job fica gravado como `backlog` (passe
+  de backlog) ou `processing` (pipeline de um `full`), e o `onResumeScan` do
+  frontend usa esse valor para retomar no modo certo em vez de virar um `full`.
+  O índice já está inteiro nesse ponto — a descoberta escreve todas as linhas antes
+  do pipeline —, então `incomplete_scan_for_path` só bloqueia `discovering` (e o
+  `thumbnailing` legado, de builds que gravavam linha a linha).
 
 ### 4.4 Backlog combinado (implementado)
 

@@ -12,7 +12,8 @@ type BacklogCallbacks = {
 };
 
 /**
- * Drives the "Process Backlog" tool.
+ * Drives the producer/consumer pipeline: the "Process Backlog" tool, the retry
+ * pass, and the pipeline half of a `full` scan.
  *
  * Same shape as `useThumbRepair`: the backend keeps one in-memory progress record
  * (the scan job row only carries a single counter), this hook polls it and
@@ -53,10 +54,13 @@ export function useBacklog({ pollMs, onNotice, onError, onFinished }: BacklogCal
           !finishedReported.current
         ) {
           finishedReported.current = true;
+          // A `full` scan runs the same pipeline, so the notice has to say "Scan":
+          // calling it "Backlog" made the toast contradict the root card.
+          const label = status.mode === "full" ? "Scan" : "Backlog";
           onNotice(
             status.phase === "done"
-              ? `Backlog done: ${status.classified} classified, ${status.thumbnailed} thumbnail(s)`
-              : `Backlog stopped after ${status.processed} file(s)`,
+              ? `${label} done: ${status.classified} classified, ${status.thumbnailed} thumbnail(s)`
+              : `${label} stopped after ${status.processed} file(s)`,
           );
           finishedRef.current?.();
         }

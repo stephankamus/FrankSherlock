@@ -63,7 +63,8 @@ struct AppState {
     recluster_progress: Arc<Mutex<Option<models::ReclusterProgress>>>,
     thumb_repair_progress: Arc<Mutex<Option<models::ThumbRepairProgress>>>,
     thumb_repair_cancel: Arc<AtomicBool>,
-    /// Live counters of the backlog pipeline, polled by the sidebar.
+    /// Live counters of the producer/consumer pipeline (backlog, retry and the
+    /// pipeline half of a `full`), polled by the sidebar.
     backlog_progress: Arc<Mutex<Option<models::BacklogProgress>>>,
 }
 
@@ -468,6 +469,7 @@ fn start_scan_job(
         *progress = Some(models::BacklogProgress {
             job_id: job.id,
             root_id: job.root_id,
+            mode: mode.as_str().to_string(),
             total: 0,
             processed: 0,
             thumbnailed: 0,
@@ -481,7 +483,14 @@ fn start_scan_job(
             error: None,
         });
     }
-    spawn_scan_worker_if_needed(app_state.clone(), app_handle, job.id, mode, overrides);
+    spawn_scan_worker_if_needed(
+        app_state.clone(),
+        app_handle,
+        job.id,
+        job.root_id,
+        mode,
+        overrides,
+    );
     db::get_scan_job(&app_state.paths.db_file, job.id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "scan job not found after start".to_string())
@@ -2147,6 +2156,7 @@ fn spawn_scan_worker_if_needed(
     app_state: AppState,
     app_handle: &tauri::AppHandle,
     job_id: i64,
+    root_id: i64,
     mode: scan::ScanMode,
     overrides: Option<models::ScanOverrides>,
 ) {
@@ -2185,17 +2195,46 @@ fn spawn_scan_worker_if_needed(
     let cancel_flags = app_state.cancel_flags.clone();
     let app_state_for_task = app_state.clone();
 
-    // Backlog counters are reported live, once per file: the sidebar needs the
+    // Pipeline counters are reported live, once per file: the sidebar needs the
     // thumbnail and classification numbers separately, and writing them to
-    // SQLite per file would add a write per vision request. Other modes ignore
-    // the callback entirely.
+    // SQLite per file would add a write per vision request. Modes that do not
+    // reach the pipeline (refresh, classify_only) never call the callback.
+    //
+    // The record is created on the first tick when it does not exist yet. A
+    // `full` discovers the folder for minutes before the pipeline exists, and
+    // showing "0 / 0" for the whole walk is worse than showing nothing; the
+    // backlog tool still gets its "counting" record up front because listing the
+    // rows can be slow.
     let progress_arc = app_state.backlog_progress.clone();
+    let record_mode = mode.as_str().to_string();
     let on_tick = move |tick: scan::BacklogTick| {
         let mut guard = progress_arc.lock().expect("backlog mutex poisoned");
+        if guard
+            .as_ref()
+            .is_some_and(|progress| progress.job_id != job_id)
+        {
+            // Another scan owns the panel; do not steal it.
+            return;
+        }
+        if guard.is_none() {
+            *guard = Some(models::BacklogProgress {
+                job_id,
+                root_id,
+                mode: record_mode.clone(),
+                total: 0,
+                processed: 0,
+                thumbnailed: 0,
+                thumbs_total: 0,
+                classified: 0,
+                classify_total: 0,
+                deduped: 0,
+                failed: 0,
+                started_at: unix_now_secs(),
+                phase: "running".to_string(),
+                error: None,
+            });
+        }
         if let Some(progress) = guard.as_mut() {
-            if progress.job_id != job_id {
-                return;
-            }
             progress.total = tick.total;
             progress.processed = tick.processed;
             progress.thumbnailed = tick.thumbnailed;
@@ -2226,7 +2265,10 @@ fn spawn_scan_worker_if_needed(
             );
         }
 
-        if mode.uses_backlog_pipeline() {
+        // Close the panel for whoever owns it, regardless of the mode: a `full`
+        // runs the pipeline too, and leaving its record as "running" would keep the
+        // counters (and the stop button) on screen until the app restarted.
+        {
             let mut guard = app_state_for_task
                 .backlog_progress
                 .lock()

@@ -322,12 +322,17 @@ export type ThumbRepairProgress = {
 // ── Backlog pipeline ────────────────────────────────────────────────
 
 /**
- * Live counters of the `backlog` scan mode. The two numbers the user cares
- * about are independent: a row can need a thumbnail, a classification, or both.
+ * Live counters of the producer/consumer pipeline.
+ *
+ * A `full` scan runs the same pipeline after discovery, so this is not backlog-only
+ * anymore. The two numbers the user cares about are independent: a row can need a
+ * thumbnail, a classification, or both.
  */
 export type BacklogProgress = {
   jobId: number;
   rootId: number;
+  /** `full`, `backlog` or `retry_failed` — the label of the pass. */
+  mode?: "full" | "backlog" | "retry_failed";
   /** Rows the pass has to work on; 0 while the index is still being read. */
   total: number;
   /** Rows consumed (thumbnail fixed and/or classification stored). */

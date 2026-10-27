@@ -45,11 +45,55 @@ describe("RootCard", () => {
     expect(screen.queryByLabelText("Remove photos")).not.toBeInTheDocument();
   });
 
-  it("shows scan progress with stats when scan is running (classifying phase)", () => {
+  it("shows scan progress with stats when scan is classifying", () => {
+    const classifyingScan = { ...mockRunningScan, phase: "classifying" as const };
+    render(
+      <RootCard root={sampleRoot} isSelected={false} scan={classifyingScan} readOnly={false} onSelect={vi.fn()} onDelete={vi.fn()} onRescan={vi.fn()} onRefresh={vi.fn()} onCopyPath={vi.fn()} onCancelScan={vi.fn()} />
+    );
+    expect(screen.getByText("Classifying 50/100")).toBeInTheDocument();
+  });
+
+  it("labels the full pipeline as processing", () => {
     render(
       <RootCard root={sampleRoot} isSelected={false} scan={mockRunningScan} readOnly={false} onSelect={vi.fn()} onDelete={vi.fn()} onRescan={vi.fn()} onRefresh={vi.fn()} onCopyPath={vi.fn()} onCancelScan={vi.fn()} />
     );
-    expect(screen.getByText("Classifying 50/100")).toBeInTheDocument();
+    expect(screen.getByText("Processing 50/100")).toBeInTheDocument();
+  });
+
+  it("shows the thumbnail and classification counters during the pipeline", () => {
+    render(
+      <RootCard
+        root={sampleRoot}
+        isSelected={false}
+        scan={mockRunningScan}
+        readOnly={false}
+        backlogProgress={{
+          jobId: mockRunningScan.id,
+          rootId: sampleRoot.id,
+          mode: "full",
+          total: 100,
+          processed: 50,
+          thumbnailed: 40,
+          thumbsTotal: 60,
+          classified: 30,
+          classifyTotal: 80,
+          deduped: 0,
+          failed: 0,
+          startedAt: 0,
+          phase: "running",
+          error: null,
+        }}
+        onSelect={vi.fn()}
+        onDelete={vi.fn()}
+        onRescan={vi.fn()}
+        onRefresh={vi.fn()}
+        onCopyPath={vi.fn()}
+        onCancelScan={vi.fn()}
+      />
+    );
+    expect(screen.getByText(/Thumbnails: 40 \/ 60/)).toBeInTheDocument();
+    expect(screen.getByText(/Classified: 30 \/ 80/)).toBeInTheDocument();
+    expect(screen.getByText("Pause")).toBeInTheDocument();
   });
 
   it("shows scan progress with stats when scan is thumbnailing", () => {

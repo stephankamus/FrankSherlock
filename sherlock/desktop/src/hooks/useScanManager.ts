@@ -64,11 +64,24 @@ type ScanManagerCallbacks = {
   itemsLength: () => number;
 };
 
+/**
+ * What the last poll saw of a running job.
+ *
+ * `phase`/`total` change when the pass changes *shape* — discovery finishing and
+ * writing every row, or the pipeline starting — while `processed` changes every
+ * checkpoint. Both mean the grid and the sidebar counters are stale.
+ */
+type ScanShape = {
+  phase: string;
+  processed: number;
+  total: number;
+};
+
 export function useScanManager(cb: ScanManagerCallbacks) {
   const [activeScans, setActiveScans] = useState<ScanJobStatus[]>([]);
   const [trackedJobIds, setTrackedJobIds] = useState<number[]>([]);
   const [completedJobs, setCompletedJobs] = useState<ScanJobStatus[]>([]);
-  const lastProcessedRef = useRef(0);
+  const lastScanShapeRef = useRef<ScanShape | null>(null);
 
   const refreshRoots = useCallback(async () => {
     try {
@@ -84,14 +97,17 @@ export function useScanManager(cb: ScanManagerCallbacks) {
   const pollRuntimeAndScans = useCallback(async () => {
     try {
       const ids = trackedJobIds;
+      // A failing runtime probe (nvidia-smi hanging, no GPU driver...) used to reject
+      // the whole poll, so scan progress and the grid stopped updating while the
+      // backend kept classifying. Those two are informational; the scan is not.
       const [setupStatus, runtimeStatus, scans, ...trackedResults] = await Promise.all([
-        getSetupStatus(),
-        getRuntimeStatus(),
+        getSetupStatus().catch(() => null),
+        getRuntimeStatus().catch(() => null),
         listActiveScans(),
         ...ids.map((id) => getScanJob(id).catch(() => null)),
       ]);
-      cb.setSetup(setupStatus);
-      cb.setRuntime(runtimeStatus);
+      if (setupStatus) cb.setSetup(setupStatus);
+      if (runtimeStatus) cb.setRuntime(runtimeStatus);
       setActiveScans((prev) => scansChanged(prev, scans) ? scans : prev);
 
       if (ids.length === 0) return;
@@ -99,7 +115,7 @@ export function useScanManager(cb: ScanManagerCallbacks) {
       const trackedJobs = trackedResults.filter((j): j is ScanJobStatus => j !== null);
       const stillTracked: number[] = [];
       const justCompleted: ScanJobStatus[] = [];
-      let maxProcessed = 0;
+      let newest: ScanJobStatus | null = null;
       let anyRunning = false;
 
       for (const job of trackedJobs) {
@@ -107,7 +123,7 @@ export function useScanManager(cb: ScanManagerCallbacks) {
           stillTracked.push(job.id);
           if (job.status === "running") {
             anyRunning = true;
-            if (job.processedFiles > maxProcessed) maxProcessed = job.processedFiles;
+            if (!newest || job.processedFiles >= newest.processedFiles) newest = job;
           }
         } else if (job.status === "completed") {
           justCompleted.push(job);
@@ -116,15 +132,38 @@ export function useScanManager(cb: ScanManagerCallbacks) {
         }
       }
 
-      if (anyRunning && maxProcessed > lastProcessedRef.current) {
-        lastProcessedRef.current = maxProcessed;
-        const liveLimit = Math.max(PAGE_SIZE, Math.min(cb.itemsLength(), MAX_ITEMS));
-        void cb.runSearch(0, false, liveLimit, true);
-        void refreshRoots();
+      if (anyRunning && newest) {
+        const next: ScanShape = {
+          phase: newest.phase,
+          processed: newest.processedFiles,
+          total: newest.totalFiles,
+        };
+        const prev = lastScanShapeRef.current;
+        // The pass changes *shape* when the walk finishes and writes every row, or
+        // when the pipeline replaces the thumbnail phase. That is the moment the grid
+        // and the sidebar counters become stale, even though no file was processed
+        // yet — which is why a 50k folder kept showing the previous 947 files for the
+        // whole pipeline.
+        const shapeChanged =
+          !prev || prev.phase !== next.phase || prev.total !== next.total;
+        const progressed = !prev || prev.processed !== next.processed;
+        if (shapeChanged || progressed) {
+          lastScanShapeRef.current = next;
+          const liveLimit = Math.max(PAGE_SIZE, Math.min(cb.itemsLength(), MAX_ITEMS));
+          void cb.runSearch(0, false, liveLimit, true);
+          void refreshRoots();
+          // `ensureDatabase` walks the thumbnail directory, so it is only worth it
+          // when the pass changes shape (the row count moved), never per batch.
+          if (shapeChanged && (next.total > 0 || next.phase !== "discovering")) {
+            ensureDatabase()
+              .then((stats) => cb.setDbStats(stats))
+              .catch(() => {});
+          }
+        }
       }
 
       if (justCompleted.length > 0) {
-        lastProcessedRef.current = 0;
+        lastScanShapeRef.current = null;
         setCompletedJobs((prev) => [...prev, ...justCompleted]);
         const stats = await ensureDatabase();
         cb.setDbStats(stats);
@@ -189,7 +228,9 @@ export function useScanManager(cb: ScanManagerCallbacks) {
       setCompletedJobs([]);
       const job = await startScan(rootPath, mode);
       setTrackedJobIds((prev) => [...prev, job.id]);
-      lastProcessedRef.current = 0;
+      // Force the first poll to re-query even when the counters are all zero: the
+      // rows may already exist from an earlier interrupted pass.
+      lastScanShapeRef.current = null;
       cb.setNotice(notice);
       await refreshRoots();
       await pollRuntimeAndScans();
@@ -245,8 +286,11 @@ export function useScanManager(cb: ScanManagerCallbacks) {
   async function onResumeScan(scan: ScanJobStatus, readOnly: boolean) {
     if (readOnly) return;
     // The job row remembers the phase it died in, so an interrupted backlog pass
-    // resumes as a backlog pass instead of turning into a full rescan.
-    const mode: ScanMode = scan.phase === "backlog" ? "backlog" : "full";
+    // resumes as a backlog pass instead of turning into a full rescan. A `full`
+    // interrupted in the pipeline is in the same situation: discovery already wrote
+    // every row, so only the pending work is left (and the walk is the expensive part).
+    const mode: ScanMode =
+      scan.phase === "backlog" || scan.phase === "processing" ? "backlog" : "full";
     await startScanWithMode(
       scan.rootPath,
       mode,
@@ -260,7 +304,8 @@ export function useScanManager(cb: ScanManagerCallbacks) {
       activeScans
         .filter((s) => s.status === "interrupted")
         .map((scan) => {
-          const mode: ScanMode = scan.phase === "backlog" ? "backlog" : "full";
+          const mode: ScanMode =
+            scan.phase === "backlog" || scan.phase === "processing" ? "backlog" : "full";
           return startScanWithMode(
             scan.rootPath,
             mode,

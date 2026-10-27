@@ -2330,14 +2330,19 @@ pub fn reassign_to_parent_root(db_path: &Path, child_root_id: i64) -> AppResult<
     Ok(Some(parent_id))
 }
 
-/// An interrupted scan that has not finished writing this root's index.
+/// An interrupted scan whose index is still a *prefix* of the folder.
 ///
-/// Discovery only builds the file list **in memory**; the rows are written by the
-/// thumbnail phase, one file at a time. Cancelling before that phase ends leaves an
-/// index that is a prefix of the folder — and a backlog pass over it reports
-/// "completed" over a fraction of the files. Measured on 2026-10-26: 925 rows of a
-/// 50k folder, presented as a finished backlog, because `upsert_file_record` had
-/// only been called 925 times when the scan was paused.
+/// Discovery walks the tree in memory; discovery used to write nothing and the rows
+/// were created one file at a time by the thumbnail phase, so pausing there left an
+/// index that was a prefix of the folder — a backlog over it reported "completed"
+/// over a fraction of the files (925 of 50k, 2026-10-26). Since the walk now writes
+/// every path up front ([`insert_pending_rows`]), only `discovering` can leave the
+/// index half-written.
+///
+/// `thumbnailing` is kept in the check for jobs created by a build that still wrote
+/// rows incrementally: for those, `processed < total` is the only evidence left.
+/// `processing` and `backlog` are always whole, which is what lets an interrupted
+/// `full` resume as a backlog pass instead of re-walking the share.
 ///
 /// Returns `(job_id, phase, processed, total)` when there is work left to write.
 pub fn incomplete_scan_for_path(
@@ -2352,7 +2357,7 @@ pub fn incomplete_scan_for_path(
                JOIN roots r ON r.id = j.root_id
               WHERE r.root_path = ?1
                 AND j.status IN ('running', 'pending', 'interrupted')
-                AND j.phase IN ('discovering', 'thumbnailing', 'processing')
+                AND j.phase IN ('discovering', 'thumbnailing')
               ORDER BY j.id DESC
               LIMIT 1",
             params![root_path],
@@ -7476,10 +7481,10 @@ mod tests {
         assert!(b.thumb_path.is_none(), "and with no thumbnail yet");
     }
 
-    /// Discovery only fills the file list **in memory**; the rows are written by the
-    /// thumbnail phase. A cancelled scan therefore leaves an index that is a prefix of
-    /// the folder, and a backlog over it reports "completed" over a fraction of the
-    /// files — 925 of 50k on 2026-10-26.
+    /// Only an interrupted *discovery* leaves the index half-written now: the walk
+    /// writes every path before the pipeline starts. A cancelled scan in the (legacy)
+    /// thumbnail phase is still reported, because builds before that change wrote the
+    /// rows there one at a time — 925 of 50k on 2026-10-26.
     #[test]
     fn an_interrupted_discovery_is_reported_before_a_backlog() {
         let (_dir, db_path) = test_db_path();
@@ -7512,13 +7517,15 @@ mod tests {
             Some((job.id, "thumbnailing".to_string(), 925, 50_000))
         );
 
-        // Writing the last row clears the warning, even if the job never completes.
+        // A pipeline interrupted after the walk wrote the rows is *not* incomplete:
+        // every path is indexed, only the work is missing. This is what lets a paused
+        // `full` resume as a backlog pass instead of re-walking 58k files.
         checkpoint_scan_job(
             &db_path,
             job.id,
             "processing",
             50_000,
-            50_000,
+            925,
             None,
             0,
             0,

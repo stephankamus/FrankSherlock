@@ -148,12 +148,13 @@ pub fn start_or_resume_scan_job(db_path: &Path, root_path: &str) -> AppResult<Sc
     db::create_or_resume_scan_job(db_path, &canonical_root.display().to_string())
 }
 
-/// Run a scan job, reporting the backlog counters as it goes.
+/// Run a scan job, reporting the pipeline counters as it goes.
 ///
-/// Only `ScanMode::Backlog` uses the callback (once when the backlog size is
-/// known, then once per file); the other modes ignore it. It exists so the
-/// sidebar can show thumbnails and classifications separately without writing to
-/// SQLite per file.
+/// Every mode that reaches the producer/consumer pipeline (`Full`, `Backlog`,
+/// `RetryFailed`) calls the callback — once when the work size is known, then once
+/// per file. It exists so the sidebar can show thumbnails and classifications
+/// separately without writing to SQLite per file; `Refresh` and `ClassifyOnly`
+/// never reach the pipeline and ignore it.
 pub fn run_scan_job_with_progress(
     ctx: &ScanContext,
     job_id: i64,
@@ -894,12 +895,16 @@ fn run_scan_job_impl(
             );
         }
 
+        // `processing` (not `backlog`): the sidebar renders this phase as a scan
+        // with a Pause button and an ETA, and `onResumeScan` maps it back to a
+        // backlog pass. Reusing the backlog phase made a full scan look like it had
+        // no progress at all while the pipeline ran.
         let outcome = run_pipeline_blocks(
             ctx,
             &job,
             job_id,
             &rows,
-            "backlog",
+            "processing",
             job.scan_marker,
             Some(&moves),
             cancel_flag,

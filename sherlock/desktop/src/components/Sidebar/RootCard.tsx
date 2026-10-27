@@ -156,17 +156,49 @@ export default function RootCard({ root, isSelected, scan, readOnly, faceProgres
           )}
         </div>
       )}
-      {scan?.status === "running" && (scan.phase === "classifying" || scan.phase === "processing") && (
+      {scan?.status === "running" &&
+        (scan.phase === "classifying" ||
+          scan.phase === "processing" ||
+          scan.phase === "backlog") && (
         <div className="root-card-scan">
           <progress value={progress} max={100} />
-          <span>Classifying {scan.processedFiles}/{scan.totalFiles}</span>
+          <span>
+            {scan.phase === "classifying"
+              ? `Classifying ${scan.processedFiles.toLocaleString()}/${scan.totalFiles.toLocaleString()}`
+              : `${backlogProgress?.mode === "retry_failed" ? "Retrying" : "Processing"} ${scan.processedFiles.toLocaleString()}/${scan.totalFiles.toLocaleString()}`}
+          </span>
           {eta && <span className="root-card-eta">{eta} remaining</span>}
+          {backlogProgress && (
+            <>
+              <div className="root-card-scan-stats">
+                Thumbnails: {backlogProgress.thumbnailed.toLocaleString()} /{" "}
+                {backlogProgress.thumbsTotal.toLocaleString()}
+              </div>
+              <div className="root-card-scan-stats">
+                Classified: {backlogProgress.classified.toLocaleString()} /{" "}
+                {backlogProgress.classifyTotal.toLocaleString()}
+              </div>
+              {backlogProgress.failed > 0 && (
+                <div className="root-card-scan-stats">
+                  Failed: {backlogProgress.failed.toLocaleString()}
+                </div>
+              )}
+            </>
+          )}
           {!readOnly && onCancelScan && (
             <button type="button" className="root-card-scan-btn" onClick={(e) => { e.stopPropagation(); onCancelScan(); }}>Pause</button>
           )}
         </div>
       )}
-      {backlogProgress && (
+      {/* A record without a phase-specific panel (e.g. the root card did not get the
+          job in `activeScans`) still shows the pass counters instead of nothing. */}
+      {backlogProgress &&
+        !(
+          scan?.status === "running" &&
+          (scan.phase === "classifying" ||
+            scan.phase === "processing" ||
+            scan.phase === "backlog")
+        ) && (
         <div className="root-card-scan">
           <progress
             value={

@@ -16,9 +16,16 @@ let classifyStartTime: number | null = null;
 let classifyStartJobId: number | null = null;
 
 export function computeEta(scan: ScanJobStatus): string | null {
-  // Only compute ETA for the classifying phase (LLM is the bottleneck).
-  // Thumbnailing is fast enough that ETA isn't useful.
-  if (scan.phase !== "classifying" && scan.phase !== "processing") return null;
+  // Only compute ETA for the phases where the GPU is the bottleneck: the sequential
+  // classification loop, the pipeline half of a `full`, and a backlog pass (which is
+  // the same pipeline). Thumbnailing is fast enough that ETA isn't useful.
+  if (
+    scan.phase !== "classifying" &&
+    scan.phase !== "processing" &&
+    scan.phase !== "backlog"
+  ) {
+    return null;
+  }
 
   const remaining = scan.totalFiles - scan.processedFiles;
   if (remaining <= 0) return null;

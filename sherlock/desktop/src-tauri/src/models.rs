@@ -646,16 +646,23 @@ pub struct ThumbRepairProgress {
     pub error: Option<String>,
 }
 
-/// Live progress of the backlog pipeline (`ScanMode::Backlog`).
+/// Live progress of the producer/consumer pipeline.
 ///
 /// Kept in memory and polled by the sidebar, like `ThumbRepairProgress`: the scan
 /// job row only carries `processed_files`, and writing two extra counters to
 /// SQLite on every file would add a write per classification.
+///
+/// A `full` scan runs the same pipeline after discovery
+/// (`plans/full-pipeline-cut.md`), so the record is not exclusive to the backlog
+/// tool anymore: `mode` is what lets the sidebar label the panel and keep the
+/// "Process Backlog" button from looking like it started the pass.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BacklogProgress {
     pub job_id: i64,
     pub root_id: i64,
+    /// `full`, `backlog` or `retry_failed`.
+    pub mode: String,
     /// Rows the pass has to work on. `0` while the index is still being read.
     pub total: u64,
     /// Rows consumed (thumbnail fixed and/or classification stored).
