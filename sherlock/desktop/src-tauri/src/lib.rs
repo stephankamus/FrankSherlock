@@ -320,13 +320,41 @@ async fn search_images(
 fn start_scan(
     root_path: String,
     mode: Option<String>,
+    overrides: Option<models::ScanOverrides>,
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<ScanJobStatus, String> {
     let raw_mode = mode.unwrap_or_else(|| "full".to_string());
     let mode = scan::ScanMode::parse(&raw_mode)
         .ok_or_else(|| format!("invalid scan mode '{raw_mode}'"))?;
-    begin_scan(root_path, mode, None, state, app_handle)
+    if let Some(overrides) = overrides.as_ref() {
+        validate_scan_overrides(overrides)?;
+    }
+    begin_scan(root_path, mode, overrides, state, app_handle)
+}
+
+/// Reject a typo before the job exists, so it cannot die on the first file with the
+/// override silently ignored.
+fn validate_scan_overrides(overrides: &models::ScanOverrides) -> Result<(), String> {
+    if let Some(profile) = overrides.prompt_profile.as_deref() {
+        config::PromptProfile::parse(profile)
+            .ok_or_else(|| format!("invalid prompt_profile '{profile}'"))?;
+    }
+    if let Some(engine) = overrides.ocr_engine.as_deref() {
+        config::OcrEngine::parse(engine).ok_or_else(|| format!("invalid ocr_engine '{engine}'"))?;
+    }
+    if let Some(max_side) = overrides.image_max_side {
+        if max_side != 0
+            && !(config::MIN_IMAGE_MAX_SIDE..=config::MAX_IMAGE_MAX_SIDE).contains(&max_side)
+        {
+            return Err(format!(
+                "invalid image_max_side {max_side}: expected 0 or {}..={}",
+                config::MIN_IMAGE_MAX_SIDE,
+                config::MAX_IMAGE_MAX_SIDE
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Retry only the rows the previous attempts gave up on.
@@ -342,15 +370,7 @@ fn retry_failed(
     app_handle: tauri::AppHandle,
 ) -> Result<ScanJobStatus, String> {
     let overrides = overrides.unwrap_or_default();
-    // Validate before creating the job: a typo must not leave a job that dies on
-    // the first file with the settings silently ignored.
-    if let Some(profile) = overrides.prompt_profile.as_deref() {
-        config::PromptProfile::parse(profile)
-            .ok_or_else(|| format!("invalid prompt_profile '{profile}'"))?;
-    }
-    if let Some(engine) = overrides.ocr_engine.as_deref() {
-        config::OcrEngine::parse(engine).ok_or_else(|| format!("invalid ocr_engine '{engine}'"))?;
-    }
+    validate_scan_overrides(&overrides)?;
     begin_scan(
         root_path,
         scan::ScanMode::RetryFailed,

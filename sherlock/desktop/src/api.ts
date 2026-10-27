@@ -59,11 +59,22 @@ export async function searchImages(request: SearchRequest): Promise<SearchRespon
   return invoke<SearchResponse>("search_images", { request });
 }
 
+/**
+ * Start a scan job.
+ *
+ * `overrides` runs this job with another model / resolution without touching
+ * `settings.toml` — it is how the 3b-vs-7b A/B keeps the library settings intact.
+ */
 export async function startScan(
   rootPath: string,
   mode: ScanMode = "full",
+  overrides?: ScanOverrides,
 ): Promise<ScanJobStatus> {
-  return invoke<ScanJobStatus>("start_scan", { rootPath, mode });
+  return invoke<ScanJobStatus>("start_scan", {
+    rootPath,
+    mode,
+    overrides: overrides ?? null,
+  });
 }
 
 /**

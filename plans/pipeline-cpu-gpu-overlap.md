@@ -816,6 +816,36 @@ Ganho esperado: os 58 743 arquivos deixam de pagar um passe mono-thread de thumb
 pipeline. **A medição na pasta de 191 arquivos ainda não foi feita** — é o próximo passo
 antes de rodar nos 58 mil, com `scripts/measure-run.py 900` logo depois do job.
 
+### 5.13 A/B 3b vs 7b: protocolo e ferramenta
+
+O 7b cabe na máquina (4,5 GB de 12 GB em uso com o 3b) e o custo medido é ~2,3×
+(§2: 7,80 s contra 3,45 s por imagem a 1024 px). O que falta é decidir se a diferença
+de descrição paga isso, e para isso o braço B **não** pode passar por `settings.toml`.
+
+- `start_scan` passou a aceitar [`ScanOverrides`](../sherlock/desktop/src-tauri/src/models.rs:439)
+  (`startScan(rootPath, mode, overrides)` no frontend), validado antes de criar o job;
+  é o mesmo caminho que o `retry_failed` já usava.
+- `scripts/dump-descriptions.py` grava um CSV por braço (`rel_path`, `media_type`,
+  `confidence`, `document_hint`, `description`) e imprime os dois lado a lado:
+  `compare arm-a.csv arm-b.csv --only-different`. Sem ele a comparação seria inválida
+  por construção — o segundo braço sobrescreve a descrição do primeiro na mesma linha.
+
+Protocolo, na pasta de 100 arquivos escolhida:
+
+1. `Refresh` na pasta (thumbnails prontos, nada classificado);
+2. braço A: `backlog` com `{ model: "qwen2.5vl:3b" }`, depois
+   `python3 scripts/measure-run.py 900` **e** `dump-descriptions.py dump <pasta> -o arm-a.csv`;
+3. `Reclassify` (checkbox de thumbnails desmarcado) — as linhas voltam a pendentes sem
+   pagar decode;
+4. braço B: `backlog` com `{ model: "qwen2.5vl:7b" }`, mesmo `measure-run.py 900` e
+   `dump arm-b.csv`;
+5. `compare arm-a.csv arm-b.csv --only-different` e registrar em
+   [`_bench_vision/RESULTS.md`](../_bench_vision/RESULTS.md) §10, com wall por arquivo,
+   p95 por requisição, `runner crashes` e o número de descrições que mudaram.
+
+O braço só vale com `runner crashes: 0` e um único `KvSize`; qualquer crash invalida a
+comparação porque a requisição se perdeu (§8).
+
 ## 6. Riscos
 
 | Risco | Mitigação |
