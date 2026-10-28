@@ -2149,12 +2149,19 @@ mod tests {
         assert_eq!(none, 0.0, "a row with no answer must stay pending");
 
         // An enum we do not accept and a description of the wrong length both cost.
-        assert!(derived_confidence(ParseKind::Strict, "something", "a dog on the beach", false) < strict);
+        assert!(
+            derived_confidence(ParseKind::Strict, "something", "a dog on the beach", false)
+                < strict
+        );
         assert!(derived_confidence(ParseKind::Strict, "photo", "dog", false) < strict);
 
         // A second signal helps, and nothing ever reaches certainty.
-        let corroborated =
-            derived_confidence(ParseKind::Strict, "document", "a receipt from the market", true);
+        let corroborated = derived_confidence(
+            ParseKind::Strict,
+            "document",
+            "a receipt from the market",
+            true,
+        );
         assert!(corroborated > strict, "{corroborated} > {strict}");
         assert!(corroborated <= 0.95);
     }
