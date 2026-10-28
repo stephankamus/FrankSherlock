@@ -383,3 +383,42 @@ transcodificação on-the-fly, cache local de thumbs, múltiplos usuários com p
 | Exposição acidental do filesystem | resolver por `id`, canonicalizar, validar prefixo do mount, nunca aceitar path do cliente |
 | Mount esquecido ao adicionar root | `/api/health` lista `unmappedRoots`, banner na UI |
 | Ocultação vazando pelo web | filtro fixo no read layer + `404` em `/api/media`, `/api/thumb`, `/api/face-crop` e `/api/item` |
+
+## 10. Estado da implementação (handoff)
+
+Branch `feat/web-client`, 2026-10-28.
+
+**Feito e commitado**
+
+- Desktop: ocultação de fotos (migration 20), publicação com snapshot/revisões/ponteiro
+  atômico, auto-publicação ao fim da cadeia de scans, seção Publicação nas Settings.
+- `sherlock/core`: crate standalone com `error`, `query_parser`, `exif`, `similarity`,
+  `paths`, `face`, `classify`, `thumbnail`, `models`, `db` e `fs`. O desktop só reexporta.
+- `sherlock/web/server`: axum lendo `current.json`, `MediaMap` com validação de traversal,
+  endpoints de leitura, auth por bearer ou `?token=`, 12 testes de integração.
+
+**Números no momento do handoff**: 241 testes no `core`, 294 no desktop, 28 no servidor
+web; 427 de frontend; `cargo fmt --check` e `cargo clippy -- -D warnings` limpos nos três
+crates.
+
+**Próximo, em ordem**
+
+1. `?w=` no `/api/media` (preview redimensionado, cache em disco) e `ETag` nas thumbs.
+2. Headers de segurança (`nosniff`, `frame-ancestors`) e tratamento de `Range` inválido.
+3. `sherlock/shared` como pacote npm do workspace: types, utils puros, interface
+   `LibraryClient` e `useLibrary()`.
+4. `httpLibraryClient` (web) e `tauriLibraryClient` (desktop, `api.ts` + `convertFileSrc`).
+5. Mover os componentes visuais para `shared` com flags de capability.
+6. `sherlock/web/ui`: Vite + React, layout responsivo, PWA e manifest.
+7. Dockerfile multi-stage, compose, job de CI da imagem e `docs/web-deploy.md`.
+8. Validação ponta a ponta no celular.
+
+**Invariantes que não podem quebrar**
+
+- `include_hidden` nunca é lido do cliente; o servidor monta a requisição com `false`.
+- Endpoints por id respondem `404` para linha oculta — indistinguível de deletada.
+- Nenhuma rota aceita caminho vindo do cliente: resolve por id, passa pelo `MediaMap` e
+  valida cada componente do `rel_path`.
+- `db.rs` existe só no `core`. O desktop nunca deve ganhar uma cópia.
+- Publicar jamais escreve o banco vivo na share: `VACUUM INTO` + revisões versionadas.
+
