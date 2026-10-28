@@ -6,6 +6,11 @@
 //! mirror every target and level), the UI polls a window of the end of that file.
 //! Polling also means the history is there when the modal opens, not only the lines
 //! emitted after it — which is what makes it useful while classifying a folder.
+//!
+//! Rotated files are read too. `tauri_plugin_log` 2.9.1 archives the active file as
+//! `<product>_<date>.log` when it reaches its size limit and keeps three of them, so a
+//! 19 h scan no longer fits in one file — reading only the active one showed the tail of
+//! the run and silently dropped the start of it.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -22,6 +27,15 @@ pub const MAX_LINES_LIMIT: usize = 5_000;
 /// How much of the file tail is read per poll. A scan can log one line per file,
 /// so 512 KiB holds a useful window without reading a 16 MiB file every second.
 const TAIL_BYTES: u64 = 512 * 1024;
+
+/// How much of each **archived** file is read.
+///
+/// Smaller than [`TAIL_BYTES`] on purpose: the archives only have to show what came
+/// before the last rotation, and there can be three of them.
+const ARCHIVE_TAIL_BYTES: u64 = 128 * 1024;
+
+/// How many archived files to include, matching the plugin's `KeepSome(3)`.
+const MAX_ARCHIVES: usize = 3;
 
 /// Snapshot of the newest log file of the application.
 ///
@@ -45,13 +59,64 @@ pub fn read_logs(app: tauri::AppHandle, max_lines: Option<usize>) -> Result<LogS
     let max_lines = max_lines
         .unwrap_or(DEFAULT_MAX_LINES)
         .clamp(1, MAX_LINES_LIMIT);
-    let (text, truncated, size_bytes) = read_tail(&path, TAIL_BYTES)?;
+    // Oldest archive first, then the active file: the modal reads top to bottom. An
+    // archive that vanished between the listing and the read (a rotation in progress) is
+    // skipped instead of failing the whole poll.
+    let mut text = String::new();
+    let mut truncated = false;
+    for archive in archived_files(&path) {
+        if let Ok((chunk, clipped, _)) = read_tail(&archive, ARCHIVE_TAIL_BYTES) {
+            truncated |= clipped;
+            text.push_str(&chunk);
+        }
+    }
+    let (tail, clipped, size_bytes) = read_tail(&path, TAIL_BYTES)?;
+    truncated |= clipped;
+    text.push_str(&tail);
     Ok(LogSnapshot {
         path: Some(path.display().to_string()),
         entries: parse_entries(&text, max_lines),
         truncated,
         size_bytes,
     })
+}
+
+/// Archived files of the active log, oldest first.
+///
+/// The plugin names them `<product>_<date>.log` and keeps the newest three. The name is
+/// not parsed: they are ordered by modification time, which survives a change in the
+/// date format the plugin chooses.
+fn archived_files(active: &Path) -> Vec<PathBuf> {
+    let Some(dir) = active.parent() else {
+        return Vec::new();
+    };
+    let Some(stem) = active.file_stem().and_then(|value| value.to_str()) else {
+        return Vec::new();
+    };
+    let prefix = format!("{stem}_");
+    let mut found: Vec<(SystemTime, PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("log") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        found.push((modified, path));
+    }
+    found.sort();
+    let skip = found.len().saturating_sub(MAX_ARCHIVES);
+    found.into_iter().skip(skip).map(|(_, path)| path).collect()
 }
 
 /// The active file is always the one appended to last (rotation renames the old
@@ -176,6 +241,29 @@ fn parse_line(line: &str) -> Option<LogEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The viewer has to find the rotations without parsing the date format the plugin
+    /// happens to use, and must not pick up another product's log in the same directory.
+    #[test]
+    fn archived_files_are_the_rotations_oldest_first() {
+        let dir = tempfile::tempdir().expect("dir");
+        let active = dir.path().join("app.log");
+        std::fs::write(&active, "active").expect("active");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let older = dir.path().join("app_2026-10-27_10-00-00.log");
+        std::fs::write(&older, "older").expect("older");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let newer = dir.path().join("app_2026-10-28_09-00-00.log");
+        std::fs::write(&newer, "newer").expect("newer");
+        std::fs::write(dir.path().join("other.log"), "other").expect("other");
+        std::fs::write(dir.path().join("app_notes.txt"), "notes").expect("notes");
+
+        assert_eq!(
+            archived_files(&active),
+            vec![older, newer],
+            "oldest first, and only this product's rotations"
+        );
+    }
 
     #[test]
     fn parses_the_plugin_line_format() {

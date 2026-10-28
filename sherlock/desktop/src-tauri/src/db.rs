@@ -997,6 +997,62 @@ pub fn pending_scan_info(
     }))
 }
 
+/// Give rows written before the derived score existed a confidence they can be filtered
+/// by, without a single GPU request.
+///
+/// Job #35 (2026-10-28) measured **22,809 of 36,744** described rows at exactly 0.0: the
+/// old prompt showed `"confidence":0.0` and the model copied it. The score cannot be
+/// recomputed *exactly* — the parse quality of a row written months ago is not stored —
+/// so this uses the conservative [`crate::classify::ParseKind::Salvaged`] base, the lowest
+/// honest number for a row that did produce a description. New rows get the real value
+/// from [`crate::classify::derived_confidence`].
+///
+/// Idempotent by construction: it only touches rows with `confidence = 0` **and** a
+/// description, so the second run finds nothing to do.
+pub fn backfill_derived_confidence(db_path: &Path) -> AppResult<u64> {
+    let conn = open_conn(db_path)?;
+    let rows: Vec<(i64, String, String, bool)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, media_type, description,
+                    (document_hint NOT IN ('', 'none') OR trim(extracted_text) <> '')
+               FROM files
+              WHERE deleted_at IS NULL
+                AND confidence = 0
+                AND description IS NOT NULL AND description <> ''",
+        )?;
+        let mapped = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)? != 0,
+            ))
+        })?;
+        mapped.collect::<Result<Vec<_>, _>>()?
+    };
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    conn.execute_batch("BEGIN")?;
+    let mut updated = 0u64;
+    for (id, media_type, description, corroborated) in &rows {
+        let score = crate::classify::derived_confidence(
+            crate::classify::ParseKind::Salvaged,
+            media_type,
+            description,
+            *corroborated,
+        );
+        conn.execute(
+            "UPDATE files SET confidence = ?2 WHERE id = ?1",
+            params![id, score as f64],
+        )?;
+        updated += 1;
+    }
+    conn.execute_batch("COMMIT")?;
+    Ok(updated)
+}
+
 pub fn complete_scan_job_by_id(
     db_path: &Path,
     job_id: i64,
@@ -6020,6 +6076,59 @@ mod tests {
         let again = migrate_thumbnail_layout(&db_path, thumbs.path()).expect("again");
         assert!(again.already_done);
         assert_eq!(again.moved, 0);
+    }
+
+    /// Rows written while the prompt still asked for a `confidence` carry 0.0. The repair
+    /// has to score the described ones — scoring higher when a second signal corroborates
+    /// — and be idempotent, because it runs at every start.
+    #[test]
+    fn backfill_scores_the_zero_confidence_rows_that_have_a_description() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/backfill").expect("root");
+
+        let plain =
+            upsert_file_record(&db_path, &sample_record(root_id, "a.jpg", "fp1")).expect("a");
+        update_file_classification(
+            &db_path, plain, "photo", "a dog on the beach", "", "", 0.0, "en", "none", "en",
+        )
+        .expect("classify a");
+        let doc = upsert_file_record(&db_path, &sample_record(root_id, "b.jpg", "fp2")).expect("b");
+        update_file_classification(
+            &db_path,
+            doc,
+            "document",
+            "a receipt from the market",
+            "TOTAL 42.00",
+            "",
+            0.0,
+            "en",
+            "receipt",
+            "en",
+        )
+        .expect("classify b");
+
+        assert_eq!(backfill_derived_confidence(&db_path).expect("backfill"), 2);
+        assert_eq!(
+            backfill_derived_confidence(&db_path).expect("again"),
+            0,
+            "nothing left with confidence 0 and a description"
+        );
+
+        let score = |id: i64| -> f64 {
+            let conn = open_conn(&db_path).expect("conn");
+            conn.query_row("SELECT confidence FROM files WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .expect("row")
+        };
+        assert!(score(plain) > 0.0, "a described row must stop reading as zero");
+        assert!(
+            score(doc) > score(plain),
+            "the document with OCR text corroborates higher: {} vs {}",
+            score(doc),
+            score(plain)
+        );
     }
 
     /// The resolution floor is a filter, not a state.

@@ -210,6 +210,19 @@ fn ensure_database(state: State<'_, AppState>) -> Result<models::DbStats, String
         db::database_stats(&state.paths.db_file).map_err(|e| e.to_string())?
     } else {
         db::init_database(&state.paths.db_file)
+            .and_then(|_| {
+                // One-shot repair, no GPU involved: rows written while the prompt still
+                // asked the model for a `confidence` mostly carry 0.0, so `min_confidence`
+                // filters and the search ordering were reading noise (22,809 rows in job
+                // #35). Idempotent — the second start finds nothing to do.
+                db::backfill_derived_confidence(&state.paths.db_file).map(|updated| {
+                    if updated > 0 {
+                        log::info!(
+                            "Backfilled a derived confidence for {updated} row(s) that had 0.0"
+                        );
+                    }
+                })
+            })
             .and_then(|_| db::database_stats(&state.paths.db_file))
             .map_err(|e| e.to_string())?
     };

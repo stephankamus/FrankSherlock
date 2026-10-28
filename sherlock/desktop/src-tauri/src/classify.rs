@@ -43,8 +43,7 @@ const PRIMARY_PROMPT_CONCISE: &str = concat!(
     r#"{"media_type":"screenshot|anime|manga|photo|document|artwork|other","#,
     r#""contains_text":true,"#,
     r#""document_photo":"none|receipt|invoice|statement|other","#,
-    r#""description":"max 12 words","#,
-    r#""confidence":0.0}"#,
+    r#""description":"max 12 words"}"#,
     " Rules: ",
     "1) contains_text=true only when text is clearly visible (UI, receipt, scan, subtitles). ",
     "2) document_photo=receipt|invoice|statement|other only when the picture IS that document; a scene showing signs, logos or prices is \"none\". ",
@@ -68,8 +67,7 @@ const PRIMARY_PROMPT_CONCISE_PT: &str = concat!(
     r#"{"media_type":"screenshot|anime|manga|photo|document|artwork|other","#,
     r#""contains_text":true,"#,
     r#""document_photo":"none|receipt|invoice|statement|other","#,
-    r#""description":"no máximo 12 palavras","#,
-    r#""confidence":0.0}"#,
+    r#""description":"no máximo 12 palavras"}"#,
     " Regras: ",
     "1) contains_text=true apenas quando houver texto claramente visível (interface, recibo, digitalização, legendas). ",
     "2) document_photo=receipt|invoice|statement|other apenas quando a imagem FOR esse documento; uma cena com placas, logotipos ou preços é \"none\". ",
@@ -635,7 +633,59 @@ pub fn primary_ctx_for(
 /// The value alone cannot tell a good classification from a default object built
 /// after four failures, and the reason is exactly what a retry has to be aimed at —
 /// so the first pass reports it instead of only logging it.
-type PrimaryOutcome = (Value, Option<&'static str>);
+type PrimaryOutcome = (Value, Option<&'static str>, ParseKind);
+
+/// How the first pass arrived at its answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseKind {
+    /// Valid JSON with a `media_type` on the first attempt.
+    Strict,
+    /// Recovered from the body text by [`salvage_primary_from_raw`].
+    Salvaged,
+    /// Nothing usable came back; the value is the safe default object.
+    Default,
+}
+
+/// A confidence number the **pipeline** can justify.
+///
+/// The model's own `confidence` field was removed from the primary schema after job #35
+/// (2026-10-28) measured **22,809 of 36,744** described rows at exactly 0.0: the schema
+/// showed `"confidence":0.0` and the model copied that literal at temperature 0. A number
+/// the model supplies cannot measure the model's own certainty, so the score is derived
+/// from evidence that exists outside the answer:
+///
+/// - how the answer was obtained (strict JSON > salvage);
+/// - whether `media_type` came back as one of the values we accept;
+/// - whether the description has a usable length;
+/// - whether a second signal corroborated it (OCR text, or a confirmed document kind).
+///
+/// `Default` returns exactly 0.0, which is what keeps [`is_empty_result`] honest: a row
+/// with no description must stay pending, not be stored with a small score.
+///
+/// The ceiling is 0.95 on purpose — nothing the model says is certain enough for 1.0.
+pub fn derived_confidence(
+    parse: ParseKind,
+    media_type: &str,
+    description: &str,
+    corroborated: bool,
+) -> f32 {
+    let mut score: f32 = match parse {
+        ParseKind::Strict => 0.80,
+        ParseKind::Salvaged => 0.55,
+        ParseKind::Default => return 0.0,
+    };
+    if media_type == "other" || !VALID_MEDIA_TYPES.contains(&media_type) {
+        score -= 0.15;
+    }
+    let words = description.split_whitespace().count();
+    if !(3..=24).contains(&words) {
+        score -= 0.10;
+    }
+    if corroborated {
+        score += 0.10;
+    }
+    score.clamp(0.05, 0.95)
+}
 
 /// Why a request produced nothing, as a short taxonomy.
 ///
@@ -691,7 +741,7 @@ fn classify_primary(
     if resp1.ok {
         if let Some(v) = parse_json_response(&resp1.raw) {
             if v.get("media_type").and_then(|v| v.as_str()).is_some() {
-                return (v, None);
+                return (v, None, ParseKind::Strict);
             }
         }
         // A 200 with an unusable body is a different failure from a 500, and it was
@@ -728,7 +778,7 @@ fn classify_primary(
     if resp2.ok {
         if let Some(v) = parse_json_response(&resp2.raw) {
             if v.get("media_type").and_then(|v| v.as_str()).is_some() {
-                return (v, None);
+                return (v, None, ParseKind::Strict);
             }
         }
         log::warn!(
@@ -766,7 +816,7 @@ fn classify_primary(
                     "primary recovered on the third attempt for {}",
                     prepared.path.display()
                 );
-                return (v, None);
+                return (v, None, ParseKind::Strict);
             }
         }
         log::warn!(
@@ -829,7 +879,7 @@ fn classify_primary(
                             "primary recovered from the original file for {}",
                             prepared.source.display()
                         );
-                        return (v, None);
+                        return (v, None, ParseKind::Strict);
                     }
                 }
                 log::warn!(
@@ -851,7 +901,7 @@ fn classify_primary(
 
     let combined = format!("{}\n{}\n{}\n{}", resp1.raw, resp2.raw, resp3.raw, resp4_raw);
     if let Some(v) = salvage_primary_from_raw(&combined) {
-        return (v, None);
+        return (v, None, ParseKind::Salvaged);
     }
     // Nothing worked: keep the exact image we sent (it is deleted by `Drop`, and
     // without it there is no way to reproduce the failure outside the app).
@@ -893,6 +943,7 @@ fn classify_primary(
             "confidence": 0.0,
         }),
         Some(failure_kind_from(&combined)),
+        ParseKind::Default,
     )
 }
 
@@ -1324,7 +1375,7 @@ pub fn classify_image_prepared(
 
     // `library_kind = anime` asks for series and characters in the *first* pass; see
     // [`effective_profile`].
-    let (primary, primary_failure) = classify_primary(
+    let (primary, primary_failure, parse_kind) = classify_primary(
         model,
         prepared,
         effective_profile(&vision),
@@ -1341,10 +1392,6 @@ pub fn classify_image_prepared(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let confidence = primary
-        .get("confidence")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0) as f32;
     // `none` is the model saying "this is a scene". A document or a screenshot without
     // the field (old prompt, salvaged body) still belongs to the bucket, so it reads
     // `other` instead of `none`.
@@ -1435,6 +1482,17 @@ pub fn classify_image_prepared(
 
     let lang_hint = detect_lang_hint(&extracted_text);
 
+    // Derived from evidence, never from the model's own number: see
+    // [`derived_confidence`]. `corroborated` means a second signal exists on the row — OCR
+    // text, or a document kind the regex confirmed — which is what separates "the model
+    // said something plausible" from "the pipeline can point at why".
+    let confidence = derived_confidence(
+        parse_kind,
+        &media_type,
+        &full_description,
+        !extracted_text.trim().is_empty() || !matches!(document_hint.as_str(), "none" | ""),
+    );
+
     ClassificationResult {
         media_type,
         description: full_description,
@@ -1461,8 +1519,7 @@ const VIDEO_PROMPT: &str = concat!(
     r#""description":"short factual description","#,
     r#""title_guess":"string or null","#,
     r#""series_candidates":["name"],"#,
-    r#""character_candidates":["name"],"#,
-    r#""confidence":0.0}"#,
+    r#""character_candidates":["name"]}"#,
     " Rules: ",
     "1) Use null-like empty arrays when unknown. ",
     "2) video_category: movie=feature film, tv_episode=TV show episode, personal=home video/vlog, ",
@@ -1485,8 +1542,7 @@ const VIDEO_PROMPT_PT: &str = concat!(
     r#""description":"descrição curta e factual","#,
     r#""title_guess":"título original ou null","#,
     r#""series_candidates":["nome"],"#,
-    r#""character_candidates":["nome"],"#,
-    r#""confidence":0.0}"#,
+    r#""character_candidates":["nome"]}"#,
     " Regras: ",
     "1) Use arrays vazios quando não souber. ",
     "2) video_category: movie=filme, tv_episode=episódio de série, personal=filme caseiro/vlog, ",
@@ -2079,6 +2135,30 @@ mod tests {
 
     /// The taxonomy is what a retry is aimed at, so it has to be recognised from the
     /// answer Ollama actually gives — that is all the reason we get.
+    /// The score has to separate evidence from guessing, and a row with no answer has to
+    /// stay at 0.0 so `is_empty_result` keeps it pending.
+    #[test]
+    fn derived_confidence_separates_evidence_from_guessing() {
+        let strict = derived_confidence(ParseKind::Strict, "photo", "a dog on the beach", false);
+        let salvaged =
+            derived_confidence(ParseKind::Salvaged, "photo", "a dog on the beach", false);
+        let none = derived_confidence(ParseKind::Default, "other", "", false);
+
+        assert!(strict > salvaged, "{strict} > {salvaged}");
+        assert!(salvaged > none, "{salvaged} > {none}");
+        assert_eq!(none, 0.0, "a row with no answer must stay pending");
+
+        // An enum we do not accept and a description of the wrong length both cost.
+        assert!(derived_confidence(ParseKind::Strict, "something", "a dog on the beach", false) < strict);
+        assert!(derived_confidence(ParseKind::Strict, "photo", "dog", false) < strict);
+
+        // A second signal helps, and nothing ever reaches certainty.
+        let corroborated =
+            derived_confidence(ParseKind::Strict, "document", "a receipt from the market", true);
+        assert!(corroborated > strict, "{corroborated} > {strict}");
+        assert!(corroborated <= 0.95);
+    }
+
     #[test]
     fn failure_kinds_come_from_the_answer_ollama_gave() {
         assert_eq!(
