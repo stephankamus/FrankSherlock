@@ -1,5 +1,7 @@
 import { useEffect } from "react";
-import type { SortField, SortOrder } from "../../types";
+
+import type { SortField, SortOrder } from "../types";
+import "./library.css";
 
 type Props = {
   query: string;

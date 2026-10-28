@@ -1,12 +1,16 @@
-import { convertFileSrc } from "@tauri-apps/api/core";
-import type { DuplicatesResponse, DuplicateFile, DuplicateGroup } from "../../types";
-import { fileName } from "../../utils/format";
-import { formatBytes } from "../../utils/format";
-import "./shared-tool-view.css";
-import "./DuplicatesView.css";
+import type { DuplicatesResponse, DuplicateFile, DuplicateGroup } from "../types";
+import { useLibrary } from "../useLibrary";
+import { fileName, formatBytes } from "../utils/format";
+import "./tools.css";
+import "./duplicates.css";
 
-type Props = {
-  data: DuplicatesResponse;
+/**
+ * The group type is a parameter so the desktop can keep its `absPath`/`rootPath`
+ * required: the handlers it passes (preview, delete) need those fields, and the web
+ * version simply uses the base shape.
+ */
+type Props<TGroup extends DuplicateGroup = DuplicateGroup> = {
+  data: Omit<DuplicatesResponse, "groups"> & { groups: TGroup[] };
   loading: boolean;
   selected: Set<number>;
   nearEnabled: boolean;
@@ -18,8 +22,8 @@ type Props = {
   onDeselectAll: () => void;
   onDeleteSelected: () => void;
   onBack: () => void;
-  onSelectGroupDuplicates: (group: DuplicateGroup) => void;
-  onPreviewGroup: (group: DuplicateGroup) => void;
+  onSelectGroupDuplicates: (group: TGroup) => void;
+  onPreviewGroup: (group: TGroup) => void;
 };
 
 function formatDate(mtimeNs: number): string {
@@ -27,12 +31,21 @@ function formatDate(mtimeNs: number): string {
   return new Date(ms).toLocaleDateString();
 }
 
-export default function DuplicatesView({
+/**
+ * Duplicate groups, read-only on the web.
+ *
+ * The view is informative there: it shows the group and opens a preview, but the
+ * selection checkboxes and the delete button only exist when the deployment can
+ * write, which is what keeps the web from offering an action the server would refuse.
+ */
+export default function DuplicatesView<TGroup extends DuplicateGroup = DuplicateGroup>({
   data, loading, selected,
   nearEnabled, nearThreshold, onNearEnabledChange, onNearThresholdChange,
   onToggleFile, onSelectAllDuplicates, onDeselectAll, onDeleteSelected,
   onBack, onSelectGroupDuplicates, onPreviewGroup,
-}: Props) {
+}: Props<TGroup>) {
+  const canWrite = useLibrary().capabilities.write;
+
   return (
     <div className="tool-view">
       <div className="tool-toolbar">
@@ -61,21 +74,25 @@ export default function DuplicatesView({
             <span className="near-threshold-label">{Math.round(nearThreshold * 100)}%</span>
           </div>
         )}
-        {selected.size > 0 ? (
-          <button type="button" onClick={onDeselectAll}>Deselect all</button>
-        ) : (
-          <button type="button" onClick={onSelectAllDuplicates} disabled={data.totalDuplicateFiles === 0}>
-            Select all duplicates
+        {canWrite && (
+          selected.size > 0 ? (
+            <button type="button" onClick={onDeselectAll}>Deselect all</button>
+          ) : (
+            <button type="button" onClick={onSelectAllDuplicates} disabled={data.totalDuplicateFiles === 0}>
+              Select all duplicates
+            </button>
+          )
+        )}
+        {canWrite && (
+          <button
+            type="button"
+            className="danger-btn"
+            disabled={selected.size === 0}
+            onClick={onDeleteSelected}
+          >
+            Delete selected ({selected.size})
           </button>
         )}
-        <button
-          type="button"
-          className="danger-btn"
-          disabled={selected.size === 0}
-          onClick={onDeleteSelected}
-        >
-          Delete selected ({selected.size})
-        </button>
         <button type="button" onClick={onBack}>Back</button>
       </div>
 
@@ -89,6 +106,7 @@ export default function DuplicatesView({
             key={group.fingerprint}
             group={group}
             selected={selected}
+            canWrite={canWrite}
             onToggleFile={onToggleFile}
             onSelectGroupDuplicates={onSelectGroupDuplicates}
             onPreviewGroup={onPreviewGroup}
@@ -107,14 +125,15 @@ function confidenceTier(group: DuplicateGroup): "safe" | "likely" | "uncertain" 
 
 const tierLabel = { safe: "EXACT", likely: "NEAR", uncertain: "NEAR" } as const;
 
-function GroupCard({
-  group, selected, onToggleFile, onSelectGroupDuplicates, onPreviewGroup,
+function GroupCard<TGroup extends DuplicateGroup>({
+  group, selected, canWrite, onToggleFile, onSelectGroupDuplicates, onPreviewGroup,
 }: {
-  group: DuplicateGroup;
+  group: TGroup;
   selected: Set<number>;
+  canWrite: boolean;
   onToggleFile: (fileId: number) => void;
-  onSelectGroupDuplicates: (group: DuplicateGroup) => void;
-  onPreviewGroup: (group: DuplicateGroup) => void;
+  onSelectGroupDuplicates: (group: TGroup) => void;
+  onPreviewGroup: (group: TGroup) => void;
 }) {
   const tier = confidenceTier(group);
   return (
@@ -134,15 +153,18 @@ function GroupCard({
         <button type="button" onClick={() => onPreviewGroup(group)}>
           Compare
         </button>
-        <button type="button" onClick={() => onSelectGroupDuplicates(group)}>
-          Select duplicates
-        </button>
+        {canWrite && (
+          <button type="button" onClick={() => onSelectGroupDuplicates(group)}>
+            Select duplicates
+          </button>
+        )}
       </div>
       {group.files.map((file) => (
         <FileRow
           key={file.id}
           file={file}
           isSelected={selected.has(file.id)}
+          canWrite={canWrite}
           onToggle={() => onToggleFile(file.id)}
           onPreview={() => onPreviewGroup(group)}
         />
@@ -152,28 +174,34 @@ function GroupCard({
 }
 
 function FileRow({
-  file, isSelected, onToggle, onPreview,
+  file, isSelected, canWrite, onToggle, onPreview,
 }: {
   file: DuplicateFile;
   isSelected: boolean;
+  canWrite: boolean;
   onToggle: () => void;
   onPreview: () => void;
 }) {
-  const thumb = file.thumbnailPath ? convertFileSrc(file.thumbnailPath) : null;
+  const library = useLibrary();
+  const thumb = library.thumbUrl(file);
+  // The web path has no stored root path, only the published root name/count.
+  const rootLabel = file.rootName ?? file.rootPath ?? "";
 
   return (
     <div
       className={`dup-file-row${isSelected ? " dup-file-row-selected" : ""}`}
       onClick={onPreview}
     >
-      <input
-        type="checkbox"
-        className="dup-file-checkbox"
-        checked={isSelected}
-        onChange={onToggle}
-        onClick={(e) => e.stopPropagation()}
-        aria-label={`Select ${fileName(file.relPath)}`}
-      />
+      {canWrite && (
+        <input
+          type="checkbox"
+          className="dup-file-checkbox"
+          checked={isSelected}
+          onChange={onToggle}
+          onClick={(e) => e.stopPropagation()}
+          aria-label={`Select ${fileName(file.relPath)}`}
+        />
+      )}
       <div className="dup-file-thumb">
         {thumb ? (
           <img src={thumb} alt={fileName(file.relPath)} loading="lazy" />
@@ -182,9 +210,9 @@ function FileRow({
         )}
       </div>
       <div className="dup-file-info">
-        <div className="dup-file-path" title={file.absPath}>{file.relPath}</div>
+        <div className="dup-file-path" title={file.relPath}>{file.relPath}</div>
         <div className="dup-file-meta">
-          <span>{file.rootPath}</span>
+          {rootLabel && <span>{rootLabel}</span>}
           <span>{formatBytes(file.sizeBytes)}</span>
           <span>{formatDate(file.mtimeNs)}</span>
           {file.groupType === "near" && file.similarityScore != null && !file.isKeeper && (

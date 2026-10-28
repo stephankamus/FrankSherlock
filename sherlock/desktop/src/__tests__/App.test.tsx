@@ -1,8 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { LibraryProvider } from "@frank-sherlock/shared";
 import App from "../App";
 import * as api from "../api";
+import { tauriLibraryClient } from "../tauriLibraryClient";
 import { mockRoot } from "./fixtures";
 import type {
   Album,
@@ -265,16 +267,25 @@ vi.mock("../components/Content/FacesView", () => ({
   default: () => <div>Mock Faces View</div>,
 }));
 
-vi.mock("../components/Content/DuplicatesView", () => ({
-  default: () => <div>Mock Duplicates View</div>,
-}));
+vi.mock("@frank-sherlock/shared", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@frank-sherlock/shared")>();
+  return {
+    ...actual,
+    DuplicatesView: () => <div>Mock Duplicates View</div>,
+  };
+});
 
 vi.mock("../components/Content/PdfPasswordsView", () => ({
   default: () => <div>Mock PDF Passwords View</div>,
 }));
 
 function renderApp() {
-  return render(<App />);
+  // The real app mounts this provider in `main.tsx`; tests render `<App />` directly.
+  return render(
+    <LibraryProvider client={tauriLibraryClient}>
+      <App />
+    </LibraryProvider>,
+  );
 }
 
 beforeEach(() => {

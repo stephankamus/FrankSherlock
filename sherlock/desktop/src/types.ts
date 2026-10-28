@@ -1,27 +1,47 @@
-export type SearchItem = {
-  id: number;
-  rootId: number;
-  relPath: string;
-  absPath: string;
-  mediaType: string;
-  description: string;
-  confidence: number;
-  mtimeNs: number;
-  sizeBytes: number;
-  thumbnailPath?: string | null;
-  faceCount?: number;
-  /**
-   * Unix seconds when the user hid this photo, `null`/absent when visible.
-   *
-   * Only present while the "show hidden" filter is on: the grid needs it to badge
-   * the tile and to decide whether the eye button hides or unhides.
-   */
-  hiddenAt?: number | null;
-  /** "heic" | "nef" when this row is a JPEG copy made by the conversion job. */
-  sourceFormat?: string | null;
-  /** Original file that produced the copy, relative to the root. */
-  sourceRelPath?: string | null;
-};
+import type {
+  Album as SharedAlbum,
+  BacklogProgress as SharedBacklogProgress,
+  ClusterResult as SharedClusterResult,
+  DbStats as SharedDbStats,
+  DuplicateFile as SharedDuplicateFile,
+  DuplicateGroup as SharedDuplicateGroup,
+  DuplicatesResponse as SharedDuplicatesResponse,
+  FaceDetectProgress as SharedFaceDetectProgress,
+  FaceInfo as SharedFaceInfo,
+  ParsedQuery as SharedParsedQuery,
+  PersonInfo as SharedPersonInfo,
+  ReclusterProgress as SharedReclusterProgress,
+  RootInfo as SharedRootInfo,
+  ScanJobStatus as SharedScanJobStatus,
+  SearchItem as SharedSearchItem,
+  SearchResponse as SharedSearchResponse,
+  SmartFolder as SharedSmartFolder,
+  SubdirEntry as SharedSubdirEntry,
+  SortField as SharedSortField,
+  SortOrder as SharedSortOrder,
+  ThumbRepairProgress as SharedThumbRepairProgress,
+  UpdateInfo as SharedUpdateInfo,
+} from "@frank-sherlock/shared";
+
+/**
+ * The read-side row shapes both clients share live in `@frank-sherlock/shared`.
+ * This file adds only what is specific to the desktop: the absolute path Tauri
+ * needs, and the shapes of the write-side commands the web never calls.
+ */
+export type { SearchRequest } from "@frank-sherlock/shared";
+
+export type SortField = SharedSortField;
+export type SortOrder = SharedSortOrder;
+export type ParsedQuery = SharedParsedQuery;
+
+/**
+ * A search hit as the desktop receives it.
+ *
+ * `absPath` is required here: every row the backend returns has one, and the grid
+ * uses it to open the original file through `convertFileSrc`.
+ */
+export type SearchItem = SharedSearchItem & { absPath: string };
+export type SearchResponse = SharedSearchResponse<SearchItem>;
 
 /** One directory that has convertible files, as reported before a job starts. */
 export type RawDirCount = {
@@ -95,42 +115,6 @@ export type RawConversion = {
   createdAt: number;
 };
 
-export type ParsedQuery = {
-  rawQuery: string;
-  queryText: string;
-  mediaTypes: string[];
-  dateFrom?: string | null;
-  dateTo?: string | null;
-  minConfidence?: number | null;
-  parserConfidence: number;
-  albumName?: string | null;
-};
-
-export type SearchResponse = {
-  total: number;
-  limit: number;
-  offset: number;
-  items: SearchItem[];
-  parsedQuery: ParsedQuery;
-};
-
-export type SortField = "relevance" | "dateModified" | "name" | "type";
-export type SortOrder = "asc" | "desc";
-
-export type SearchRequest = {
-  query: string;
-  limit?: number;
-  offset?: number;
-  rootScope?: number[];
-  mediaTypes?: string[];
-  minConfidence?: number;
-  dateFrom?: string;
-  dateTo?: string;
-  sortBy?: SortField;
-  sortOrder?: SortOrder;
-  /** Desktop-only "show hidden" filter. The web client never sets this. */
-  includeHidden?: boolean;
-};
 
 /** Progress of the network publish, polled while it runs. */
 export type PublishProgress = {
@@ -158,39 +142,8 @@ export type PublishReport = {
   elapsedMs: number;
 };
 
-export type ScanJobStatus = {
-  id: number;
-  rootId: number;
-  rootPath: string;
-  status: "pending" | "running" | "interrupted" | "completed" | "failed";
-  scanMarker: number;
-  totalFiles: number;
-  processedFiles: number;
-  progressPct: number;
-  added: number;
-  modified: number;
-  moved: number;
-  unchanged: number;
-  deleted: number;
-  cursorRelPath?: string | null;
-  errorText?: string | null;
-  updatedAt: number;
-  startedAt: number;
-  completedAt?: number | null;
-  phase: "discovering" | "thumbnailing" | "classifying" | "processing" | "cleanup" | "backlog";
-  discoveredFiles: number;
-};
-
-export type DbStats = {
-  roots: number;
-  files: number;
-  dbSizeBytes: number;
-  /** Bytes that actually hold rows. Drops after deletes, unlike dbSizeBytes. */
-  dbLogicalBytes?: number;
-  /** Bytes sitting in the SQLite freelist, reclaimable with VACUUM. */
-  dbFreeBytes?: number;
-  thumbsSizeBytes: number;
-};
+export type ScanJobStatus = SharedScanJobStatus;
+export type DbStats = SharedDbStats;
 
 export type CompactResult = {
   beforeBytes: number;
@@ -266,17 +219,12 @@ export type PurgeResult = {
   thumbsCleaned: number;
 };
 
-export type RootInfo = {
-  id: number;
-  rootPath: string;
+/** The desktop's console row: the shared read shape plus the pipeline fields. */
+export type RootInfo = SharedRootInfo & {
   rootName: string;
+  rootPath: string;
   createdAt: number;
   lastScanAt: number | null;
-  fileCount: number;
-  /** Roots are never deleted automatically when unreachable; they are flagged. */
-  availability?: "online" | "offline" | "unknown";
-  lastSeenAt?: number | null;
-  lastError?: string | null;
 };
 
 export type DeleteFilesResult = {
@@ -336,19 +284,8 @@ export type FileProperties = {
   audioCodec?: string | null;
 };
 
-export type Album = {
-  id: number;
-  name: string;
-  createdAt: number;
-  fileCount: number;
-};
-
-export type SmartFolder = {
-  id: number;
-  name: string;
-  query: string;
-  createdAt: number;
-};
+export type Album = SharedAlbum;
+export type SmartFolder = SharedSmartFolder;
 
 export type PdfPassword = {
   id: number;
@@ -371,64 +308,24 @@ export type RetryProtectedPdfsResult = {
   stillProtected: number;
 };
 
-export type SubdirEntry = {
-  relPath: string;
-  name: string;
-  fileCount: number;
-};
+export type SubdirEntry = SharedSubdirEntry;
 
-export type UpdateInfo = {
-  version: string;
-  body: string | null;
-};
+export type UpdateInfo = SharedUpdateInfo;
 
-export type DuplicateFile = {
-  id: number;
-  rootId: number;
-  relPath: string;
-  absPath: string;
-  rootPath: string;
-  mediaType: string;
-  description: string;
-  confidence: number;
-  mtimeNs: number;
-  sizeBytes: number;
-  thumbnailPath?: string | null;
-  isKeeper: boolean;
-  similarityScore?: number | null;
-  groupType: string;
-};
-
-export type DuplicateGroup = {
-  fingerprint: string;
-  fileCount: number;
-  totalSizeBytes: number;
-  wastedBytes: number;
-  files: DuplicateFile[];
-  groupType: string;
-  avgSimilarity?: number | null;
-};
-
-export type DuplicatesResponse = {
-  totalGroups: number;
-  totalDuplicateFiles: number;
-  totalWastedBytes: number;
+/**
+ * Duplicates as the desktop receives them: the scanned file's absolute path is
+ * required, because the view opens the original and offers the local actions.
+ * The web version replaces it with `thumbUrl`/`mediaUrl`.
+ */
+export type DuplicateFile = SharedDuplicateFile & { absPath: string; rootPath: string };
+export type DuplicateGroup = Omit<SharedDuplicateGroup, "files"> & { files: DuplicateFile[] };
+export type DuplicatesResponse = Omit<SharedDuplicatesResponse, "groups"> & {
   groups: DuplicateGroup[];
 };
 
 // ── Thumbnail repair ────────────────────────────────────────────────
 
-export type ThumbRepairProgress = {
-  rootId?: number | null;
-  total: number;
-  processed: number;
-  repaired: number;
-  failed: number;
-  /** Unix seconds when the run started (used for rate and ETA). */
-  startedAt: number;
-  phase: "scanning" | "repairing" | "done" | "cancelled" | "failed";
-  error: string | null;
-};
+export type ThumbRepairProgress = SharedThumbRepairProgress;
 
 /**
  * Progress of the "convert existing descriptions" pass.
@@ -458,72 +355,19 @@ export type DescriptionLanguageProgress = {
  * anymore. The two numbers the user cares about are independent: a row can need a
  * thumbnail, a classification, or both.
  */
-export type BacklogProgress = {
-  jobId: number;
-  rootId: number;
-  /** `full`, `backlog` or `retry_failed` — the label of the pass. */
-  mode?: "full" | "backlog" | "retry_failed";
-  /** Rows the pass has to work on; 0 while the index is still being read. */
-  total: number;
-  /** Rows consumed (thumbnail fixed and/or classification stored). */
-  processed: number;
-  thumbnailed: number;
-  /** Rows that actually need a thumbnail — not the same as `total`. */
-  thumbsTotal: number;
-  classified: number;
-  /** Rows that actually need a classification. */
-  classifyTotal: number;
-  deduped: number;
-  /** Faces written by the producer; 0 unless `faceDetection` was on. */
-  faces: number;
-  /** Rows of this pass that needed face detection. */
-  facesTotal: number;
-  failed: number;
-  startedAt: number;
-  phase: "counting" | "running" | "done" | "cancelled" | "failed";
-  error: string | null;
-};
+export type BacklogProgress = SharedBacklogProgress;
 
 // ── Face detection ──────────────────────────────────────────────────
 
-export type FaceDetectProgress = {
-  rootId: number;
-  total: number;
-  processed: number;
-  facesFound: number;
-  phase: "downloading" | "loading" | "detecting" | "failed";
-  error: string | null;
-};
+export type FaceDetectProgress = SharedFaceDetectProgress;
 
-export type PersonInfo = {
-  id: number;
-  name: string;
-  faceCount: number;
-  cropPath?: string | null;
-  thumbnailPath?: string | null;
-};
+export type PersonInfo = SharedPersonInfo;
 
-export type ClusterResult = {
-  newPersons: number;
-  assignedFaces: number;
-};
+export type ClusterResult = SharedClusterResult;
 
-export type FaceInfo = {
-  id: number;
-  personId: number | null;
-  fileId: number;
-  relPath: string;
-  filename: string;
-  confidence: number;
-  cropPath?: string | null;
-};
+export type FaceInfo = SharedFaceInfo;
 
-export type ReclusterProgress = {
-  phase: "crops" | "clustering" | "done";
-  total: number;
-  processed: number;
-  result: ClusterResult | null;
-};
+export type ReclusterProgress = SharedReclusterProgress;
 
 /* ── Vision configuration ───────────────────────────────────────── */
 

@@ -2,6 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
+  DuplicatesView,
+  HelpModal,
+  PreviewModal,
+  ToastContainer,
+  type SearchItem as SharedSearchItem,
+} from "@frank-sherlock/shared";
+import {
   cancelScan, compactDatabase, copyFilesToClipboard, deleteFiles, ensureDatabase,
   getCliFolderPath, getFailedClassifications, getFileMetadata, getFileProperties,
   getHiddenFileCount, getVisionSettings, listRoots,
@@ -27,24 +34,21 @@ import { fileName, formatBytes } from "./utils/format";
 import Titlebar from "./components/Titlebar/Titlebar";
 import Sidebar from "./components/Sidebar/Sidebar";
 import Content from "./components/Content/Content";
-import DuplicatesView from "./components/Content/DuplicatesView";
 import FacesView from "./components/Content/FacesView";
+import PdfViewer from "./components/Content/PdfViewer";
 import PdfPasswordsView from "./components/Content/PdfPasswordsView";
 import ContextMenu from "./components/Content/ContextMenu";
 import StatusBar from "./components/StatusBar/StatusBar";
-import ToastContainer from "./components/Toasts/ToastContainer";
 import SetupModal from "./components/modals/SetupModal";
 import ResumeModal from "./components/modals/ResumeModal";
 import MediaOfflineModal from "./components/modals/MediaOfflineModal";
 import StartupScanModal from "./components/modals/StartupScanModal";
 import ScanSummaryModal from "./components/modals/ScanSummaryModal";
-import PreviewModal from "./components/modals/PreviewModal";
 import ConfirmDeleteModal from "./components/modals/ConfirmDeleteModal";
 import ConfirmReclassifyModal from "./components/modals/ConfirmReclassifyModal";
 import RawConversionModal from "./components/modals/RawConversionModal";
 import ConfirmFileDeleteModal from "./components/modals/ConfirmFileDeleteModal";
 import RenameModal from "./components/modals/RenameModal";
-import HelpModal from "./components/modals/HelpModal";
 import EditMetadataModal from "./components/modals/EditMetadataModal";
 import PropertiesModal from "./components/modals/PropertiesModal";
 import ModelInfoModal from "./components/modals/ModelInfoModal";
@@ -73,6 +77,16 @@ import { useDuplicatesManager } from "./hooks/useDuplicatesManager";
 import "./app.css";
 
 const POLL_MS = 1200;
+
+/**
+ * PDF pane of the shared preview.
+ *
+ * The desktop keeps `PdfViewer` (pdf.js + saved passwords + reclassify on unlock);
+ * the shared component only knows how to ask for this slot.
+ */
+function renderPdfItem(item: SharedSearchItem) {
+  return <PdfViewer filePath={item.absPath ?? ""} fileId={item.id} />;
+}
 
 export default function App() {
   /* ── Core UI state ── */
@@ -911,6 +925,7 @@ export default function App() {
           totalItems={items.length}
           onClose={() => setPreviewOpen(false)}
           onNavigate={(idx) => { selectOnly(idx); }}
+          renderPdf={renderPdfItem}
         />
       )}
       {duplicates.dupPreviewItems.length > 0 && (
@@ -921,6 +936,7 @@ export default function App() {
           totalItems={duplicates.dupPreviewItems.length}
           onClose={() => duplicates.setDupPreviewItems([])}
           onNavigate={() => {}}
+          renderPdf={renderPdfItem}
         />
       )}
       {facePreviewItems.length > 0 && (
@@ -931,6 +947,7 @@ export default function App() {
           totalItems={1}
           onClose={() => setFacePreviewItems([])}
           onNavigate={() => {}}
+          renderPdf={renderPdfItem}
         />
       )}
       {showHelp && <HelpModal onClose={() => setShowHelp(false)} />}

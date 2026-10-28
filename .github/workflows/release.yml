@@ -62,8 +62,8 @@ jobs:
             libjavascriptcoregtk-4.1-dev \
             ffmpeg
 
+      # Root npm workspace: `shared` is a dependency of the desktop app.
       - name: Install frontend dependencies
-        working-directory: sherlock/desktop
         run: npm ci
 
       - name: Download PDFium

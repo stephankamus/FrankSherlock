@@ -11,6 +11,10 @@ use crate::media::MediaMap;
 
 pub const DEFAULT_PORT: u16 = 8080;
 
+/// Where `?w=` derivatives are written. Under `/tmp` in the image, which is a tmpfs:
+/// the cache is disposable by design and must not live on the read-only library mount.
+pub const DEFAULT_CACHE_DIR: &str = "/tmp/fs-web-cache";
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Mount of the publish folder: `current.json`, the snapshots and the thumbnails.
@@ -20,6 +24,8 @@ pub struct Config {
     /// Bearer token every `/api` call must present. Empty disables the check (see
     /// `main`), which is only acceptable behind an authenticating reverse proxy.
     pub auth_token: Option<String>,
+    /// Writable directory for resized previews (`<CACHE_DIR>/<revision>/<id>_<w>.jpg`).
+    pub cache_dir: PathBuf,
     pub port: u16,
 }
 
@@ -57,6 +63,16 @@ impl Config {
             );
         }
 
+        let cache_dir =
+            std::env::var("CACHE_DIR").unwrap_or_else(|_| DEFAULT_CACHE_DIR.to_string());
+        let cache_dir = PathBuf::from(cache_dir);
+        std::fs::create_dir_all(&cache_dir).map_err(|error| {
+            format!(
+                "CACHE_DIR ({}) is not writable: {error}. Mount a tmpfs there.",
+                cache_dir.display()
+            )
+        })?;
+
         let port = match std::env::var("PORT") {
             Ok(raw) => raw
                 .trim()
@@ -69,6 +85,7 @@ impl Config {
             library_dir,
             media_map,
             auth_token,
+            cache_dir,
             port,
         })
     }

@@ -55,9 +55,16 @@ jobs:
         with:
           node-version: 24
 
+      # The frontend is an npm workspace rooted at the repository: `shared` and the
+      # desktop app are installed together, and the lockfile lives at the root.
       - name: Install frontend dependencies
-        working-directory: sherlock/desktop
         run: npm ci
+
+      - name: Run shared package tests
+        run: npm run test --workspace @frank-sherlock/shared
+
+      - name: Typecheck shared package
+        run: npm run typecheck --workspace @frank-sherlock/shared
 
       - name: Download PDFium
         working-directory: sherlock/desktop/src-tauri

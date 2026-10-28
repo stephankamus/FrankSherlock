@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import Toolbar from "../../components/Content/Toolbar";
+import { Toolbar } from "@frank-sherlock/shared";
 
 const defaultSortProps = {
   sortBy: "dateModified" as const,

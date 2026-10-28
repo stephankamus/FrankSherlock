@@ -1,6 +1,6 @@
 import ModalOverlay from "./ModalOverlay";
-import "./shared-modal.css";
-import "./HelpModal.css";
+import "./modal.css";
+import "./help-modal.css";
 
 type Props = {
   onClose: () => void;
@@ -55,8 +55,8 @@ export default function HelpModal({ onClose }: Props) {
         <div className="help-section">
           <h4>Confidence</h4>
           <div className="help-examples">
-            <code>anime confidence &gt;= 0.8</code>
-            <code>min confidence &gt; 0.7</code>
+            <code>{"anime confidence >= 0.8"}</code>
+            <code>{"min confidence > 0.7"}</code>
           </div>
         </div>
 
@@ -64,7 +64,7 @@ export default function HelpModal({ onClose }: Props) {
           <h4>Album filter</h4>
           <div className="help-examples">
             <code>album:vacation</code>
-            <code>album:&quot;my trip&quot; sunset</code>
+            <code>album:"my trip" sunset</code>
           </div>
         </div>
 
@@ -72,7 +72,7 @@ export default function HelpModal({ onClose }: Props) {
           <h4>Subdirectory filter</h4>
           <div className="help-examples">
             <code>subdir:Screenshots</code>
-            <code>subdir:&quot;Photos/2024&quot; sunset</code>
+            <code>subdir:"Photos/2024" sunset</code>
           </div>
         </div>
 
@@ -80,13 +80,13 @@ export default function HelpModal({ onClose }: Props) {
           <h4>Combined</h4>
           <div className="help-examples">
             <code>anime between 2023 and 2024</code>
-            <code>receipt confidence &gt;= 0.9</code>
+            <code>{"receipt confidence >= 0.9"}</code>
             <code>photos from 2022</code>
           </div>
         </div>
 
         <p className="help-note">
-          Filters combine with AND. Word stemming is applied (e.g. &quot;running&quot; matches &quot;run&quot;).
+          Filters combine with AND. Word stemming is applied (e.g. "running" matches "run").
           If no FTS results, a substring fallback is used automatically.
           Media type and confidence filters relax if no results.
         </p>

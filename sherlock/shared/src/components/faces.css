@@ -1,6 +1,6 @@
 /* ── FacesView — component-specific styles ──────────────── */
 /* Base layout (.tool-view, .tool-toolbar, .tool-body, etc.)
-   is in shared-tool-view.css */
+   is in tools.css */
 
 /* ── Progress ────────────────────────────────────────────── */
 .faces-progress {
@@ -190,4 +190,74 @@
 .faces-card.scrubbing .faces-card-crop img {
   border-radius: 4px;
   transition: none;
+}
+
+/* ── Context menu used by the faces view (write actions) ─── */
+.context-menu {
+  position: fixed;
+  z-index: 1100;
+  min-width: 180px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-md);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  padding: 4px 0;
+}
+
+.context-menu-item {
+  padding: 6px 12px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  cursor: pointer;
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+  background: none;
+  border: none;
+  width: 100%;
+  font-family: inherit;
+}
+
+.context-menu-item:hover {
+  background: var(--bg-hover);
+}
+
+.context-menu-parent {
+  padding: 6px 12px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  cursor: default;
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+  position: relative;
+}
+
+.context-menu-parent:hover {
+  background: var(--bg-hover);
+}
+
+.context-menu-arrow {
+  color: var(--text-secondary);
+  font-size: 0.65rem;
+  margin-left: 12px;
+}
+
+.context-menu-submenu {
+  display: none;
+  position: absolute;
+  left: 100%;
+  top: -4px;
+  min-width: 160px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-md);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  padding: 4px 0;
+  z-index: 1101;
+}
+
+.context-menu-parent:hover > .context-menu-submenu,
+.context-menu-parent:focus-within > .context-menu-submenu {
+  display: block;
 }

@@ -1,3 +1,192 @@
+/*
+ * Sidebar pieces shared by both clients: the card shell used by roots, albums and
+ * smart folders, plus the directory tree.
+ *
+ * The desktop keeps the scan-console rules (`root-card-scan*`, discovery bar,
+ * context menu) in its own `Sidebar.css`; what is here is what a read-only client
+ * needs to render the same cards.
+ */
+
+.root-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 2px 6px;
+}
+
+.root-card {
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: background 0.1s, border-color 0.1s;
+}
+
+.root-card:hover {
+  background: var(--bg-hover);
+}
+
+.root-card.selected {
+  background: var(--bg-hover);
+  border-color: var(--accent);
+}
+
+.root-card:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.root-card-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.root-card-icon {
+  flex-shrink: 0;
+  font-size: 0.85rem;
+  line-height: 1;
+}
+
+.root-card-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.root-card-delete {
+  all: unset;
+  width: 18px;
+  height: 18px;
+  border-radius: var(--radius-sm);
+  display: grid;
+  place-items: center;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.1s;
+  flex-shrink: 0;
+}
+
+.root-card:hover .root-card-delete,
+.root-card.selected .root-card-delete {
+  opacity: 1;
+}
+
+.root-card-delete:hover {
+  background: var(--danger);
+  color: #fff;
+}
+
+.root-card-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+  padding-left: 22px;
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+}
+
+.root-card-offline {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--warning-bg, rgba(226, 160, 50, 0.18));
+  color: var(--warning, #e2a032);
+  font-size: 0.6rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* ── Directory tree ──────────────────────────────────── */
+.dir-tree {
+  padding: 2px 0 4px;
+}
+
+.dir-tree-node {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding-right: 8px;
+  min-height: 22px;
+}
+
+.dir-tree-chevron {
+  all: unset;
+  width: 16px;
+  height: 16px;
+  display: grid;
+  place-items: center;
+  font-size: 0.65rem;
+  color: var(--text-secondary);
+  cursor: pointer;
+  flex-shrink: 0;
+  border-radius: var(--radius-sm);
+}
+
+.dir-tree-chevron:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
+.dir-tree-label {
+  all: unset;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 4px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 0.7rem;
+}
+
+.dir-tree-label:hover {
+  background: var(--bg-hover);
+}
+
+.dir-tree-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+}
+
+.dir-tree-count {
+  flex-shrink: 0;
+  font-size: 0.6rem;
+  color: var(--text-secondary);
+  opacity: 0.7;
+}
+
+.dir-tree-selected .dir-tree-label {
+  background: var(--bg-hover);
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.dir-tree-selected .dir-tree-name {
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.dir-tree-loading {
+  padding: 4px 12px;
+  font-size: 0.65rem;
+  color: var(--text-secondary);
+  font-style: italic;
+}
 /* ── Sidebar ──────────────────────────────────────────────── */
 .sidebar {
   background: var(--bg-sidebar);
@@ -175,94 +364,11 @@
 }
 
 /* ── Root cards ──────────────────────────────────────────── */
-.root-list {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 2px 6px;
-}
-
-.root-card {
-  padding: 6px 8px;
-  border-radius: var(--radius-sm);
-  border: 1px solid transparent;
-  cursor: pointer;
-  transition: background 0.1s, border-color 0.1s;
-}
-
-.root-card:hover {
-  background: var(--bg-hover);
-}
-
-.root-card.selected {
-  background: var(--bg-hover);
-  border-color: var(--accent);
-}
-
-.root-card:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: -1px;
-}
-
-.root-card-header {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-}
-
-.root-card-icon {
-  flex-shrink: 0;
-  font-size: 0.85rem;
-  line-height: 1;
-}
-
-.root-card-name {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: var(--font-size-sm);
-  color: var(--text-primary);
-  font-weight: 500;
-}
-
-.root-card-delete {
-  all: unset;
-  width: 18px;
-  height: 18px;
-  border-radius: var(--radius-sm);
-  display: grid;
-  place-items: center;
-  font-size: 0.85rem;
-  color: var(--text-secondary);
-  cursor: pointer;
-  opacity: 0;
-  transition: opacity 0.1s;
-  flex-shrink: 0;
-}
-
-.root-card:hover .root-card-delete,
-.root-card.selected .root-card-delete {
-  opacity: 1;
-}
-
-.root-card-delete:hover {
-  background: var(--danger);
-  color: #fff;
-}
-
-.root-card-meta {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 2px;
-  padding-left: 22px;
-  font-size: 0.7rem;
-  color: var(--text-secondary);
-}
-
+/*
+ * The `.root-list` / `.root-card*` shell and the directory tree moved to
+ * `@frank-sherlock/shared` (`sidebar.css`), where albums and smart folders also
+ * live. The scan-console rules stay here, next to the component that uses them.
+ */
 .root-card-scan {
   margin-top: 4px;
   padding-left: 22px;
@@ -386,101 +492,8 @@
   color: var(--danger);
 }
 
-/* ── Directory tree ──────────────────────────────────── */
-.dir-tree {
-  padding: 2px 0 4px;
-}
-
-.dir-tree-node {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  padding-right: 8px;
-  min-height: 22px;
-}
-
-.dir-tree-chevron {
-  all: unset;
-  width: 16px;
-  height: 16px;
-  display: grid;
-  place-items: center;
-  font-size: 0.65rem;
-  color: var(--text-secondary);
-  cursor: pointer;
-  flex-shrink: 0;
-  border-radius: var(--radius-sm);
-}
-
-.dir-tree-chevron:hover {
-  color: var(--text-primary);
-  background: var(--bg-hover);
-}
-
-.dir-tree-label {
-  all: unset;
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 1px 4px;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  font-size: 0.7rem;
-}
-
-.dir-tree-label:hover {
-  background: var(--bg-hover);
-}
-
-.dir-tree-name {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--text-primary);
-}
-
-.dir-tree-count {
-  flex-shrink: 0;
-  font-size: 0.6rem;
-  color: var(--text-secondary);
-  opacity: 0.7;
-}
-
-.dir-tree-selected .dir-tree-label {
-  background: var(--bg-hover);
-  outline: 1px solid var(--accent);
-  outline-offset: -1px;
-}
-
-.dir-tree-selected .dir-tree-name {
-  color: var(--accent);
-  font-weight: 500;
-}
-
-.dir-tree-loading {
-  padding: 4px 12px;
-  font-size: 0.65rem;
-  color: var(--text-secondary);
-  font-style: italic;
-}
-
 /* ── Offline roots ────────────────────────────────────────── */
 /* The share is unreachable right now, but every indexed row is kept. */
-.root-card-offline {
-  padding: 1px 6px;
-  border-radius: 999px;
-  background: var(--warning-bg, rgba(226, 160, 50, 0.18));
-  color: var(--warning, #e2a032);
-  font-size: 0.6rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
 .root-card-scan-offline span {
   display: block;
   white-space: normal;

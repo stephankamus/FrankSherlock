@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode};
 use http_body_util::BodyExt;
 use sherlock_web::{api, AppState, Config, MediaMap};
 use tempfile::TempDir;
@@ -22,6 +22,8 @@ const TOKEN: &str = "test-token";
 struct Fixture {
     _temp: TempDir,
     library: PathBuf,
+    /// Where `?w=` derivatives are written.
+    cache: PathBuf,
     state: Arc<AppState>,
     visible_id: i64,
     hidden_id: i64,
@@ -84,8 +86,12 @@ fn build() -> Fixture {
     std::fs::create_dir_all(&thumb_dir).expect("thumb dir");
     std::fs::write(thumb_dir.join("visible.jpg"), b"jpeg-bytes").expect("thumb");
 
-    // A real file behind the visible row, so `/api/media` has something to serve.
-    std::fs::write(media.join("a").join("visible.jpg"), b"original-bytes").expect("media file");
+    // A real JPEG behind the visible row: `/api/media?w=` needs something the decoder
+    // can read, and the `Range` tests need a body with more than a handful of bytes.
+    let media_file = media.join("a").join("visible.jpg");
+    image::RgbImage::from_pixel(120, 60, image::Rgb([200, 40, 40]))
+        .save_with_format(&media_file, image::ImageFormat::Jpeg)
+        .expect("media file");
 
     let pointer = serde_json::json!({
         "format": 1,
@@ -113,16 +119,19 @@ fn build() -> Fixture {
     ))
     .expect("media map");
 
+    let cache = temp.path().join("cache");
     let config = Config {
         library_dir: library.clone(),
         media_map,
         auth_token: Some(TOKEN.to_string()),
+        cache_dir: cache.clone(),
         port: 0,
     };
 
     Fixture {
         _temp: temp,
         library,
+        cache,
         state: AppState::new(config),
         visible_id,
         hidden_id,
@@ -131,17 +140,24 @@ fn build() -> Fixture {
     }
 }
 
-async fn get(state: &Arc<AppState>, uri: &str) -> (StatusCode, Vec<u8>) {
-    let request = Request::builder()
+async fn get_with_headers(
+    state: &Arc<AppState>,
+    uri: &str,
+    extra: &[(&str, &str)],
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let mut builder = Request::builder()
         .uri(uri)
-        .header("Authorization", format!("Bearer {TOKEN}"))
-        .body(Body::empty())
-        .expect("request");
+        .header("Authorization", format!("Bearer {TOKEN}"));
+    for (name, value) in extra {
+        builder = builder.header(*name, *value);
+    }
+    let request = builder.body(Body::empty()).expect("request");
     let response = api::app(Arc::clone(state))
         .oneshot(request)
         .await
         .expect("response");
     let status = response.status();
+    let headers = response.headers().clone();
     let body = response
         .into_body()
         .collect()
@@ -149,6 +165,11 @@ async fn get(state: &Arc<AppState>, uri: &str) -> (StatusCode, Vec<u8>) {
         .expect("body")
         .to_bytes()
         .to_vec();
+    (status, headers, body)
+}
+
+async fn get(state: &Arc<AppState>, uri: &str) -> (StatusCode, Vec<u8>) {
+    let (status, _, body) = get_with_headers(state, uri, &[]).await;
     (status, body)
 }
 
@@ -241,6 +262,8 @@ async fn hidden_rows_are_404_on_every_id_based_endpoint() {
     for uri in [
         format!("/api/thumb/{}", fixture.hidden_id),
         format!("/api/media/{}", fixture.hidden_id),
+        // The derivative takes the same path, so it must be refused before decoding.
+        format!("/api/media/{}?w=60", fixture.hidden_id),
         format!("/api/item/{}", fixture.hidden_id),
     ] {
         let (status, _) = get(&fixture.state, &uri).await;
@@ -273,7 +296,8 @@ async fn media_is_served_through_the_mount() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, b"original-bytes");
+    let original = image::load_from_memory(&body).expect("jpeg");
+    assert_eq!((original.width(), original.height()), (120, 60));
 }
 
 #[tokio::test]
@@ -332,4 +356,122 @@ async fn the_library_endpoint_matches_the_pointer() {
     );
     // Silence the unused-field lint of the fixture while keeping the field for debugging.
     let _ = &fixture.library;
+}
+
+#[tokio::test]
+async fn media_preview_is_downscaled_and_reused_from_the_cache() {
+    let fixture = build();
+    let uri = format!("/api/media/{}?w=60", fixture.visible_id);
+    let (status, headers, body) = get_with_headers(&fixture.state, &uri, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "image/jpeg");
+
+    let preview = image::load_from_memory(&body).expect("preview jpeg");
+    assert_eq!(
+        (preview.width(), preview.height()),
+        (60, 30),
+        "the aspect ratio is preserved"
+    );
+
+    let cached = fixture
+        .cache
+        .join("rev-001")
+        .join(format!("{}_60.jpg", fixture.visible_id));
+    assert!(cached.is_file(), "the derivative must be cached on disk");
+
+    // Overwrite the cache with a marker: a second request must serve it instead of
+    // paying for another decode, which is the whole point of the cache.
+    std::fs::write(&cached, b"cached-marker").expect("overwrite cache");
+    let (status, _, body) = get_with_headers(&fixture.state, &uri, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"cached-marker");
+}
+
+#[tokio::test]
+async fn a_huge_preview_width_is_clamped_to_the_server_ceiling() {
+    let fixture = build();
+    let (status, _, body) = get_with_headers(
+        &fixture.state,
+        &format!("/api/media/{}?w=99999", fixture.visible_id),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The source is 120 px wide, smaller than the ceiling, so it is not upscaled.
+    let preview = image::load_from_memory(&body).expect("preview jpeg");
+    assert_eq!(preview.width(), 120);
+
+    let cached = fixture
+        .cache
+        .join("rev-001")
+        .join(format!("{}_4096.jpg", fixture.visible_id));
+    assert!(
+        cached.is_file(),
+        "the cache is namespaced by the clamped width"
+    );
+}
+
+#[tokio::test]
+async fn thumbnails_carry_an_etag_and_answer_if_none_match() {
+    let fixture = build();
+    let uri = format!("/api/thumb/{}", fixture.visible_id);
+    let (status, headers, body) = get_with_headers(&fixture.state, &uri, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"jpeg-bytes");
+    let etag = headers["etag"].to_str().expect("etag header").to_string();
+    assert!(etag.starts_with('"') && etag.ends_with('"'));
+
+    let (status, headers, body) =
+        get_with_headers(&fixture.state, &uri, &[("if-none-match", etag.as_str())]).await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+    assert_eq!(headers["etag"], etag.as_str());
+    assert!(body.is_empty());
+}
+
+#[tokio::test]
+async fn responses_carry_the_security_headers() {
+    let fixture = build();
+    let (_, headers, _) = get_with_headers(&fixture.state, "/api/health", &[]).await;
+    assert_eq!(headers["x-content-type-options"], "nosniff");
+    assert_eq!(headers["x-frame-options"], "SAMEORIGIN");
+    let csp = headers["content-security-policy"]
+        .to_str()
+        .expect("csp header");
+    assert!(csp.contains("frame-ancestors 'self'"), "{csp}");
+}
+
+#[tokio::test]
+async fn media_answers_range_requests() {
+    let fixture = build();
+    let (status, headers, body) = get_with_headers(
+        &fixture.state,
+        &format!("/api/media/{}", fixture.visible_id),
+        &[("range", "bytes=0-3")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(body.len(), 4);
+    assert!(headers.contains_key("content-range"));
+}
+
+#[tokio::test]
+async fn an_invalid_range_is_416_not_a_panic() {
+    // `ServeFile` treats both an unsatisfiable range and an unparsable one as 416 and
+    // sends `Content-Range: bytes */len`; it never reads the whole file to answer a
+    // broken request. That is the behaviour a mobile player can act on.
+    let fixture = build();
+    for range in ["bytes=99999999-", "bytes=abc", "bytes=5-1"] {
+        let (status, headers, _) = get_with_headers(
+            &fixture.state,
+            &format!("/api/media/{}", fixture.visible_id),
+            &[("range", range)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE, "{range}");
+        let content_range = headers["content-range"]
+            .to_str()
+            .expect("content-range header");
+        assert!(content_range.starts_with("bytes */"), "{content_range}");
+    }
 }

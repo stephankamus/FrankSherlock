@@ -1,8 +1,6 @@
 import type { RefObject } from "react";
+import { ImageGrid, ResultsMeta, Toolbar } from "@frank-sherlock/shared";
 import type { SearchItem, SortField, SortOrder } from "../../types";
-import Toolbar from "./Toolbar";
-import ResultsMeta from "./ResultsMeta";
-import ImageGrid from "./ImageGrid";
 import "./Content.css";
 
 type ContentProps = {

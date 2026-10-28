@@ -1,10 +1,12 @@
-import type { SmartFolder } from "../../types";
+import type { SmartFolder } from "../types";
+import "./sidebar.css";
 
 type Props = {
   folder: SmartFolder;
   isSelected: boolean;
   onSelect: () => void;
-  onDelete: () => void;
+  /** Absent on a read-only deployment: the web never deletes a smart folder. */
+  onDelete?: () => void;
 };
 
 export default function SmartFolderCard({ folder, isSelected, onSelect, onDelete }: Props) {
@@ -34,13 +36,15 @@ export default function SmartFolderCard({ folder, isSelected, onSelect, onDelete
           </svg>
         </span>
         <span className="root-card-name" title={folder.name}>{folder.name}</span>
-        <button
-          type="button"
-          className="root-card-delete"
-          onClick={(e) => { e.stopPropagation(); onDelete(); }}
-          title="Delete smart folder"
-          aria-label={`Delete ${folder.name}`}
-        >&times;</button>
+        {onDelete && (
+          <button
+            type="button"
+            className="root-card-delete"
+            onClick={(e) => { e.stopPropagation(); onDelete(); }}
+            title="Delete smart folder"
+            aria-label={`Delete ${folder.name}`}
+          >&times;</button>
+        )}
       </div>
       <div className="root-card-meta">
         <span title={folder.query}>{folder.query}</span>

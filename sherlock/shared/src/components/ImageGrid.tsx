@@ -1,6 +1,8 @@
 import type { RefObject } from "react";
-import type { SearchItem } from "../../types";
+
+import type { SearchItem } from "../types";
 import ImageTile from "./ImageTile";
+import "./library.css";
 
 type ImageGridProps = {
   items: SearchItem[];

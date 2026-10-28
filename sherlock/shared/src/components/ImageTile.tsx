@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
-import { fileName } from "../../utils/format";
-import type { SearchItem } from "../../types";
+
+import type { SearchItem } from "../types";
+import { useLibrary } from "../useLibrary";
+import { fileName } from "../utils/format";
+import "./library.css";
 
 type Props = {
   item: SearchItem;
@@ -15,12 +17,32 @@ type Props = {
   onToggleHidden?: (index: number) => void;
 };
 
-export default function ImageTile({ item, index, isSelected, isFocused, onClick, onDoubleClick, onContextMenu, onToggleHidden }: Props) {
-  const thumb = item.thumbnailPath ? convertFileSrc(item.thumbnailPath) : null;
+/**
+ * One grid tile.
+ *
+ * The only platform-specific part is where the pixels come from: the desktop client
+ * returns `asset://` URLs for the cached thumbnail and the original file, the HTTP
+ * client returns `/api/thumb/{id}` and a resized `/api/media/{id}?w=`. The web never
+ * receives a stored path, and this component never touches the filesystem.
+ */
+export default function ImageTile({
+  item,
+  index,
+  isSelected,
+  isFocused,
+  onClick,
+  onDoubleClick,
+  onContextMenu,
+  onToggleHidden,
+}: Props) {
+  const library = useLibrary();
+  const thumb = library.thumbUrl(item);
   // Thumbnails can be missing (stale cache after a root was re-added under a new
-  // path, files cleaned up by an earlier scan). Falling back to the original
-  // file keeps the grid usable instead of showing a broken image.
-  const original = item.absPath ? convertFileSrc(item.absPath) : null;
+  // path, files cleaned up by an earlier scan). Falling back to the original keeps
+  // the grid usable instead of showing a broken image; on the web that fallback is
+  // the resized derivative, not a 12 MP JPEG. A video cannot render in an <img>,
+  // so it goes straight to the placeholder.
+  const original = item.mediaType === "video" ? null : library.previewUrl(item, 1600) || null;
   const [src, setSrc] = useState<string | null>(thumb);
   useEffect(() => {
     setSrc(thumb);
@@ -29,6 +51,7 @@ export default function ImageTile({ item, index, isSelected, isFocused, onClick,
   // Only ever set while the "show hidden" filter is on: the query drops hidden rows
   // otherwise, so a badge here means the user asked to see them.
   const isHidden = item.hiddenAt != null;
+  const canHide = library.capabilities.write && onToggleHidden != null;
 
   return (
     <article
@@ -60,7 +83,7 @@ export default function ImageTile({ item, index, isSelected, isFocused, onClick,
         {isVideo && (
           <span className="tile-video-badge" aria-label="Video">&#9654;</span>
         )}
-        {onToggleHidden && (
+        {canHide && (
           // The click must not reach the tile: selecting the photo is a different
           // gesture, and on a multi-selection it would clear it.
           <button
@@ -70,7 +93,7 @@ export default function ImageTile({ item, index, isSelected, isFocused, onClick,
             aria-label={isHidden ? "Unhide this photo" : "Hide this photo"}
             onClick={(e) => {
               e.stopPropagation();
-              onToggleHidden(index);
+              onToggleHidden?.(index);
             }}
             onDoubleClick={(e) => e.stopPropagation()}
           >

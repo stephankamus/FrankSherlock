@@ -1,3 +1,5 @@
+import "./library.css";
+
 type Props = {
   count: number;
   total: number;

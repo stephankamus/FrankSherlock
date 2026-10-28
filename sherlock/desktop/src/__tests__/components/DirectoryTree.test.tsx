@@ -1,16 +1,40 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import DirectoryTree from "../../components/Sidebar/DirectoryTree";
-import type { SubdirEntry } from "../../types";
+import {
+  DirectoryTree,
+  LibraryProvider,
+  READ_ONLY_CAPABILITIES,
+  type LibraryClient,
+  type SubdirEntry,
+} from "@frank-sherlock/shared";
+import type { ReactElement } from "react";
 
-// Mock the API
-vi.mock("../../api", () => ({
-  listSubdirectories: vi.fn(),
-}));
+// The tree asks the client, not `api.ts`: the web resolves the same call over HTTP.
+const mockListSubdirs = vi.fn(async (_rootId: number, _prefix: string) => [] as SubdirEntry[]);
 
-import { listSubdirectories } from "../../api";
-const mockListSubdirs = vi.mocked(listSubdirectories);
+const client: LibraryClient = {
+  capabilities: READ_ONLY_CAPABILITIES,
+  search: vi.fn(),
+  listRoots: vi.fn(),
+  listSubdirs: mockListSubdirs,
+  listAlbums: vi.fn(),
+  listSmartFolders: vi.fn(),
+  listPeople: vi.fn(),
+  listFacesForPerson: vi.fn(),
+  listDuplicates: vi.fn(),
+  thumbUrl: () => null,
+  mediaUrl: () => "",
+  previewUrl: () => "",
+  videoUrl: async () => "",
+  faceCropUrl: () => null,
+  personCropUrl: () => null,
+  pdfUrl: () => "",
+};
+
+function wrap(ui: ReactElement) {
+  return <LibraryProvider client={client}>{ui}</LibraryProvider>;
+}
 
 const topLevelDirs: SubdirEntry[] = [
   { relPath: "Documents", name: "Documents", fileCount: 5 },
@@ -30,9 +54,7 @@ describe("DirectoryTree", () => {
   it("renders top-level directories on mount", async () => {
     mockListSubdirs.mockResolvedValueOnce(topLevelDirs);
 
-    render(
-      <DirectoryTree rootId={1} selectedSubdir={null} onSelectSubdir={vi.fn()} />,
-    );
+    render(wrap(<DirectoryTree rootId={1} selectedSubdir={null} onSelectSubdir={vi.fn()} />));
 
     await waitFor(() => {
       expect(screen.getByText("Documents")).toBeInTheDocument();
@@ -46,7 +68,7 @@ describe("DirectoryTree", () => {
     mockListSubdirs.mockResolvedValueOnce([]);
 
     const { container } = render(
-      <DirectoryTree rootId={1} selectedSubdir={null} onSelectSubdir={vi.fn()} />,
+      wrap(<DirectoryTree rootId={1} selectedSubdir={null} onSelectSubdir={vi.fn()} />),
     );
 
     await waitFor(() => {
@@ -60,9 +82,7 @@ describe("DirectoryTree", () => {
     mockListSubdirs.mockResolvedValueOnce(topLevelDirs);
     const onSelectSubdir = vi.fn();
 
-    render(
-      <DirectoryTree rootId={1} selectedSubdir={null} onSelectSubdir={onSelectSubdir} />,
-    );
+    render(wrap(<DirectoryTree rootId={1} selectedSubdir={null} onSelectSubdir={onSelectSubdir} />));
 
     await waitFor(() => {
       expect(screen.getByText("Photos")).toBeInTheDocument();
@@ -76,9 +96,7 @@ describe("DirectoryTree", () => {
     mockListSubdirs.mockResolvedValueOnce(topLevelDirs);
     const onSelectSubdir = vi.fn();
 
-    render(
-      <DirectoryTree rootId={1} selectedSubdir="Photos" onSelectSubdir={onSelectSubdir} />,
-    );
+    render(wrap(<DirectoryTree rootId={1} selectedSubdir="Photos" onSelectSubdir={onSelectSubdir} />));
 
     await waitFor(() => {
       expect(screen.getByText("Photos")).toBeInTheDocument();
@@ -93,9 +111,7 @@ describe("DirectoryTree", () => {
       .mockResolvedValueOnce(topLevelDirs) // initial load
       .mockResolvedValueOnce(photosChildren); // expand Photos
 
-    render(
-      <DirectoryTree rootId={1} selectedSubdir={null} onSelectSubdir={vi.fn()} />,
-    );
+    render(wrap(<DirectoryTree rootId={1} selectedSubdir={null} onSelectSubdir={vi.fn()} />));
 
     await waitFor(() => {
       expect(screen.getByText("Photos")).toBeInTheDocument();
@@ -117,9 +133,7 @@ describe("DirectoryTree", () => {
       .mockResolvedValueOnce(topLevelDirs)
       .mockResolvedValueOnce(photosChildren);
 
-    render(
-      <DirectoryTree rootId={1} selectedSubdir={null} onSelectSubdir={vi.fn()} />,
-    );
+    render(wrap(<DirectoryTree rootId={1} selectedSubdir={null} onSelectSubdir={vi.fn()} />));
 
     await waitFor(() => {
       expect(screen.getByText("Photos")).toBeInTheDocument();
@@ -139,9 +153,7 @@ describe("DirectoryTree", () => {
   it("shows file count badges", async () => {
     mockListSubdirs.mockResolvedValueOnce(topLevelDirs);
 
-    render(
-      <DirectoryTree rootId={1} selectedSubdir={null} onSelectSubdir={vi.fn()} />,
-    );
+    render(wrap(<DirectoryTree rootId={1} selectedSubdir={null} onSelectSubdir={vi.fn()} />));
 
     await waitFor(() => {
       expect(screen.getByText("5")).toBeInTheDocument();
@@ -152,9 +164,7 @@ describe("DirectoryTree", () => {
   it("highlights selected directory", async () => {
     mockListSubdirs.mockResolvedValueOnce(topLevelDirs);
 
-    render(
-      <DirectoryTree rootId={1} selectedSubdir="Photos" onSelectSubdir={vi.fn()} />,
-    );
+    render(wrap(<DirectoryTree rootId={1} selectedSubdir="Photos" onSelectSubdir={vi.fn()} />));
 
     await waitFor(() => {
       expect(screen.getByText("Photos")).toBeInTheDocument();
@@ -170,16 +180,14 @@ describe("DirectoryTree", () => {
       .mockResolvedValueOnce([{ relPath: "Music", name: "Music", fileCount: 3 }]); // root 2
 
     const { rerender } = render(
-      <DirectoryTree rootId={1} selectedSubdir={null} onSelectSubdir={vi.fn()} />,
+      wrap(<DirectoryTree rootId={1} selectedSubdir={null} onSelectSubdir={vi.fn()} />),
     );
 
     await waitFor(() => {
       expect(screen.getByText("Photos")).toBeInTheDocument();
     });
 
-    rerender(
-      <DirectoryTree rootId={2} selectedSubdir={null} onSelectSubdir={vi.fn()} />,
-    );
+    rerender(wrap(<DirectoryTree rootId={2} selectedSubdir={null} onSelectSubdir={vi.fn()} />));
 
     await waitFor(() => {
       expect(screen.getByText("Music")).toBeInTheDocument();

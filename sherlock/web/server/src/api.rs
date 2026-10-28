@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -83,6 +83,9 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/item/{id}", get(item))
         .route("/thumb/{id}", get(thumb))
         .route("/face-crop/{id}", get(face_crop))
+        // A person card needs its representative crop; serving it by person id keeps
+        // the stored path of the chosen face out of the payload.
+        .route("/person-crop/{id}", get(person_crop))
         .route("/media/{id}", get(media))
         .route("/albums", get(albums))
         .route("/smart-folders", get(smart_folders))
@@ -99,6 +102,32 @@ pub fn app(state: Arc<AppState>) -> Router {
         .nest("/api", api)
         .route("/", get(index))
         .route("/healthz", get(|| async { "ok" }))
+        // Applied to every route, including the nested API and the media responses.
+        .layer(axum::middleware::from_fn(security_headers))
+}
+
+/// Headers that keep a browser from reinterpreting the bytes or framing the app.
+///
+/// `nosniff` stops a JPEG served with the wrong extension from being treated as HTML;
+/// `frame-ancestors 'self'` allows the SPA to embed its own PDFs in an `<iframe>` while
+/// refusing to be embedded by another site. `X-Frame-Options` stays for old browsers
+/// that do not implement CSP.
+async fn security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'self'"),
+    );
+    headers.insert(
+        header::X_FRAME_OPTIONS,
+        HeaderValue::from_static("SAMEORIGIN"),
+    );
+    response
 }
 
 /// Placeholder until the SPA is embedded: proving the server is up beats a 404.
@@ -450,35 +479,189 @@ async fn smart_folders(
     Ok(Json(serde_json::to_value(folders).map_err(internal)?))
 }
 
-async fn people(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>, ApiError> {
+async fn people(State(state): State<Arc<AppState>>) -> Result<Json<Vec<WebPerson>>, ApiError> {
     let snapshot = state.library.snapshot().map_err(ApiError::Unavailable)?;
     let people = blocking(&snapshot.db_path, |db_path| db::list_persons(db_path, &[])).await?;
-    Ok(Json(serde_json::to_value(people).map_err(internal)?))
+    Ok(Json(
+        people.into_iter().map(WebPerson::from_person).collect(),
+    ))
+}
+
+/// A person with its crop replaced by the id-based URL.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebPerson {
+    id: i64,
+    name: String,
+    face_count: u64,
+    /// Null when no visible face of this person has a crop yet.
+    crop_url: Option<String>,
+}
+
+impl WebPerson {
+    fn from_person(person: sherlock_core::models::PersonInfo) -> Self {
+        // Only the *presence* of a crop leaves the database: the URL is built from the
+        // person id, so the stored path of the representative face never travels.
+        let crop_url = person
+            .crop_path
+            .as_ref()
+            .map(|_| format!("/api/person-crop/{}", person.id));
+        Self {
+            id: person.id,
+            name: person.name,
+            face_count: person.face_count,
+            crop_url,
+        }
+    }
 }
 
 async fn faces_for_person(
     State(state): State<Arc<AppState>>,
     Path(person_id): Path<i64>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<Vec<WebFace>>, ApiError> {
     let snapshot = state.library.snapshot().map_err(ApiError::Unavailable)?;
     let faces = blocking(&snapshot.db_path, move |db_path| {
         db::list_faces_for_person(db_path, person_id)
     })
     .await?;
-    Ok(Json(serde_json::to_value(faces).map_err(internal)?))
+    Ok(Json(faces.into_iter().map(WebFace::from_face).collect()))
+}
+
+/// One face of a person, with its crop replaced by the id-based URL.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebFace {
+    id: i64,
+    person_id: Option<i64>,
+    file_id: i64,
+    rel_path: String,
+    filename: String,
+    confidence: f32,
+    crop_url: Option<String>,
+}
+
+impl WebFace {
+    fn from_face(face: sherlock_core::models::FaceInfo) -> Self {
+        let crop_url = face
+            .crop_path
+            .as_ref()
+            .map(|_| format!("/api/face-crop/{}", face.id));
+        Self {
+            id: face.id,
+            person_id: face.person_id,
+            file_id: face.file_id,
+            rel_path: face.rel_path,
+            filename: face.filename,
+            confidence: face.confidence,
+            crop_url,
+        }
+    }
 }
 
 async fn duplicates(
     State(state): State<Arc<AppState>>,
     Query(params): Query<DuplicatesParams>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<WebDuplicatesResponse>, ApiError> {
     let snapshot = state.library.snapshot().map_err(ApiError::Unavailable)?;
     let scope: Vec<i64> = params.root_id.into_iter().collect();
-    let groups = blocking(&snapshot.db_path, move |db_path| {
+    let response = blocking(&snapshot.db_path, move |db_path| {
         db::find_duplicates(db_path, &scope, None)
     })
     .await?;
-    Ok(Json(serde_json::to_value(groups).map_err(internal)?))
+    Ok(Json(WebDuplicatesResponse::from_response(response)))
+}
+
+/// Duplicate groups are informative on the web: no host path, just URLs.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebDuplicatesResponse {
+    total_groups: u64,
+    total_duplicate_files: u64,
+    total_wasted_bytes: i64,
+    groups: Vec<WebDuplicateGroup>,
+}
+
+impl WebDuplicatesResponse {
+    fn from_response(response: sherlock_core::models::DuplicatesResponse) -> Self {
+        Self {
+            total_groups: response.total_groups,
+            total_duplicate_files: response.total_duplicate_files,
+            total_wasted_bytes: response.total_wasted_bytes,
+            groups: response
+                .groups
+                .into_iter()
+                .map(WebDuplicateGroup::from_group)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebDuplicateGroup {
+    fingerprint: String,
+    file_count: u64,
+    total_size_bytes: i64,
+    wasted_bytes: i64,
+    files: Vec<WebDuplicateFile>,
+    group_type: String,
+    avg_similarity: Option<f32>,
+}
+
+impl WebDuplicateGroup {
+    fn from_group(group: sherlock_core::models::DuplicateGroup) -> Self {
+        Self {
+            fingerprint: group.fingerprint,
+            file_count: group.file_count,
+            total_size_bytes: group.total_size_bytes,
+            wasted_bytes: group.wasted_bytes,
+            files: group
+                .files
+                .into_iter()
+                .map(WebDuplicateFile::from_file)
+                .collect(),
+            group_type: group.group_type,
+            avg_similarity: group.avg_similarity,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebDuplicateFile {
+    id: i64,
+    root_id: i64,
+    rel_path: String,
+    media_type: String,
+    description: String,
+    confidence: f32,
+    mtime_ns: i64,
+    size_bytes: i64,
+    is_keeper: bool,
+    similarity_score: Option<f32>,
+    group_type: String,
+    thumb_url: String,
+    media_url: String,
+}
+
+impl WebDuplicateFile {
+    fn from_file(file: sherlock_core::models::DuplicateFile) -> Self {
+        Self {
+            thumb_url: format!("/api/thumb/{}", file.id),
+            media_url: format!("/api/media/{}", file.id),
+            id: file.id,
+            root_id: file.root_id,
+            rel_path: file.rel_path,
+            media_type: file.media_type,
+            description: file.description,
+            confidence: file.confidence,
+            mtime_ns: file.mtime_ns,
+            size_bytes: file.size_bytes,
+            is_keeper: file.is_keeper,
+            similarity_score: file.similarity_score,
+            group_type: file.group_type,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -493,6 +676,7 @@ struct DuplicatesParams {
 async fn thumb(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let snapshot = state.library.snapshot().map_err(ApiError::Unavailable)?;
     let row = blocking_serve_row(&snapshot.db_path, id).await?;
@@ -500,25 +684,13 @@ async fn thumb(
     let key = sherlock_core::thumbnail::root_key(&root.path);
     let path =
         sherlock_core::thumbnail::thumb_path_for(&snapshot.thumbnails_dir, &key, &row.rel_path);
-    let bytes = tokio::fs::read(&path)
-        .await
-        .map_err(|_| ApiError::NotFound)?;
-    Ok((
-        [
-            (header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg")),
-            (
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=604800"),
-            ),
-        ],
-        bytes,
-    )
-        .into_response())
+    serve_jpeg_file(&path, &headers).await
 }
 
 async fn face_crop(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let snapshot = state.library.snapshot().map_err(ApiError::Unavailable)?;
     let crops_dir = snapshot.face_crops_dir.clone().ok_or(ApiError::NotFound)?;
@@ -536,25 +708,46 @@ async fn face_crop(
         .and_then(|path| std::path::Path::new(path).file_name())
         .and_then(|name| name.to_str())
         .ok_or(ApiError::NotFound)?;
-    let bytes = tokio::fs::read(crops_dir.join(file_name))
-        .await
-        .map_err(|_| ApiError::NotFound)?;
-    Ok((
-        [
-            (header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg")),
-            (
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=604800"),
-            ),
-        ],
-        bytes,
-    )
-        .into_response())
+    serve_jpeg_file(&crops_dir.join(file_name), &headers).await
+}
+
+/// A person card's crop: the crop of one of its visible faces, by person id.
+///
+/// `list_faces_for_person` already excludes files that were deleted or hidden, so a
+/// person whose every photo is hidden answers `404` — the same rule the crops follow.
+async fn person_crop(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let snapshot = state.library.snapshot().map_err(ApiError::Unavailable)?;
+    let crops_dir = snapshot.face_crops_dir.clone().ok_or(ApiError::NotFound)?;
+    let faces = blocking(&snapshot.db_path, move |db_path| {
+        db::list_faces_for_person(db_path, id)
+    })
+    .await?;
+    let file_name = faces
+        .iter()
+        .filter_map(|face| face.crop_path.as_deref())
+        .filter_map(|path| std::path::Path::new(path).file_name())
+        .filter_map(|name| name.to_str())
+        .next()
+        .ok_or(ApiError::NotFound)?;
+    serve_jpeg_file(&crops_dir.join(file_name), &headers).await
+}
+
+/// Query string of `/api/media`.
+#[derive(Debug, Deserialize)]
+struct MediaParams {
+    /// Width of the preview derivative. Absent, zero or garbage means the original.
+    #[serde(default)]
+    w: Option<String>,
 }
 
 async fn media(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
+    Query(params): Query<MediaParams>,
     request: Request,
 ) -> Result<Response, ApiError> {
     let snapshot = state.library.snapshot().map_err(ApiError::Unavailable)?;
@@ -566,6 +759,37 @@ async fn media(
             "{} is not available on this host (share unmounted?)",
             row.rel_path
         )));
+    }
+
+    if let Some(width) = crate::preview::requested_width(params.w.as_deref()) {
+        if crate::preview::is_resizable(&row.rel_path) {
+            let target = crate::preview::cache_path(
+                &state.config.cache_dir,
+                &snapshot.pointer.revision,
+                id,
+                width,
+            );
+            if !target.is_file() {
+                let source = path.clone();
+                let destination = target.clone();
+                let rendered = tokio::task::spawn_blocking(move || {
+                    crate::preview::render(&source, &destination, width)
+                })
+                .await
+                .map_err(internal)?;
+                if let Err(error) = rendered {
+                    // An exotic or corrupt container still has a usable original:
+                    // degrading to it is better than failing the whole request.
+                    log::warn!(
+                        "could not build a {width}px preview for {}: {error}",
+                        row.rel_path
+                    );
+                }
+            }
+            if target.is_file() {
+                return serve_jpeg_file(&target, request.headers()).await;
+            }
+        }
     }
 
     // `ServeFile` is what makes seeking work: it answers `Range` and `HEAD` correctly,
@@ -621,6 +845,77 @@ fn root_for<'a>(
         .ok_or(ApiError::NotFound)
 }
 
+/// A long cache is safe because a published revision is immutable; the `ETag` is what
+/// lets a client that *does* revalidate skip the body.
+const CACHE_CONTROL_VALUE: &str = "public, max-age=604800";
+
+/// A thumbnail, a crop or a `?w=` derivative: JPEG, immutable within one revision.
+///
+/// `ETag` comes from the file's size and mtime: the published tree is replaced wholesale
+/// when a new revision is published, and a repaired thumbnail gets a new mtime. A client
+/// sending `If-None-Match` gets `304` and downloads no bytes at all.
+async fn serve_jpeg_file(
+    path: &std::path::Path,
+    headers: &HeaderMap,
+) -> Result<Response, ApiError> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|_| ApiError::NotFound)?;
+    let etag = etag_for(&metadata);
+    let etag_header = HeaderValue::from_str(&etag).map_err(internal)?;
+    if matches_etag(headers, &etag) {
+        return Ok((
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::ETAG, etag_header),
+                (
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static(CACHE_CONTROL_VALUE),
+                ),
+            ],
+        )
+            .into_response());
+    }
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|_| ApiError::NotFound)?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg")),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static(CACHE_CONTROL_VALUE),
+            ),
+            (header::ETAG, etag_header),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+fn etag_for(metadata: &std::fs::Metadata) -> String {
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    format!("\"{:x}-{:x}\"", metadata.len(), modified)
+}
+
+fn matches_etag(headers: &HeaderMap, etag: &str) -> bool {
+    headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|candidate| candidate == "*" || candidate == etag)
+        })
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,5 +968,61 @@ mod tests {
         let json = serde_json::to_value(&web).expect("json");
         assert!(json.get("absPath").is_none(), "host paths must not leak");
         assert!(json.get("thumbnailPath").is_none());
+    }
+
+    #[test]
+    fn duplicate_files_are_served_by_id() {
+        let file = sherlock_core::models::DuplicateFile {
+            id: 11,
+            root_id: 2,
+            rel_path: "a/b.jpg".to_string(),
+            abs_path: "/stored/a/b.jpg".to_string(),
+            root_path: "/stored".to_string(),
+            media_type: "photo".to_string(),
+            description: "duplicate".to_string(),
+            confidence: 0.5,
+            mtime_ns: 0,
+            size_bytes: 1,
+            thumbnail_path: Some("/cache/thumbs/x.jpg".to_string()),
+            is_keeper: true,
+            similarity_score: None,
+            group_type: "exact".to_string(),
+        };
+        let json = serde_json::to_value(WebDuplicateFile::from_file(file)).expect("json");
+        assert_eq!(json["thumbUrl"], "/api/thumb/11");
+        assert_eq!(json["mediaUrl"], "/api/media/11");
+        assert!(json.get("absPath").is_none());
+        assert!(json.get("rootPath").is_none());
+        assert!(json.get("thumbnailPath").is_none());
+    }
+
+    #[test]
+    fn a_person_crop_url_is_built_from_the_person_id() {
+        let person = sherlock_core::models::PersonInfo {
+            id: 9,
+            name: "Ana".to_string(),
+            face_count: 3,
+            crop_path: Some("/cache/face_crops/42.jpg".to_string()),
+            thumbnail_path: None,
+        };
+        let json = serde_json::to_value(WebPerson::from_person(person)).expect("json");
+        assert_eq!(json["cropUrl"], "/api/person-crop/9");
+        assert!(json.get("cropPath").is_none(), "host paths must not leak");
+    }
+
+    #[test]
+    fn a_face_crop_url_is_built_from_the_face_id() {
+        let face = sherlock_core::models::FaceInfo {
+            id: 5,
+            person_id: Some(9),
+            file_id: 7,
+            rel_path: "a/b.jpg".to_string(),
+            filename: "b.jpg".to_string(),
+            confidence: 0.9,
+            crop_path: Some("/cache/face_crops/5.jpg".to_string()),
+        };
+        let json = serde_json::to_value(WebFace::from_face(face)).expect("json");
+        assert_eq!(json["cropUrl"], "/api/face-crop/5");
+        assert!(json.get("cropPath").is_none(), "host paths must not leak");
     }
 }

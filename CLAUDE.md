@@ -15,12 +15,14 @@ Frank Sherlock is a local-only, AI-powered image cataloging and search system. T
 
 ```
 sherlock/               <- THE MAIN APP (Tauri v2 desktop)
-  core/                 <- Rust read core shared with the planned web server
+  core/                 <- Rust read core shared with the web server
                            (error, query parser, row models, search queries)
+  shared/               <- npm workspace package shared by both frontends:
+                           read types, pure utils, `LibraryClient`, `useLibrary()`
   desktop/
     src-tauri/          <- Rust backend (scan, classify, thumbnail, publish, config)
     src/                <- React frontend (VSCode-inspired UI)
-  web/                  <- Planned: Docker-served read-only client (see plans/web-client.md)
+  web/                  <- Docker-served read-only client (see plans/web-client.md)
 _classification/        <- PoC: Python classification pipeline (informed classify.rs)
 _research_ab_test/      <- A/B benchmark research (scripts, docs, test files)
   scripts/              <- Benchmark scripts for model selection
@@ -44,15 +46,18 @@ docs/                   <- App assets (app_icon.png)
 
 ## Build & Test
 
-From `sherlock/desktop/`:
+The frontend is an npm workspace rooted at the repository (`sherlock/shared` +
+`sherlock/desktop`), with one lockfile at the root:
 
 ```bash
-npm install                    # frontend deps
-cargo build                    # rust backend (from src-tauri/)
-cargo test                     # 486 unit tests
-npm run tauri:dev              # launch dev mode
-npm run test                   # 427 frontend tests
-npm run tauri:build            # produce AppImage/DMG/MSI
+npm install                              # every workspace, from the repository root
+npm run test                             # shared + desktop frontend tests
+npm run test --workspace @frank-sherlock/shared
+npm run test --workspace sherlock-desktop
+npm run build --workspace sherlock-desktop
+cd sherlock/desktop && npm run tauri:dev   # launch dev mode
+cd sherlock/desktop && cargo test          # rust backend tests (src-tauri/)
+cd sherlock/desktop && npm run tauri:build # AppImage/DMG/MSI
 ```
 
 The shared core is a standalone crate, not a workspace member, and has its own tests:
@@ -101,7 +106,21 @@ WEBKIT_DISABLE_DMABUF_RENDERER=1 GDK_BACKEND=wayland,x11 npm run tauri:dev
 - Frontend: TypeScript strict mode, camelCase for TS types matching Rust's `#[serde(rename_all = "camelCase")]`.
 - JSON parsing from LLMs uses a 3-tier fallback: direct parse -> brace-balanced extraction -> regex field salvage.
 - Thumbnails and classification caches mirror the source `rel_path` structure under their respective dirs.
-- Frontend shared utilities (`basename`, `errorMessage`) live in `src/utils.ts`. Modal CSS shares base styles via `shared-modal.css`.
+- Read-side types and pure helpers (`formatBytes`, `fileName`, `basename`, `errorMessage`, media
+  extension checks) live in `sherlock/shared`; `sherlock/desktop/src/types.ts` and `src/utils.ts`
+  only add desktop-specific shapes and re-export the rest. Modal CSS shares base styles via `shared-modal.css`.
+- A component that must work in both apps talks to `useLibrary()` (`LibraryClient`), never to
+  `invoke` or `convertFileSrc` directly. The desktop client is
+  [`tauriLibraryClient.ts`](sherlock/desktop/src/tauriLibraryClient.ts:1); the web client is
+  `createHttpLibraryClient` in `sherlock/shared`. Every visual component that both apps use
+  lives in `sherlock/shared/src/components`, each with its CSS next to it: `ImageTile`,
+  `ImageGrid`, `Toolbar`, `ResultsMeta`, `ModalOverlay`, `HelpModal`, `ToastContainer`,
+  `AlbumCard`, `SmartFolderCard`, `DirectoryTree`, `DuplicatesView`, `FacesView`,
+  `PreviewModal`, `RootCard` and `Sidebar`. `PreviewModal` takes a `renderPdf` slot (desktop
+  passes `PdfViewer`, web gets an `<iframe>`), and `FacesView` takes an optional `actions`
+  object that only the writer passes.
+- Write actions inside shared views are gated by `capabilities.write` / `scan` / `pdfUnlock`;
+  the server is the second barrier (it also refuses hidden rows and unknown root mounts).
 - **App.tsx is an orchestrator** — it composes hooks and renders layout. Feature-specific state and handlers must live in dedicated hooks under `src/hooks/`. New tool modes (like DuplicatesView, FacesView, PdfPasswordsView) should be self-contained components that manage their own data loading. App.tsx only holds: layout state (sidebar, modals, preview), search/filter state, and thin mode-switching coordination.
 
 ## Important Paths
@@ -116,13 +135,14 @@ WEBKIT_DISABLE_DMABUF_RENDERER=1 GDK_BACKEND=wayland,x11 npm run tauri:dev
 
 ```bash
 # Rust (from sherlock/desktop/src-tauri/)
-cargo test                     # 322 tests
+cargo test                     # desktop backend
 
-# Frontend (from sherlock/desktop/)
-npm run test                   # 299 tests
+# Frontend (from the repository root)
+npm run test --workspace sherlock-desktop          # 427 tests
+npm run test --workspace @frank-sherlock/shared    # shared package
 ```
 
-Tests cover: JSON parsing fallbacks, thumbnail generation, incremental scan discovery, DB operations (upsert, touch, delete, FTS), query parsing, scan job persistence, platform abstraction, and all UI components. Shared test fixtures live in `src/__tests__/fixtures.ts`.
+Tests cover: JSON parsing fallbacks, thumbnail generation, incremental scan discovery, DB operations (upsert, touch, delete, FTS), query parsing, scan job persistence, platform abstraction, HTTP client contracts, and all UI components. Desktop test fixtures live in `sherlock/desktop/src/__tests__/fixtures.ts`.
 
 ## Database Migration Rules
 

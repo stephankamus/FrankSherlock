@@ -1,6 +1,6 @@
 /* ── DuplicatesView — component-specific styles ─────────── */
 /* Base layout (.tool-view, .tool-toolbar, .tool-body, etc.)
-   is in shared-tool-view.css */
+   is in tools.css */
 
 .tool-toolbar .danger-btn {
   background: var(--danger);

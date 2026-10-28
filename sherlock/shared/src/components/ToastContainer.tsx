@@ -1,4 +1,4 @@
-import "./ToastContainer.css";
+import "./toast.css";
 
 type Props = {
   notice: string | null;

@@ -386,9 +386,9 @@ transcodificação on-the-fly, cache local de thumbs, múltiplos usuários com p
 
 ## 10. Estado da implementação (handoff)
 
-Branch `feat/web-client`, 2026-10-28.
+Branch `feat/web-client`, 2026-10-28 (terceira sessão).
 
-**Feito e commitado**
+**Feito e commitado (sessões anteriores)**
 
 - Desktop: ocultação de fotos (migration 20), publicação com snapshot/revisões/ponteiro
   atômico, auto-publicação ao fim da cadeia de scans, seção Publicação nas Settings.
@@ -397,21 +397,98 @@ Branch `feat/web-client`, 2026-10-28.
 - `sherlock/web/server`: axum lendo `current.json`, `MediaMap` com validação de traversal,
   endpoints de leitura, auth por bearer ou `?token=`, 12 testes de integração.
 
-**Números no momento do handoff**: 241 testes no `core`, 294 no desktop, 28 no servidor
-web; 427 de frontend; `cargo fmt --check` e `cargo clippy -- -D warnings` limpos nos três
-crates.
+**Feito nesta sessão (itens 3 e 4 da lista anterior)**
+
+- Workspace npm na raiz ([`package.json`](package.json:1)): `sherlock/shared` +
+  `sherlock/desktop`, um único `package-lock.json`. O `sherlock/desktop/package-lock.json`
+  foi removido, e CI/release passaram a rodar `npm ci` na raiz. O CI também roda os testes e
+  o `tsc` do `shared`.
+- `sherlock/shared`: types de leitura (`SearchItem`, `SearchResponse`, `RootInfo`, álbuns,
+  pessoas, rostos, duplicados, health), utils puros (`formatBytes`, `fileName`, `basename`,
+  `errorMessage`, checagem de extensão), `LibraryClient` com `capabilities`,
+  `LibraryProvider`/`useLibrary()` e `createHttpLibraryClient` (query string, token por
+  header e por `?token=` nas mídias, `previewUrl` com `?w=` limitado a 4096). 18 testes.
+- Desktop: [`types.ts`](sherlock/desktop/src/types.ts:1) e `utils*` reexportam o `shared` e
+  só mantêm o que é específico (ex.: `absPath` obrigatório). O
+  [`tauriLibraryClient`](sherlock/desktop/src/tauriLibraryClient.ts:1) implementa a interface
+  sobre `api.ts` + `convertFileSrc`, montado no [`main.tsx`](sherlock/desktop/src/main.tsx:1).
+  Nenhum call site mudou; os 427 testes continuam passando.
+- Servidor: `/api/people`, `/api/faces/{id}` e `/api/duplicates` devolvem URLs
+  (`cropUrl`, `thumbUrl`, `mediaUrl`) e nenhum caminho de host. A rota nova
+  `/api/person-crop/{id}` serve o crop representativo por id, então nem o path do crop sai do
+  servidor. 3 testes unitários novos.
+- Início do item 5: `ImageTile`, `ImageGrid`, `Toolbar` e `ResultsMeta` movidos para
+  `sherlock/shared/src/components`, com o CSS correspondente em `library.css` (o `Content.css`
+  do desktop ficou só com o shell). O `ImageTile` resolve a thumbnail pelo `useLibrary()` e o
+  botão de ocultar passou a exigir `capabilities.write`, então o web não pinta a ação mesmo
+  se um callback for passado por engano.
+- Continuação do item 5: `ModalOverlay`, `HelpModal`, `ToastContainer`, `AlbumCard`,
+  `SmartFolderCard`, `DirectoryTree`, `DuplicatesView` e `PreviewModal` também foram para
+  `shared/src/components`, cada um com o seu CSS (`modal.css`, `help-modal.css`, `toast.css`,
+  `sidebar.css`, `tools.css`, `duplicates.css`, `preview.css`). O `DirectoryTree` consulta
+  `client.listSubdirs`; o `DuplicatesView` resolve thumbnails pelo client, é genérico no tipo
+  de grupo (o desktop mantém `absPath` obrigatório) e só mostra seleção/exclusão com
+  `capabilities.write`; os cards de álbum/smart folder só renderizam o "x" quando o callback
+  existe. O `ModalOverlay` ganhou um re-export no caminho antigo para não tocar os ~20 modais
+  do desktop.
+- `PreviewModal` agora usa `previewUrl(item, 1600)` para imagens e ganhou
+  `videoUrl(item): Promise<string>` no `LibraryClient` (desktop pede ao servidor de stream
+  local com fallback para o asset protocol; web devolve `/api/media` com `Range`). O PDF é um
+  slot `renderPdf(item)`: o desktop injeta o `PdfViewer` com unlock, o web usa `<iframe>`
+  same-origin + link de download.
+- `FacesView` movido para `shared/src/components` (+ `faces.css`): leitura por
+  `client.listPeople`/`listFacesForPerson`, crops por `personCropUrl`/`faceCropUrl`, e as
+  ações de escrita num objeto `actions` opcional (`renamePerson`, `recluster`,
+  `reclusterStatus`, `unassignFace`, `reassignFaces`, `setRepresentativeFace`). Sem `actions`
+  ou com `capabilities.write` falso, renomear, re-cluster, menus de contexto e edição de
+  rostos desaparecem. O desktop mantém [`FacesView.tsx`](sherlock/desktop/src/components/Content/FacesView.tsx:1)
+  como wrapper que injeta as ações de `api.ts` e o provider; os 22 testes existentes passaram
+  sem alteração.
+- `Sidebar`/`RootCard` movidos para `shared` (+ `sidebar.css` com o shell e as regras de
+  scan), junto com `useDragReorder`, `useSelection`, `useContextMenuClose` e `scanEta`
+  (`computeEta`/`formatEta`). Os tipos do console (`ScanJobStatus`, `BacklogProgress`,
+  `FaceDetectProgress`, `ThumbRepairProgress`, `DbStats`, `UpdateInfo`) foram para o shared e
+  o desktop só reexporta; `RootInfo` compartilhado aceita as duas grafias (`name`/`rootName`,
+  `path`/`rootPath`) e `Sidebar`/`RootCard` são genéricos no tipo do root, então o desktop
+  continua inferindo o tipo rico. Os shims em `components/Sidebar/*`, `utils/scanEta` e
+  `hooks/useDragReorder` preservaram os imports e os 40 testes de Sidebar.
+
+**Feito nesta sessão (itens 1 e 2 da lista anterior)**
+
+- `?w=` no `/api/media`: [`preview.rs`](sherlock/web/server/src/preview.rs:1) decodifica, reduz
+  com Lanczos3 e publica um JPEG (qualidade 82) em
+  `CACHE_DIR/<revision>/<id>_<width>.jpg` via arquivo temporário + rename, sempre em
+  `spawn_blocking`. A largura é opcional e limitada a 4096; valor zero/inválido ou extensão que
+  o decoder não lê servem o original (com `warn`, nunca `500`). O cache é namespaced pela
+  revisão publicada. `CACHE_DIR` entrou no `Config` (default `/tmp/fs-web-cache`, criado no
+  boot e validado como gravável).
+- `ETag` + `If-None-Match` em thumbs, crops de rosto, crops de pessoa e derivados `?w=`;
+  resposta `304` sem body, com `Cache-Control: public, max-age=604800`.
+- Headers de segurança em todas as rotas: `X-Content-Type-Options: nosniff`,
+  `Content-Security-Policy: frame-ancestors 'self'` e `X-Frame-Options: SAMEORIGIN`.
+- `Range`: `ServeFile` responde `206` para range válido e `416` + `Content-Range: bytes */len`
+  para range não satisfazível **ou** não parseável (os três formatos estão testados), sem
+  panic e sem baixar o arquivo inteiro.
+- O fixture dos testes de integração passou a usar um JPEG real (120×60), o que permite
+  exercitar decode, resize, cache e `Range`. São 6 testes de integração e 6 unitários novos
+  em `preview.rs`.
+
+**Números no momento do handoff**: 241 no `core`, 294 no desktop (Rust), 43 no servidor web
+(25 unitários + 18 de integração), 428 no frontend do desktop, 21 no `shared`;
+`cargo fmt --check` e `cargo clippy -- -D warnings` limpos nos três crates; `tsc --noEmit`
+limpo em `shared` e `desktop`. O item 5 está **completo**: todo componente que o web usa mora
+em `sherlock/shared`.
 
 **Próximo, em ordem**
 
-1. `?w=` no `/api/media` (preview redimensionado, cache em disco) e `ETag` nas thumbs.
-2. Headers de segurança (`nosniff`, `frame-ancestors`) e tratamento de `Range` inválido.
-3. `sherlock/shared` como pacote npm do workspace: types, utils puros, interface
-   `LibraryClient` e `useLibrary()`.
-4. `httpLibraryClient` (web) e `tauriLibraryClient` (desktop, `api.ts` + `convertFileSrc`).
-5. Mover os componentes visuais para `shared` com flags de capability.
-6. `sherlock/web/ui`: Vite + React, layout responsivo, PWA e manifest.
-7. Dockerfile multi-stage, compose, job de CI da imagem e `docs/web-deploy.md`.
-8. Validação ponta a ponta no celular.
+1. `sherlock/web/ui`: Vite + React, layout responsivo, PWA e manifest (entra também na lista
+   `workspaces` do `package.json` da raiz). Montar `LibraryProvider` com
+   `createHttpLibraryClient({ baseUrl, token })`, usar `Health` para o banner de roots não
+   mapeados e as views já compartilhadas para grid, sidebar, pessoas, duplicados e preview.
+   `utils/rawEstimate` continua no desktop (depende de `RawScanReport`).
+2. Dockerfile multi-stage, compose, job de CI da imagem e `docs/web-deploy.md` (incluir
+   `CACHE_DIR` no tmpfs e `LIBRARY_DIR` read-only).
+3. Validação ponta a ponta no celular.
 
 **Invariantes que não podem quebrar**
 
@@ -419,6 +496,14 @@ crates.
 - Endpoints por id respondem `404` para linha oculta — indistinguível de deletada.
 - Nenhuma rota aceita caminho vindo do cliente: resolve por id, passa pelo `MediaMap` e
   valida cada componente do `rel_path`.
+- Pessoas, rostos e duplicados também são servidos por id/URL: nenhum `*Path` do host sai do
+  servidor.
+- Derivados `?w=` vivem em `CACHE_DIR` (tmpfs), nunca no mount read-only, e o nome inclui a
+  revisão publicada — um cache antigo não pode servir uma thumbnail reparada.
 - `db.rs` existe só no `core`. O desktop nunca deve ganhar uma cópia.
 - Publicar jamais escreve o banco vivo na share: `VACUUM INTO` + revisões versionadas.
+- Componente compartilhado nunca importa `@tauri-apps/*` nem `api.ts`: tudo passa por
+  `useLibrary()`, e cada app monta o provider no seu `main.tsx`.
+- Ação de escrita em componente compartilhado é opt-in duplo: o callback só é passado pelo
+  app que pode escrever **e** o componente confere `capabilities.write` antes de renderizar.
 

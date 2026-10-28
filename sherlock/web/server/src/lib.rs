@@ -10,6 +10,7 @@ pub mod api;
 pub mod config;
 pub mod library;
 pub mod media;
+pub mod preview;
 
 use std::sync::Arc;
 

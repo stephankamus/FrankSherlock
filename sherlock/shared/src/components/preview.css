@@ -180,6 +180,20 @@
   background: #1e1e1e;
 }
 
+/* The web has no pdf.js: a same-origin iframe plus a download link is the v1. */
+.preview-pdf-frame {
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+
+.preview-pdf-download {
+  display: inline-block;
+  margin: 8px 12px;
+  color: var(--accent);
+  font-size: var(--font-size-sm);
+}
+
 /* ── Split layout (dual-pdf, pdf-plus-image) ─────────────── */
 .preview-split {
   display: grid;

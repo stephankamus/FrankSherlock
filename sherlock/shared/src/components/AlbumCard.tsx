@@ -1,10 +1,12 @@
-import type { Album } from "../../types";
+import type { Album } from "../types";
+import "./sidebar.css";
 
 type Props = {
   album: Album;
   isSelected: boolean;
   onSelect: () => void;
-  onDelete: () => void;
+  /** Absent on a read-only deployment: the web never deletes an album. */
+  onDelete?: () => void;
 };
 
 export default function AlbumCard({ album, isSelected, onSelect, onDelete }: Props) {
@@ -32,13 +34,15 @@ export default function AlbumCard({ album, isSelected, onSelect, onDelete }: Pro
           </svg>
         </span>
         <span className="root-card-name" title={album.name}>{album.name}</span>
-        <button
-          type="button"
-          className="root-card-delete"
-          onClick={(e) => { e.stopPropagation(); onDelete(); }}
-          title="Delete album"
-          aria-label={`Delete ${album.name}`}
-        >&times;</button>
+        {onDelete && (
+          <button
+            type="button"
+            className="root-card-delete"
+            onClick={(e) => { e.stopPropagation(); onDelete(); }}
+            title="Delete album"
+            aria-label={`Delete ${album.name}`}
+          >&times;</button>
+        )}
       </div>
       <div className="root-card-meta">
         <span>{album.fileCount.toLocaleString()} files</span>

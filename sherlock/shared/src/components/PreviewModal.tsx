@@ -1,12 +1,11 @@
-import { useState, useEffect } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
-import { getVideoStreamUrl } from "../../api";
-import type { SearchItem } from "../../types";
-import { fileName } from "../../utils/format";
-import { formatBytes } from "../../utils/format";
-import PdfViewer from "../Content/PdfViewer";
+import { useEffect, useState, type ReactNode } from "react";
+
+import type { SearchItem } from "../types";
+import { useLibrary } from "../useLibrary";
+import { fileName, formatBytes, isPdfPath, isVideoPath } from "../utils/format";
 import ModalOverlay from "./ModalOverlay";
-import "./PreviewModal.css";
+import "./modal.css";
+import "./preview.css";
 
 type Props = {
   previewItems: SearchItem[];
@@ -15,17 +14,13 @@ type Props = {
   totalItems: number;
   onClose: () => void;
   onNavigate: (index: number) => void;
+  /**
+   * Renders one PDF pane. The desktop passes its `PdfViewer` (react-pdf + saved
+   * passwords); the web omits it and gets the same-origin `<iframe>` plus a download
+   * link, because unlocking a password is a desktop-only feature in v1.
+   */
+  renderPdf?: (item: SearchItem) => ReactNode;
 };
-
-function isPdf(item: SearchItem): boolean {
-  return /\.pdf$/i.test(item.relPath);
-}
-
-const VIDEO_EXTS = /\.(mp4|mkv|avi|mov|wmv|flv|webm|m4v|ts|mpg|mpeg)$/i;
-
-function isVideo(item: SearchItem): boolean {
-  return VIDEO_EXTS.test(item.relPath);
-}
 
 type LayoutMode =
   | "single-image"
@@ -40,14 +35,14 @@ function detectLayout(items: SearchItem[]): {
   pdfs: SearchItem[];
   images: SearchItem[];
 } {
-  const pdfs = items.filter(isPdf).slice(0, 2);
-  const images = items.filter((i) => !isPdf(i) && !isVideo(i));
+  const pdfs = items.filter((item) => isPdfPath(item.relPath)).slice(0, 2);
+  const images = items.filter((item) => !isPdfPath(item.relPath) && !isVideoPath(item.relPath));
 
   if (items.length === 1) {
-    if (isVideo(items[0])) {
+    if (isVideoPath(items[0].relPath)) {
       return { mode: "single-video", pdfs, images };
     }
-    return isPdf(items[0])
+    return isPdfPath(items[0].relPath)
       ? { mode: "single-pdf", pdfs, images }
       : { mode: "single-image", pdfs, images };
   }
@@ -63,21 +58,29 @@ function detectLayout(items: SearchItem[]): {
   return { mode: "image-collage", pdfs: [], images };
 }
 
-/** Resolve the best playback URL for a video file. */
-function useVideoStreamUrl(absPath: string | undefined): string | null {
+/** Resolve the playback URL through the client (stream server on the desktop). */
+function useVideoStreamUrl(item: SearchItem | undefined): string | null {
+  const library = useLibrary();
   const [url, setUrl] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!absPath) { setUrl(null); return; }
+    if (!item) {
+      setUrl(null);
+      return;
+    }
     let cancelled = false;
-    getVideoStreamUrl(absPath)
-      .then((u) => { if (!cancelled) setUrl(u); })
+    library
+      .videoUrl(item)
+      .then((resolved) => {
+        if (!cancelled) setUrl(resolved || null);
+      })
       .catch(() => {
-        // Fallback to asset protocol (works on macOS/Windows)
-        if (!cancelled) setUrl(convertFileSrc(absPath));
+        if (!cancelled) setUrl(null);
       });
-    return () => { cancelled = true; };
-  }, [absPath]);
+    return () => {
+      cancelled = true;
+    };
+  }, [item, library]);
 
   return url;
 }
@@ -89,14 +92,16 @@ export default function PreviewModal({
   totalItems,
   onClose,
   onNavigate,
+  renderPdf,
 }: Props) {
+  const library = useLibrary();
   const { mode, pdfs, images } = detectLayout(previewItems);
   const videoItem = mode === "single-video" ? previewItems[0] : undefined;
-  const videoUrl = useVideoStreamUrl(videoItem?.absPath);
+  const videoUrl = useVideoStreamUrl(videoItem);
   const [videoError, setVideoError] = useState(false);
 
   // Reset error when navigating to a different item
-  useEffect(() => { setVideoError(false); }, [videoItem?.absPath]);
+  useEffect(() => { setVideoError(false); }, [videoItem?.id]);
 
   // Keyboard: Space closes preview, arrows navigate (single-item only)
   useEffect(() => {
@@ -126,6 +131,19 @@ export default function PreviewModal({
     document.addEventListener("keydown", handleKeyDown, true);
     return () => document.removeEventListener("keydown", handleKeyDown, true);
   }, [onClose, onNavigate, singlePreviewIndex, totalItems]);
+
+  function pdfPane(item: SearchItem) {
+    if (renderPdf) return renderPdf(item);
+    const url = library.pdfUrl(item);
+    return (
+      <>
+        <iframe className="preview-pdf-frame" src={url} title={fileName(item.relPath)} />
+        <a className="preview-pdf-download" href={url} download={fileName(item.relPath)}>
+          Download PDF
+        </a>
+      </>
+    );
+  }
 
   return (
     <ModalOverlay className="preview-overlay" onBackdropClick={onClose}>
@@ -168,7 +186,7 @@ export default function PreviewModal({
         {mode === "single-image" && (
           <div className="preview-image-wrap">
             <img
-              src={convertFileSrc(previewItems[0].absPath)}
+              src={library.previewUrl(previewItems[0], 1600)}
               alt={previewItems[0].relPath}
             />
           </div>
@@ -198,9 +216,9 @@ export default function PreviewModal({
         {/* Video error fallback: show thumbnail + message */}
         {mode === "single-video" && videoError && (
           <div className="preview-video-wrap preview-video-fallback">
-            {previewItems[0].thumbnailPath && (
+            {library.thumbUrl(previewItems[0]) && (
               <img
-                src={convertFileSrc(previewItems[0].thumbnailPath)}
+                src={library.thumbUrl(previewItems[0]) ?? undefined}
                 alt={previewItems[0].relPath}
                 style={{ maxHeight: "50vh", objectFit: "contain" }}
               />
@@ -215,7 +233,7 @@ export default function PreviewModal({
         {/* Single PDF preview */}
         {mode === "single-pdf" && (
           <div className="preview-pdf-wrap">
-            <PdfViewer filePath={pdfs[0].absPath} fileId={pdfs[0].id} />
+            {pdfPane(pdfs[0])}
           </div>
         )}
 
@@ -223,10 +241,10 @@ export default function PreviewModal({
         {mode === "dual-pdf" && (
           <div className="preview-split" data-testid="preview-split">
             <div className="preview-split-pane">
-              <PdfViewer filePath={pdfs[0].absPath} fileId={pdfs[0].id} />
+              {pdfPane(pdfs[0])}
             </div>
             <div className="preview-split-pane">
-              <PdfViewer filePath={pdfs[1].absPath} fileId={pdfs[1].id} />
+              {pdfPane(pdfs[1])}
             </div>
           </div>
         )}
@@ -235,11 +253,11 @@ export default function PreviewModal({
         {mode === "pdf-plus-image" && (
           <div className="preview-split" data-testid="preview-split">
             <div className="preview-split-pane">
-              <PdfViewer filePath={pdfs[0].absPath} fileId={pdfs[0].id} />
+              {pdfPane(pdfs[0])}
             </div>
             <div className="preview-split-pane preview-image-wrap">
               <img
-                src={convertFileSrc(images[0].absPath)}
+                src={library.previewUrl(images[0], 1600)}
                 alt={images[0].relPath}
               />
             </div>
@@ -252,7 +270,7 @@ export default function PreviewModal({
             {images.map((item, idx) => (
               <div key={item.id} className="preview-collage-cell">
                 <img
-                  src={convertFileSrc(item.absPath)}
+                  src={library.previewUrl(item, 1600)}
                   alt={item.relPath}
                 />
                 {images.length > 1 && (
@@ -287,7 +305,7 @@ export default function PreviewModal({
               {previewItems.map((item, idx) => (
                 <div key={item.id} className="preview-compare-row">
                   <span className="preview-compare-num">{idx + 1}</span>
-                  <span className="preview-compare-name" title={item.absPath}>
+                  <span className="preview-compare-name" title={item.relPath}>
                     {fileName(item.relPath)}
                   </span>
                   <span className="preview-compare-meta">{formatBytes(item.sizeBytes)}</span>

@@ -41,7 +41,9 @@ sherlock/certs/
 
 # Blog posts (drafts, not shipped)
 posts/
-
 # Local experiment artifacts
 _face_ab_test/*.pt
 *.url
+
+# Node workspaces (hoisted at the repository root)
+node_modules/

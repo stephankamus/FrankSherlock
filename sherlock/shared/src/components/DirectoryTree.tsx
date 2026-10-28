@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
-import { listSubdirectories } from "../../api";
-import type { SubdirEntry } from "../../types";
+
+import type { SubdirEntry } from "../types";
+import { useLibrary } from "../useLibrary";
+import "./sidebar.css";
 
 type DirectoryTreeProps = {
   rootId: number;
@@ -67,6 +69,7 @@ function TreeNode({
 }
 
 export default function DirectoryTree({ rootId, selectedSubdir, onSelectSubdir }: DirectoryTreeProps) {
+  const library = useLibrary();
   const [topLevel, setTopLevel] = useState<SubdirEntry[]>([]);
   const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set());
   const [childrenCache, setChildrenCache] = useState<Map<string, SubdirEntry[]>>(new Map());
@@ -80,7 +83,8 @@ export default function DirectoryTree({ rootId, selectedSubdir, onSelectSubdir }
     setChildrenCache(new Map());
     setLoading(true);
 
-    listSubdirectories(rootId, "")
+    library
+      .listSubdirs(rootId, "")
       .then((dirs) => {
         if (!cancelled) setTopLevel(dirs);
       })
@@ -92,7 +96,7 @@ export default function DirectoryTree({ rootId, selectedSubdir, onSelectSubdir }
       });
 
     return () => { cancelled = true; };
-  }, [rootId]);
+  }, [rootId, library]);
 
   const onToggleExpand = useCallback(async (relPath: string) => {
     setExpandedNodes((prev) => {
@@ -103,7 +107,8 @@ export default function DirectoryTree({ rootId, selectedSubdir, onSelectSubdir }
         next.add(relPath);
         // Lazy-fetch children if not cached
         if (!childrenCache.has(relPath)) {
-          listSubdirectories(rootId, relPath)
+          library
+            .listSubdirs(rootId, relPath)
             .then((dirs) => {
               setChildrenCache((c) => new Map(c).set(relPath, dirs));
             })
@@ -114,7 +119,7 @@ export default function DirectoryTree({ rootId, selectedSubdir, onSelectSubdir }
       }
       return next;
     });
-  }, [rootId, childrenCache]);
+  }, [rootId, childrenCache, library]);
 
   const onSelect = useCallback((relPath: string) => {
     onSelectSubdir(selectedSubdir === relPath ? null : relPath);
