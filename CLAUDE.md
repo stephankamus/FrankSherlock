@@ -15,9 +15,12 @@ Frank Sherlock is a local-only, AI-powered image cataloging and search system. T
 
 ```
 sherlock/               <- THE MAIN APP (Tauri v2 desktop)
+  core/                 <- Rust read core shared with the planned web server
+                           (error, query parser, row models, search queries)
   desktop/
-    src-tauri/          <- Rust backend (scan, classify, thumbnail, db, config)
+    src-tauri/          <- Rust backend (scan, classify, thumbnail, publish, config)
     src/                <- React frontend (VSCode-inspired UI)
+  web/                  <- Planned: Docker-served read-only client (see plans/web-client.md)
 _classification/        <- PoC: Python classification pipeline (informed classify.rs)
 _research_ab_test/      <- A/B benchmark research (scripts, docs, test files)
   scripts/              <- Benchmark scripts for model selection
@@ -46,10 +49,16 @@ From `sherlock/desktop/`:
 ```bash
 npm install                    # frontend deps
 cargo build                    # rust backend (from src-tauri/)
-cargo test                     # 322 unit tests
+cargo test                     # 486 unit tests
 npm run tauri:dev              # launch dev mode
-npm run test                   # 299 frontend tests
+npm run test                   # 427 frontend tests
 npm run tauri:build            # produce AppImage/DMG/MSI
+```
+
+The shared core is a standalone crate, not a workspace member, and has its own tests:
+
+```bash
+cd sherlock/core && cargo test # 35 unit tests (query parser)
 ```
 
 If Wayland/NVIDIA causes WebKit issues:

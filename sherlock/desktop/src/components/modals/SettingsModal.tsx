@@ -1,10 +1,17 @@
 import { useEffect, useState } from "react";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
   cancelDescriptionConversion,
+  cancelPublish,
   convertExistingDescriptions,
   getDescriptionLanguageStatus,
   getFaceThreadPlan,
+  getPublishLastReport,
+  getPublishStatus,
   getVisionSettings,
+  loadUserConfig,
+  publishLibrary,
+  saveUserConfig,
   updateSettings,
 } from "../../api";
 import type {
@@ -12,12 +19,15 @@ import type {
   DescriptionLanguageSetting,
   FaceThreadPlan,
   ImageFilterSetting,
+  PublishProgress,
+  PublishReport,
   SettingsUpdatePayload,
   StartupScanSetting,
   VisionOcrEngine,
   VisionPromptProfile,
   VisionSettings,
 } from "../../types";
+import { formatBytes } from "../../utils/format";
 import ModalOverlay from "./ModalOverlay";
 import "./shared-modal.css";
 import "./SettingsModal.css";
@@ -29,6 +39,41 @@ type Props = {
   /** Opens the live log viewer on top of this modal. */
   onOpenLogs?: () => void;
 };
+
+/**
+ * Deployment settings for the web app, stored in `config.json` rather than
+ * `settings.toml`: where the snapshot goes describes *this machine's* share, not how
+ * the pipeline classifies images. They also save on their own, because the publish
+ * button has to act on the value that was persisted, not on what is on screen.
+ */
+export type PublishConfig = {
+  dir: string;
+  auto: boolean;
+  includeFaceCrops: boolean;
+  keepRevisions: number;
+};
+
+export const DEFAULT_PUBLISH: PublishConfig = {
+  dir: "",
+  auto: true,
+  includeFaceCrops: true,
+  keepRevisions: 2,
+};
+
+/** Read the `publish` block out of `config.json`, tolerating a missing/partial one. */
+export function readPublishConfig(config: Record<string, unknown>): PublishConfig {
+  const raw = (config.publish ?? {}) as Partial<PublishConfig>;
+  return {
+    dir: typeof raw.dir === "string" ? raw.dir : "",
+    // `!== false` keeps the plan's default (on) while still honouring an explicit off.
+    auto: raw.auto !== false,
+    includeFaceCrops: raw.includeFaceCrops !== false,
+    keepRevisions:
+      typeof raw.keepRevisions === "number" && raw.keepRevisions >= 1
+        ? Math.min(10, Math.round(raw.keepRevisions))
+        : DEFAULT_PUBLISH.keepRevisions,
+  };
+}
 
 const PROMPT_PROFILES: { value: VisionPromptProfile; label: string }[] = [
   { value: "concise", label: "Concise (fewer output tokens)" },
@@ -111,6 +156,11 @@ export default function SettingsModal({ onClose, onSaved, onOpenLogs }: Props) {
   const [converting, setConverting] = useState(false);
   /** Cores and the session split `faceThreads` resolves to, so the hint is concrete. */
   const [threadPlan, setThreadPlan] = useState<FaceThreadPlan | null>(null);
+  /** Publishing to the web app: its own state, saved on change. */
+  const [publish, setPublish] = useState<PublishConfig>(DEFAULT_PUBLISH);
+  const [publishJob, setPublishJob] = useState<PublishProgress | null>(null);
+  const [publishing, setPublishing] = useState(false);
+  const [lastPublish, setLastPublish] = useState<PublishReport | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -138,10 +188,34 @@ export default function SettingsModal({ onClose, onSaved, onOpenLogs }: Props) {
       .catch(() => {
         // Same: the hint degrades to "0 = all cores" without the numbers.
       });
+    loadUserConfig()
+      .then((config) => {
+        if (!cancelled) setPublish(readPublishConfig(config));
+      })
+      .catch(() => {
+        // Without config.json the fields just show the defaults; not worth an error.
+      });
+    // A publish can finish after this modal was closed, so the last report is read
+    // from the backend instead of relying on a promise the screen no longer holds.
+    getPublishLastReport()
+      .then((report) => {
+        if (!cancelled && report) setLastPublish(report);
+      })
+      .catch(() => {});
     return () => {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (!publishing) return;
+    const id = window.setInterval(() => {
+      getPublishStatus()
+        .then((status) => setPublishJob(status))
+        .catch(() => setPublishJob(null));
+    }, 500);
+    return () => window.clearInterval(id);
+  }, [publishing]);
 
   useEffect(() => {
     if (!converting) return;
@@ -182,6 +256,52 @@ export default function SettingsModal({ onClose, onSaved, onOpenLogs }: Props) {
       await cancelDescriptionConversion();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  /** Persist the publish settings immediately; they are deployment config. */
+  async function persistPublish(next: PublishConfig) {
+    setPublish(next);
+    try {
+      const config = await loadUserConfig();
+      await saveUserConfig({ ...config, publish: next });
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function choosePublishFolder() {
+    try {
+      const picked = await open({
+        directory: true,
+        multiple: false,
+        title: "Folder the web app will read",
+      });
+      if (typeof picked === "string") await persistPublish({ ...publish, dir: picked });
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function runPublish() {
+    if (!publish.dir.trim()) {
+      setError("Choose a publish folder first.");
+      return;
+    }
+    setError(null);
+    // The backend reads the folder from config.json, so the screen must have saved
+    // what it shows before asking for a publish.
+    await persistPublish(publish);
+    setPublishing(true);
+    setPublishJob(null);
+    try {
+      const report = await publishLibrary();
+      setLastPublish(report);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setPublishing(false);
+      setPublishJob(null);
     }
   }
 
@@ -447,6 +567,94 @@ export default function SettingsModal({ onClose, onSaved, onOpenLogs }: Props) {
                   ? ` Right now: ${threadPlan.budget} thread(s) as ${threadPlan.workers} session(s) of ${threadPlan.intraThreads}.`
                   : ""}
               </span>
+            </div>
+
+            <div className="settings-field settings-publish">
+              <h4>Publishing to the web app</h4>
+              <span className="settings-hint">
+                A folder on the shared drive. The desktop writes a consistent snapshot of
+                the index and the thumbnails there; the web app only reads it. Keeping the
+                index local is deliberate — SQLite must not be written across a share.
+              </span>
+              <div className="settings-publish-path">
+                <input
+                  id="settings-publish-dir"
+                  type="text"
+                  value={publish.dir}
+                  placeholder="/mnt/nas/frank-sherlock"
+                  aria-label="Publish folder"
+                  onChange={(e) => setPublish({ ...publish, dir: e.target.value })}
+                  onBlur={() => void persistPublish(publish)}
+                />
+                <button type="button" onClick={() => void choosePublishFolder()}>
+                  Choose…
+                </button>
+              </div>
+              <label className="modal-checkbox settings-checkbox">
+                <input
+                  type="checkbox"
+                  checked={publish.auto}
+                  onChange={(e) => void persistPublish({ ...publish, auto: e.target.checked })}
+                />
+                <span>Publish when a scan finishes.</span>
+              </label>
+              <label className="modal-checkbox settings-checkbox">
+                <input
+                  type="checkbox"
+                  checked={publish.includeFaceCrops}
+                  onChange={(e) =>
+                    void persistPublish({ ...publish, includeFaceCrops: e.target.checked })
+                  }
+                />
+                <span>
+                  Include face crops — the web app needs them for the people gallery.
+                </span>
+              </label>
+              <label className="settings-inline-field" htmlFor="settings-keep-revisions">
+                <span>Snapshots to keep</span>
+                <input
+                  id="settings-keep-revisions"
+                  type="number"
+                  min={1}
+                  max={10}
+                  value={publish.keepRevisions}
+                  onChange={(e) =>
+                    void persistPublish({ ...publish, keepRevisions: Number(e.target.value) })
+                  }
+                />
+              </label>
+              {publishing ? (
+                <div className="settings-conversion">
+                  <span>
+                    Publishing… {publishJob?.phase ?? "starting"}
+                    {publishJob && publishJob.total > 0
+                      ? ` ${publishJob.done}/${publishJob.total}`
+                      : ""}
+                  </span>
+                  <button type="button" onClick={() => void cancelPublish()}>
+                    Cancel
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  className="settings-logs-btn"
+                  onClick={() => void runPublish()}
+                  disabled={!publish.dir.trim()}
+                >
+                  Publish now
+                </button>
+              )}
+              {lastPublish && !publishing && (
+                <span className="settings-hint" role="status">
+                  Last publish: revision {lastPublish.revision}
+                  {lastPublish.cancelled ? " (cancelled)" : ""} —{" "}
+                  {lastPublish.thumbnailsCopied} thumbnail(s) copied,{" "}
+                  {lastPublish.thumbnailsUnchanged} unchanged,{" "}
+                  {lastPublish.revisionsPruned} old snapshot(s) removed, database{" "}
+                  {formatBytes(lastPublish.databaseBytes)}.
+                </span>
+              )}
             </div>
 
             {onOpenLogs && (

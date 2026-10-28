@@ -9,8 +9,8 @@ use crate::error::{AppError, AppResult};
 use crate::models::{
     Album, CompactResult, DbStats, DuplicateFile, DuplicateGroup, DuplicatesResponse, ExistingFile,
     FileMetadata, FileProperties, FileRecordUpsert, HealthCheckOutcome, ParsedQuery, PdfPassword,
-    ProtectedPdfInfo, PurgeResult, RawConversion, RootInfo, ScanJobState, ScanJobStatus, SearchItem,
-    SearchRequest, SearchResponse, SmartFolder, SortField, SortOrder, SubdirEntry,
+    ProtectedPdfInfo, PurgeResult, RawConversion, RootInfo, ScanJobState, ScanJobStatus,
+    SearchItem, SearchRequest, SearchResponse, SmartFolder, SortField, SortOrder, SubdirEntry,
 };
 use crate::query_parser::parse_query;
 
@@ -430,6 +430,24 @@ fn run_migrations(conn: &mut Connection) -> AppResult<()> {
             );
             CREATE INDEX IF NOT EXISTS idx_raw_conversions_output
                 ON raw_conversions(root_id, output_rel_path);
+            "#,
+        ),
+        // Migration 20: user-chosen hiding of individual rows.
+        //
+        // Why a timestamp and not a boolean: it records *when* a photo was hidden, so
+        // "hidden recently" can be ordered and the undo toast has something to show.
+        // `NULL` means visible, which is what every row written before this migration
+        // already is — no backfill needed.
+        //
+        // Deliberately not `deleted_at`: a hidden row is still on disk, still scanned,
+        // still classified and still face-scanned. Hiding is a visibility preference,
+        // not an exclusion from the pipeline. `upsert_file_record` lists its columns
+        // explicitly and therefore never clears this one (see the migration 19 note
+        // above about `raw_conversions` for the same trap).
+        M::up(
+            r#"
+            ALTER TABLE files ADD COLUMN hidden_at INTEGER;
+            CREATE INDEX IF NOT EXISTS idx_files_hidden_at ON files(hidden_at);
             "#,
         ),
     ]);
@@ -2352,9 +2370,11 @@ pub fn migrate_thumbnail_layout(
 pub fn root_path_by_id(db_path: &Path, root_id: i64) -> AppResult<Option<String>> {
     let conn = open_conn(db_path)?;
     let path = conn
-        .query_row("SELECT root_path FROM roots WHERE id = ?1", [root_id], |row| {
-            row.get::<_, String>(0)
-        })
+        .query_row(
+            "SELECT root_path FROM roots WHERE id = ?1",
+            [root_id],
+            |row| row.get::<_, String>(0),
+        )
         .ok();
     Ok(path)
 }
@@ -2703,7 +2723,8 @@ pub fn list_roots(db_path: &Path) -> AppResult<Vec<RootInfo>> {
     let conn = open_conn(db_path)?;
     let mut stmt = conn.prepare(
         "SELECT r.id, r.root_path, r.root_name, r.created_at, r.last_scan_at,
-                (SELECT COUNT(*) FROM files f WHERE f.root_id = r.id AND f.deleted_at IS NULL),
+                (SELECT COUNT(*) FROM files f
+                  WHERE f.root_id = r.id AND f.deleted_at IS NULL AND f.hidden_at IS NULL),
                 r.availability, r.last_seen_at, r.last_error
          FROM roots r ORDER BY r.sort_order, r.id",
     )?;
@@ -3722,6 +3743,13 @@ fn search_images_normalized(
     let mut where_clauses = vec!["f.deleted_at IS NULL".to_string()];
     let mut bind_values: Vec<Value> = Vec::new();
 
+    // Hidden rows stay in the index (and in FTS) so unhiding is an UPDATE; only the
+    // "show hidden" filter in the desktop grid asks for them. The web server always
+    // sends `include_hidden: false`.
+    if !request.include_hidden {
+        where_clauses.push("f.hidden_at IS NULL".to_string());
+    }
+
     if has_query {
         from_sql.push_str(" JOIN files_fts ON files_fts.rowid = f.id ");
         where_clauses.push("files_fts MATCH ?".to_string());
@@ -3805,7 +3833,8 @@ fn search_images_normalized(
     let group_by = if has_face_join { " GROUP BY f.id " } else { "" };
     let select_sql = format!(
         "SELECT f.id, f.root_id, f.rel_path, f.abs_path, f.media_type, f.description, \
-         f.confidence, f.mtime_ns, f.size_bytes, f.thumb_path, f.face_count{}{}{}{} LIMIT ? OFFSET ?",
+         f.confidence, f.mtime_ns, f.size_bytes, f.thumb_path, f.face_count, \
+         f.hidden_at{}{}{}{} LIMIT ? OFFSET ?",
         from_sql, where_sql, group_by, order_sql
     );
     let mut select_bind = bind_values;
@@ -3825,6 +3854,7 @@ fn search_images_normalized(
             size_bytes: row.get(8)?,
             thumbnail_path: row.get(9)?,
             face_count: row.get::<_, Option<i64>>(10)?.filter(|&c| c > 0),
+            hidden_at: row.get(11)?,
             source_format: None,
             source_rel_path: None,
         })
@@ -3868,6 +3898,10 @@ fn search_like_fallback(
     let mut from_sql = String::from(" FROM files f ");
     let mut where_clauses = vec!["f.deleted_at IS NULL".to_string()];
     let mut bind_values: Vec<Value> = Vec::new();
+
+    if !request.include_hidden {
+        where_clauses.push("f.hidden_at IS NULL".to_string());
+    }
 
     // LIKE across searchable text columns
     where_clauses.push(
@@ -3957,7 +3991,8 @@ fn search_like_fallback(
     let group_by = if has_face_join { " GROUP BY f.id " } else { "" };
     let select_sql = format!(
         "SELECT f.id, f.root_id, f.rel_path, f.abs_path, f.media_type, f.description, \
-         f.confidence, f.mtime_ns, f.size_bytes, f.thumb_path, f.face_count{}{}{}{} LIMIT ? OFFSET ?",
+         f.confidence, f.mtime_ns, f.size_bytes, f.thumb_path, f.face_count, \
+         f.hidden_at{}{}{}{} LIMIT ? OFFSET ?",
         from_sql, where_sql, group_by, order_sql
     );
     let mut select_bind = bind_values;
@@ -3977,6 +4012,7 @@ fn search_like_fallback(
             size_bytes: row.get(8)?,
             thumbnail_path: row.get(9)?,
             face_count: row.get::<_, Option<i64>>(10)?.filter(|&c| c > 0),
+            hidden_at: row.get(11)?,
             source_format: None,
             source_rel_path: None,
         })
@@ -4227,6 +4263,65 @@ pub fn now_epoch_secs_pub() -> i64 {
     now_epoch_secs()
 }
 
+// ── Visibility (hidden photos) ──────────────────────────────────────
+
+/// Hide or unhide a batch of rows, returning how many actually changed.
+///
+/// One transaction for the whole batch: hiding a 40-tile selection and reporting a
+/// single toast must not leave half of it hidden when the disk is busy. Rows already
+/// in the requested state are not counted, which is what keeps the toast honest.
+pub fn set_files_hidden(db_path: &Path, file_ids: &[i64], hidden: bool) -> AppResult<u64> {
+    if file_ids.is_empty() {
+        return Ok(0);
+    }
+    let conn = open_conn(db_path)?;
+    let tx = conn.unchecked_transaction()?;
+    let now = now_epoch_secs();
+    let mut changed = 0u64;
+
+    if hidden {
+        {
+            let mut stmt =
+                tx.prepare("UPDATE files SET hidden_at = ?1 WHERE id = ?2 AND hidden_at IS NULL")?;
+            for id in file_ids {
+                changed += stmt.execute(params![now, id])? as u64;
+            }
+        }
+    } else {
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE files SET hidden_at = NULL WHERE id = ?1 AND hidden_at IS NOT NULL",
+            )?;
+            for id in file_ids {
+                changed += stmt.execute(params![id])? as u64;
+            }
+        }
+    }
+
+    tx.commit()?;
+    Ok(changed)
+}
+
+/// How many rows are hidden, optionally scoped to a set of roots.
+pub fn hidden_count(db_path: &Path, root_scope: &[i64]) -> AppResult<u64> {
+    let conn = open_conn(db_path)?;
+    let (scope_clause, scope_params): (String, Vec<i64>) = if root_scope.is_empty() {
+        (String::new(), Vec::new())
+    } else {
+        let placeholders = vec!["?"; root_scope.len()].join(", ");
+        (
+            format!(" AND root_id IN ({placeholders})"),
+            root_scope.to_vec(),
+        )
+    };
+    let sql = format!(
+        "SELECT COUNT(*) FROM files
+          WHERE deleted_at IS NULL AND hidden_at IS NOT NULL{scope_clause}"
+    );
+    let count: i64 = conn.query_row(&sql, params_from_iter(scope_params), |r| r.get(0))?;
+    Ok(count as u64)
+}
+
 fn now_epoch_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4264,7 +4359,8 @@ pub fn list_albums(db_path: &Path) -> AppResult<Vec<Album>> {
         "SELECT a.id, a.name, a.created_at,
                 (SELECT COUNT(*) FROM album_files af
                  JOIN files f ON f.id = af.file_id
-                 WHERE af.album_id = a.id AND f.deleted_at IS NULL) AS file_count
+                 WHERE af.album_id = a.id AND f.deleted_at IS NULL
+                   AND f.hidden_at IS NULL) AS file_count
          FROM albums a ORDER BY a.sort_order, a.id",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -4671,6 +4767,7 @@ pub fn list_files_with_faces(
                 f.thumb_path, f.face_count
          FROM files f
          WHERE f.deleted_at IS NULL
+           AND f.hidden_at IS NULL
            AND f.face_count > 0
            {}
          ORDER BY f.face_count DESC, f.rel_path",
@@ -4682,6 +4779,9 @@ pub fn list_files_with_faces(
         Ok(crate::models::SearchItem {
             source_format: None,
             source_rel_path: None,
+            // The query filters hidden rows out, so the gallery has no hidden
+            // entries to badge — `None` is the truth for every row it returns.
+            hidden_at: None,
             id: row.get(0)?,
             root_id: row.get(1)?,
             rel_path: row.get(2)?,
@@ -4727,16 +4827,22 @@ pub fn get_face_stats(db_path: &Path, root_scope: &[i64]) -> AppResult<FaceStats
 
     let base_where = "f.deleted_at IS NULL AND f.confidence > 0 AND f.media_type IN ('photo', 'screenshot', 'meme', 'anime', 'illustration', 'artwork')";
 
+    // What the Faces view *shows* excludes hidden rows, because its gallery does. What
+    // is still *pending* below deliberately includes them: a hidden photo is still
+    // scanned for faces, and hiding it must not make "Detect faces" report nothing to
+    // do while there is work left.
+    let visible_only = format!("{base_where} AND f.hidden_at IS NULL");
+
     // images_with_faces: face_count > 0
     let sql = format!(
-        "SELECT COUNT(*) FROM files f WHERE {base_where} AND f.face_count > 0{scope_clause}"
+        "SELECT COUNT(*) FROM files f WHERE {visible_only} AND f.face_count > 0{scope_clause}"
     );
     let images_with_faces: u64 =
         conn.query_row(&sql, params_from_iter(scope_params.iter()), |r| r.get(0))?;
 
     // total_faces: sum of face_count
     let sql = format!(
-        "SELECT COALESCE(SUM(f.face_count), 0) FROM files f WHERE {base_where} AND f.face_count > 0{scope_clause}"
+        "SELECT COALESCE(SUM(f.face_count), 0) FROM files f WHERE {visible_only} AND f.face_count > 0{scope_clause}"
     );
     let total_faces: u64 =
         conn.query_row(&sql, params_from_iter(scope_params.iter()), |r| r.get(0))?;
@@ -4745,6 +4851,9 @@ pub fn get_face_stats(db_path: &Path, root_scope: &[i64]) -> AppResult<FaceStats
     // `faces_scanned_at`: a row either went through detection or it did not, which is
     // the question the UI asks. `face_count` is only a count and says nothing about
     // whether a zero means "no faces" or "never looked".
+    // The denominator of `images_scanned` must count the same population as
+    // `images_pending` (which includes hidden rows), otherwise a library whose only
+    // pending images are hidden subtracts 5 from 0 and underflows the u64.
     let sql = format!("SELECT COUNT(*) FROM files f WHERE {base_where}{scope_clause}");
     let total_images: u64 =
         conn.query_row(&sql, params_from_iter(scope_params.iter()), |r| r.get(0))?;
@@ -4787,16 +4896,15 @@ pub fn list_persons(
 ) -> AppResult<Vec<crate::models::PersonInfo>> {
     let conn = open_conn(db_path)?;
 
-    let (scope_join, scope_clause, scope_params) = if root_scope.is_empty() {
-        ("".to_string(), "".to_string(), vec![])
+    // `files` is joined unconditionally now: the visibility filter has to apply even
+    // when no root is selected, and a person whose every photo is hidden should not
+    // appear with a count of faces nobody can open.
+    let (scope_clause, scope_params) = if root_scope.is_empty() {
+        ("".to_string(), vec![])
     } else {
         let placeholders: Vec<String> = root_scope.iter().map(|_| "?".to_string()).collect();
         (
-            " JOIN files fil ON fil.id = fd.file_id ".to_string(),
-            format!(
-                " AND fil.root_id IN ({}) AND fil.deleted_at IS NULL",
-                placeholders.join(",")
-            ),
+            format!(" AND fil.root_id IN ({})", placeholders.join(",")),
             root_scope.iter().map(|id| Value::from(*id)).collect(),
         )
     };
@@ -4806,8 +4914,8 @@ pub fn list_persons(
                 p.representative_face_id
          FROM people p
          JOIN face_detections fd ON fd.person_id = p.id
-         {scope_join}
-         WHERE 1=1 {scope_clause}
+         JOIN files fil ON fil.id = fd.file_id
+         WHERE fil.deleted_at IS NULL AND fil.hidden_at IS NULL {scope_clause}
          GROUP BY p.id
          HAVING face_count > 0
          ORDER BY face_count DESC"
@@ -4914,6 +5022,8 @@ pub fn list_faces_for_person(
          FROM face_detections fd
          JOIN files f ON f.id = fd.file_id
          WHERE fd.person_id = ?1
+           AND f.deleted_at IS NULL
+           AND f.hidden_at IS NULL
          ORDER BY fd.confidence DESC",
     )?;
     let faces = stmt
@@ -5567,7 +5677,7 @@ pub fn list_subdirectories(
     // We extract the next path segment after the prefix to group by directory.
     let mut stmt = conn.prepare(
         "SELECT rel_path FROM files
-         WHERE root_id = ? AND deleted_at IS NULL AND rel_path LIKE ?",
+         WHERE root_id = ? AND deleted_at IS NULL AND hidden_at IS NULL AND rel_path LIKE ?",
     )?;
 
     let rows = stmt.query_map(params![root_id, like_pattern], |row| {
@@ -5690,9 +5800,10 @@ fn find_exact_duplicates(db_path: &Path, root_scope: &[i64]) -> AppResult<Vec<Du
          FROM files f \
          JOIN roots r ON f.root_id = r.id \
          WHERE f.deleted_at IS NULL \
+           AND f.hidden_at IS NULL \
            AND f.fingerprint IN ( \
                SELECT fingerprint FROM files \
-               WHERE deleted_at IS NULL ",
+               WHERE deleted_at IS NULL AND hidden_at IS NULL ",
     );
 
     let mut bind_values: Vec<Value> = Vec::new();
@@ -5757,7 +5868,11 @@ fn find_exact_duplicates(db_path: &Path, root_scope: &[i64]) -> AppResult<Vec<Du
 
         if fingerprint != current_fp {
             if !current_files.is_empty() {
-                groups.push(build_exact_group(&current_fp, &mut current_files, &converted));
+                groups.push(build_exact_group(
+                    &current_fp,
+                    &mut current_files,
+                    &converted,
+                ));
             }
             current_fp = fingerprint;
             current_files.clear();
@@ -5782,7 +5897,11 @@ fn find_exact_duplicates(db_path: &Path, root_scope: &[i64]) -> AppResult<Vec<Du
     }
 
     if !current_files.is_empty() {
-        groups.push(build_exact_group(&current_fp, &mut current_files, &converted));
+        groups.push(build_exact_group(
+            &current_fp,
+            &mut current_files,
+            &converted,
+        ));
     }
 
     Ok(groups)
@@ -5829,7 +5948,7 @@ fn find_near_duplicates(
          f.thumb_path, f.fingerprint, f.dhash \
          FROM files f \
          JOIN roots r ON f.root_id = r.id \
-         WHERE f.deleted_at IS NULL AND f.dhash IS NOT NULL ",
+         WHERE f.deleted_at IS NULL AND f.hidden_at IS NULL AND f.dhash IS NOT NULL ",
     );
 
     let mut bind_values: Vec<Value> = Vec::new();
@@ -6090,7 +6209,16 @@ mod tests {
         let plain =
             upsert_file_record(&db_path, &sample_record(root_id, "a.jpg", "fp1")).expect("a");
         update_file_classification(
-            &db_path, plain, "photo", "a dog on the beach", "", "", 0.0, "en", "none", "en",
+            &db_path,
+            plain,
+            "photo",
+            "a dog on the beach",
+            "",
+            "",
+            0.0,
+            "en",
+            "none",
+            "en",
         )
         .expect("classify a");
         let doc = upsert_file_record(&db_path, &sample_record(root_id, "b.jpg", "fp2")).expect("b");
@@ -6122,7 +6250,10 @@ mod tests {
             })
             .expect("row")
         };
-        assert!(score(plain) > 0.0, "a described row must stop reading as zero");
+        assert!(
+            score(plain) > 0.0,
+            "a described row must stop reading as zero"
+        );
         assert!(
             score(doc) > score(plain),
             "the document with OCR text corroborates higher: {} vs {}",
@@ -6145,8 +6276,8 @@ mod tests {
         let root_id = upsert_root(&db_path, "/tmp/floor").expect("root");
         let big =
             upsert_file_record(&db_path, &sample_record(root_id, "big.jpg", "fp1")).expect("big");
-        let small =
-            upsert_file_record(&db_path, &sample_record(root_id, "small.jpg", "fp2")).expect("small");
+        let small = upsert_file_record(&db_path, &sample_record(root_id, "small.jpg", "fp2"))
+            .expect("small");
         upsert_file_record(&db_path, &sample_record(root_id, "unmeasured.jpg", "fp3"))
             .expect("unmeasured");
 
@@ -6387,6 +6518,119 @@ mod tests {
             video_codec: None,
             audio_codec: None,
         }
+    }
+
+    #[test]
+    fn hidden_rows_are_excluded_from_search_unless_asked_for() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/demo").expect("root");
+        let visible = upsert_file_record(&db_path, &sample_record(root_id, "keep.jpg", "fp-keep"))
+            .expect("visible");
+        let hidden = upsert_file_record(&db_path, &sample_record(root_id, "hide.jpg", "fp-hide"))
+            .expect("hidden");
+
+        assert_eq!(
+            set_files_hidden(&db_path, &[hidden], true).expect("hide"),
+            1
+        );
+
+        let res = search_images(&db_path, &SearchRequest::default()).expect("search");
+        assert_eq!(res.total, 1);
+        assert_eq!(res.items.len(), 1);
+        assert_eq!(res.items[0].id, visible);
+        assert!(res.items[0].hidden_at.is_none());
+
+        let all = search_images(
+            &db_path,
+            &SearchRequest {
+                include_hidden: true,
+                ..Default::default()
+            },
+        )
+        .expect("search all");
+        assert_eq!(all.total, 2);
+        let row = all
+            .items
+            .iter()
+            .find(|item| item.id == hidden)
+            .expect("hidden row is returned");
+        assert!(
+            row.hidden_at.is_some(),
+            "the desktop grid needs the timestamp to badge the tile and state the eye button"
+        );
+    }
+
+    /// A scan rewrites every column it knows about and `hidden_at` is not one of them.
+    ///
+    /// This is the same trap as the migration 19 note about `raw_conversions`: the day
+    /// someone adds the column to `upsert_file_record`'s list, a routine rescan quietly
+    /// unhides the photos the user asked to keep out of sight.
+    #[test]
+    fn rescanning_a_hidden_row_keeps_it_hidden() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/demo").expect("root");
+        let id = upsert_file_record(&db_path, &sample_record(root_id, "hide.jpg", "fp-hide"))
+            .expect("row");
+        set_files_hidden(&db_path, &[id], true).expect("hide");
+
+        upsert_file_record(&db_path, &sample_record(root_id, "hide.jpg", "fp-hide"))
+            .expect("rescan");
+
+        assert_eq!(hidden_count(&db_path, &[]).expect("count"), 1);
+        assert_eq!(
+            search_images(&db_path, &SearchRequest::default())
+                .expect("search")
+                .total,
+            0
+        );
+    }
+
+    #[test]
+    fn hiding_is_idempotent_and_reports_only_changes() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/demo").expect("root");
+        let a = upsert_file_record(&db_path, &sample_record(root_id, "a.jpg", "fp-a")).expect("a");
+        let b = upsert_file_record(&db_path, &sample_record(root_id, "b.jpg", "fp-b")).expect("b");
+
+        assert_eq!(set_files_hidden(&db_path, &[a, b], true).expect("hide"), 2);
+        assert_eq!(
+            set_files_hidden(&db_path, &[a, b], true).expect("hide again"),
+            0,
+            "a second hide must not claim to have changed anything"
+        );
+        assert_eq!(hidden_count(&db_path, &[root_id]).expect("scope count"), 2);
+
+        assert_eq!(set_files_hidden(&db_path, &[a], false).expect("unhide"), 1);
+        assert_eq!(hidden_count(&db_path, &[]).expect("count"), 1);
+    }
+
+    #[test]
+    fn hidden_rows_are_left_out_of_root_and_subdirectory_counts() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/demo").expect("root");
+        upsert_file_record(&db_path, &sample_record(root_id, "top.jpg", "fp-top")).expect("top");
+        let a =
+            upsert_file_record(&db_path, &sample_record(root_id, "Trip/a.jpg", "fp-a")).expect("a");
+        upsert_file_record(&db_path, &sample_record(root_id, "Trip/b.jpg", "fp-b")).expect("b");
+
+        set_files_hidden(&db_path, &[a], true).expect("hide");
+
+        let roots = list_roots(&db_path).expect("roots");
+        assert_eq!(
+            roots[0].file_count, 2,
+            "the sidebar count is what you can see"
+        );
+
+        let subs = list_subdirectories(&db_path, root_id, "").expect("subdirs");
+        let trip = subs
+            .iter()
+            .find(|entry| entry.rel_path == "Trip")
+            .expect("Trip entry");
+        assert_eq!(trip.file_count, 1);
     }
 
     /// The backlog row is a positional projection: the `SELECT` list and the
@@ -7647,11 +7891,11 @@ mod tests {
         init_database(&db_path).expect("init");
 
         let conn = open_conn(&db_path).expect("open");
-        // Verify user_version is set (20 migrations applied → version 20)
+        // Verify user_version is set (21 migrations applied → version 21)
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 20);
+        assert_eq!(version, 21);
 
         // Migration 19 records where a converted HEIC/NEF copy came from.
         let conversion_columns: Vec<String> = {
@@ -7743,8 +7987,8 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        // We have 20 migrations (indices 0..19), so user_version should be 20
-        assert_eq!(version, 20);
+        // We have 21 migrations (indices 0..20), so user_version should be 21
+        assert_eq!(version, 21);
     }
 
     #[test]
@@ -7787,11 +8031,9 @@ mod tests {
         assert_eq!(rows[0].max_side, 2048);
 
         delete_raw_conversion(&db_path, root_id, "Trip/IMG_1.HEIC").expect("delete");
-        assert!(
-            list_raw_conversions(&db_path, root_id)
-                .expect("list")
-                .is_empty()
-        );
+        assert!(list_raw_conversions(&db_path, root_id)
+            .expect("list")
+            .is_empty());
     }
 
     #[test]
@@ -7831,6 +8073,7 @@ mod tests {
                 size_bytes: 5,
                 thumbnail_path: None,
                 face_count: None,
+                hidden_at: None,
                 source_format: None,
                 source_rel_path: None,
             },
@@ -7846,6 +8089,7 @@ mod tests {
                 size_bytes: 5,
                 thumbnail_path: None,
                 face_count: None,
+                hidden_at: None,
                 source_format: None,
                 source_rel_path: None,
             },

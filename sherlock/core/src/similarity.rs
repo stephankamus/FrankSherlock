@@ -69,6 +69,14 @@ impl DhashIndex {
     pub fn len(&self) -> usize {
         self.bands[0].values().map(Vec::len).sum()
     }
+
+    /// Whether nothing has been indexed yet.
+    ///
+    /// Every insert lands in all bands, so band 0 is enough to answer, and the pair
+    /// with [`Self::len`] is what makes this a proper collection type for callers.
+    pub fn is_empty(&self) -> bool {
+        self.bands[0].is_empty()
+    }
 }
 
 /// Jaccard word overlap between two descriptions.

@@ -18,6 +18,8 @@ import type {
   PdfPassword,
   PersonInfo,
   ProtectedPdfInfo,
+  PublishProgress,
+  PublishReport,
   PurgeResult,
   RawConversion,
   RawJobStatus,
@@ -350,8 +352,56 @@ export async function deleteFiles(fileIds: number[]): Promise<DeleteFilesResult>
   return invoke<DeleteFilesResult>("delete_files", { fileIds });
 }
 
+/**
+ * Hide or unhide a batch of rows.
+ *
+ * One call for both directions so the undo action can replay exactly what it undid.
+ * Resolves with how many rows actually changed, which is what the toast reports.
+ */
+export async function setFilesHidden(fileIds: number[], hidden: boolean): Promise<number> {
+  return invoke<number>("set_files_hidden", { fileIds, hidden });
+}
+
+/**
+ * How many rows are hidden in the given scope, for the "show hidden" toggle.
+ *
+ * Counted on its own instead of inside the search response: the number has to stay
+ * correct while paging, and a per-page count would not.
+ */
+export async function getHiddenFileCount(rootScope: number[] = []): Promise<number> {
+  return invoke<number>("hidden_file_count", { rootScope });
+}
+
 export async function renameFile(fileId: number, newName: string): Promise<RenameFileResult> {
   return invoke<RenameFileResult>("rename_file", { fileId, newName });
+}
+
+// ── Publishing to the web app ───────────────────────────────────────
+
+/**
+ * Snapshot the index and the caches to the folder configured in Settings.
+ *
+ * Resolves when the publish is finished, cancelled or failed: the caller shows the
+ * report. Long libraries take a while on the first run because every thumbnail has to
+ * cross the share; later runs only copy what changed.
+ */
+export async function publishLibrary(): Promise<PublishReport> {
+  return invoke<PublishReport>("publish_library");
+}
+
+/** Live counters of a running publish, or `null` when nothing is running. */
+export async function getPublishStatus(): Promise<PublishProgress | null> {
+  return invoke<PublishProgress | null>("publish_status");
+}
+
+/** Report of the last completed publish, including one finished after the screen closed. */
+export async function getPublishLastReport(): Promise<PublishReport | null> {
+  return invoke<PublishReport | null>("publish_last_report");
+}
+
+/** Ask the running publish to stop between files. The pointer is left untouched. */
+export async function cancelPublish(): Promise<boolean> {
+  return invoke<boolean>("cancel_publish");
 }
 
 export async function getFileMetadata(fileId: number): Promise<FileMetadata> {

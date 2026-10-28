@@ -13,6 +13,11 @@ type Props = {
   onSortOrderChange: (value: SortOrder) => void;
   hasTextQuery: boolean;
   onSaveSmartFolder?: () => void;
+  /** Show the photos the user hid. Desktop-only; the web client has no such filter. */
+  includeHidden?: boolean;
+  onIncludeHiddenChange?: (value: boolean) => void;
+  /** How many rows are hidden in the current scope, for the toggle label. */
+  hiddenCount?: number;
 };
 
 const sortOptions: { value: SortField; label: string; icon: JSX.Element; requiresQuery?: boolean }[] = [
@@ -37,6 +42,7 @@ const sortOptions: { value: SortField; label: string; icon: JSX.Element; require
 export default function Toolbar({
   query, onQueryChange, selectedMediaType, onMediaTypeChange, mediaTypeOptions,
   sortBy, onSortByChange, sortOrder, onSortOrderChange, hasTextQuery, onSaveSmartFolder,
+  includeHidden = false, onIncludeHiddenChange, hiddenCount = 0,
 }: Props) {
   useEffect(() => {
     if (!hasTextQuery && sortBy === "relevance") {
@@ -63,6 +69,28 @@ export default function Toolbar({
           <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
             <path d="M2 1h10l3 3v10a1 1 0 01-1 1H2a1 1 0 01-1-1V2a1 1 0 011-1zm2 0v4h7V1H4zm4 6a2.5 2.5 0 100 5 2.5 2.5 0 000-5z"/>
           </svg>
+        </button>
+      )}
+      {/*
+        Only visible when there is something to reveal, or while it is already on —
+        a toggle for "0 hidden" would be noise in every screenshot of the app.
+      */}
+      {(hiddenCount > 0 || includeHidden) && onIncludeHiddenChange && (
+        <button
+          className={`toolbar-hidden-toggle${includeHidden ? " toolbar-hidden-toggle-active" : ""}`}
+          onClick={() => onIncludeHiddenChange(!includeHidden)}
+          aria-pressed={includeHidden}
+          title={
+            includeHidden
+              ? "Hide these photos again"
+              : `${hiddenCount} hidden photo${hiddenCount === 1 ? "" : "s"} — show them`
+          }
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+            <path d="M8 3C4.5 3 1.7 5.4 1 8c.7 2.6 3.5 5 7 5s6.3-2.4 7-5c-.7-2.6-3.5-5-7-5zm0 8.2A3.2 3.2 0 118 4.8a3.2 3.2 0 010 6.4z"/>
+            <circle cx="8" cy="8" r="1.6"/>
+          </svg>
+          <span>{includeHidden ? "hidden on" : `hidden ${hiddenCount}`}</span>
         </button>
       )}
       <select

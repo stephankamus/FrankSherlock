@@ -20,12 +20,17 @@ type Props = {
   onAddToAlbum: (albumId: number) => void;
   onCreateAlbumFromSelection: () => void;
   onClose: () => void;
+  /** Hides or unhides the selection. Absent on the read-only web client. */
+  onToggleHidden?: () => void;
+  /** True when every selected row is already hidden, so the item reads "Unhide". */
+  selectionAllHidden?: boolean;
 };
 
 export default function ContextMenu({
   x, y, selectedCount, albums, description, extractedText, confidence,
   onCopyPath, onCopyDescription, onCopyOcrText, onRename, onEditMetadata, onProperties,
   onDelete, onAddToAlbum, onCreateAlbumFromSelection, onClose,
+  onToggleHidden, selectionAllHidden = false,
 }: Props) {
   const isUnclassified = confidence !== null && confidence === 0;
   const menuRef = useRef<HTMLDivElement>(null);
@@ -139,6 +144,12 @@ export default function ContextMenu({
           </button>
         </div>
       </div>
+
+      {onToggleHidden && (
+        <button className="context-menu-item" role="menuitem" onClick={onToggleHidden}>
+          <span>{selectionAllHidden ? "Unhide" : "Hide"}</span>
+        </button>
+      )}
 
       <div className="context-menu-separator" role="separator" />
 

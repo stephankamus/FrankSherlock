@@ -10,6 +10,13 @@ export type SearchItem = {
   sizeBytes: number;
   thumbnailPath?: string | null;
   faceCount?: number;
+  /**
+   * Unix seconds when the user hid this photo, `null`/absent when visible.
+   *
+   * Only present while the "show hidden" filter is on: the grid needs it to badge
+   * the tile and to decide whether the eye button hides or unhides.
+   */
+  hiddenAt?: number | null;
   /** "heic" | "nef" when this row is a JPEG copy made by the conversion job. */
   sourceFormat?: string | null;
   /** Original file that produced the copy, relative to the root. */
@@ -121,6 +128,34 @@ export type SearchRequest = {
   dateTo?: string;
   sortBy?: SortField;
   sortOrder?: SortOrder;
+  /** Desktop-only "show hidden" filter. The web client never sets this. */
+  includeHidden?: boolean;
+};
+
+/** Progress of the network publish, polled while it runs. */
+export type PublishProgress = {
+  phase: string;
+  done: number;
+  total: number;
+  /** File currently being written, for the log line under the button. */
+  current: string;
+};
+
+/** What the last publish actually shipped. */
+export type PublishReport = {
+  revision: string;
+  cancelled: boolean;
+  databaseBytes: number;
+  databaseSha256: string;
+  thumbnailsCopied: number;
+  thumbnailsUnchanged: number;
+  thumbnailsRemoved: number;
+  thumbnailsBytes: number;
+  faceCropsCopied: number;
+  faceCropsRemoved: number;
+  faceCropsBytes: number;
+  revisionsPruned: number;
+  elapsedMs: number;
 };
 
 export type ScanJobStatus = {

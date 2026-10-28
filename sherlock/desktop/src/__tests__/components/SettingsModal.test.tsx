@@ -5,7 +5,11 @@ import {
   convertExistingDescriptions,
   getDescriptionLanguageStatus,
   getFaceThreadPlan,
+  getPublishLastReport,
   getVisionSettings,
+  loadUserConfig,
+  publishLibrary,
+  saveUserConfig,
   updateSettings,
 } from "../../api";
 import SettingsModal from "../../components/modals/SettingsModal";
@@ -18,7 +22,29 @@ vi.mock("../../api", () => ({
   getDescriptionLanguageStatus: vi.fn(),
   cancelDescriptionConversion: vi.fn(),
   getFaceThreadPlan: vi.fn(),
+  loadUserConfig: vi.fn(),
+  saveUserConfig: vi.fn(),
+  getPublishLastReport: vi.fn(),
+  getPublishStatus: vi.fn(),
+  publishLibrary: vi.fn(),
+  cancelPublish: vi.fn(),
 }));
+
+const publishReport = {
+  revision: "20261028T150000Z-001",
+  cancelled: false,
+  databaseBytes: 2048,
+  databaseSha256: "ab".repeat(32),
+  thumbnailsCopied: 4,
+  thumbnailsUnchanged: 9,
+  thumbnailsRemoved: 0,
+  thumbnailsBytes: 4096,
+  faceCropsCopied: 0,
+  faceCropsRemoved: 0,
+  faceCropsBytes: 0,
+  revisionsPruned: 1,
+  elapsedMs: 42,
+};
 
 const settings: VisionSettings = {
   modelOverride: null,
@@ -49,6 +75,44 @@ describe("SettingsModal", () => {
       workers: 4,
       intraThreads: 4,
     });
+    (loadUserConfig as ReturnType<typeof vi.fn>).mockResolvedValue({});
+    (saveUserConfig as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    (getPublishLastReport as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+    (publishLibrary as ReturnType<typeof vi.fn>).mockResolvedValue(publishReport);
+  });
+
+  it("publishes to the folder saved in config.json and shows the report", async () => {
+    const user = userEvent.setup();
+    (loadUserConfig as ReturnType<typeof vi.fn>).mockResolvedValue({
+      publish: { dir: "/mnt/nas/frank-sherlock", auto: true, includeFaceCrops: false, keepRevisions: 3 },
+    });
+    render(<SettingsModal onClose={() => {}} />);
+
+    const button = await screen.findByRole("button", { name: "Publish now" });
+    await user.click(button);
+
+    expect(publishLibrary).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText(/Last publish:/)).toBeInTheDocument();
+    expect(screen.getByText(/4 thumbnail\(s\) copied/)).toBeInTheDocument();
+  });
+
+  it("saves the publishing switches as soon as they change", async () => {
+    const user = userEvent.setup();
+    render(<SettingsModal onClose={() => {}} />);
+
+    await user.click(
+      await screen.findByRole("checkbox", { name: /Publish when a scan finishes/ }),
+    );
+
+    await waitFor(() => expect(saveUserConfig).toHaveBeenCalled());
+    const calls = (saveUserConfig as ReturnType<typeof vi.fn>).mock.calls;
+    const saved = calls[calls.length - 1]?.[0];
+    expect(saved.publish.auto).toBe(false);
+  });
+
+  it("explains why Publish now is disabled without a folder", async () => {
+    render(<SettingsModal onClose={() => {}} />);
+    expect(await screen.findByRole("button", { name: "Publish now" })).toBeDisabled();
   });
 
   it("opens the live log viewer from the logs entry", async () => {

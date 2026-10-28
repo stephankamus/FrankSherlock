@@ -75,4 +75,32 @@ describe("ImageTile", () => {
     await user.dblClick(screen.getByRole("listitem"));
     expect(onDoubleClick).toHaveBeenCalledWith(2);
   });
+
+  it("hides the photo without selecting the tile", async () => {
+    const user = userEvent.setup();
+    const onClick = vi.fn();
+    const onToggleHidden = vi.fn();
+    render(
+      <ImageTile item={mockItem} index={4} isSelected={false} isFocused={false} onClick={onClick} onDoubleClick={() => {}} onContextMenu={() => {}} onToggleHidden={onToggleHidden} />
+    );
+    await user.click(screen.getByLabelText("Hide this photo"));
+    expect(onToggleHidden).toHaveBeenCalledWith(4);
+    expect(onClick).not.toHaveBeenCalled();
+  });
+
+  it("marks a hidden tile and offers to unhide it", () => {
+    const { container } = render(
+      <ImageTile item={{ ...mockItem, hiddenAt: 1_700_000_000 }} index={0} isSelected={false} isFocused={false} onClick={() => {}} onDoubleClick={() => {}} onContextMenu={() => {}} onToggleHidden={() => {}} />
+    );
+    expect(container.querySelector(".tile-hidden")).not.toBeNull();
+    expect(screen.getByText("hidden")).toBeInTheDocument();
+    expect(screen.getByLabelText("Unhide this photo")).toBeInTheDocument();
+  });
+
+  it("offers no hide button on a read-only surface", () => {
+    render(
+      <ImageTile item={mockItem} index={0} isSelected={false} isFocused={false} onClick={() => {}} onDoubleClick={() => {}} onContextMenu={() => {}} />
+    );
+    expect(screen.queryByLabelText("Hide this photo")).not.toBeInTheDocument();
+  });
 });

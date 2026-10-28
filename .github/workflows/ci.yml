@@ -69,6 +69,20 @@ jobs:
         shell: bash
         run: bash scripts/download-onnxruntime.sh
 
+      # The shared read core is a standalone crate (path dependency), so it is built
+      # and tested on its own before the app that consumes it.
+      - name: Run core tests
+        working-directory: sherlock/core
+        run: cargo test
+
+      - name: Check core formatting
+        working-directory: sherlock/core
+        run: cargo fmt --check
+
+      - name: Clippy (core)
+        working-directory: sherlock/core
+        run: cargo clippy -- -D warnings
+
       - name: Run Rust tests
         working-directory: sherlock/desktop/src-tauri
         run: cargo test

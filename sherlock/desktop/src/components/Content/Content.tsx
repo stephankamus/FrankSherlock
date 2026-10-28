@@ -17,6 +17,10 @@ type ContentProps = {
   onSortOrderChange: (v: SortOrder) => void;
   hasTextQuery: boolean;
   onSaveSmartFolder?: () => void;
+  includeHidden?: boolean;
+  onIncludeHiddenChange?: (value: boolean) => void;
+  hiddenCount?: number;
+  onTileToggleHidden?: (idx: number) => void;
   items: SearchItem[];
   total: number;
   loading: boolean;
@@ -38,6 +42,7 @@ type ContentProps = {
 export default function Content({
   query, onQueryChange, selectedMediaType, onMediaTypeChange, mediaTypeOptions,
   sortBy, onSortByChange, sortOrder, onSortOrderChange, hasTextQuery, onSaveSmartFolder,
+  includeHidden, onIncludeHiddenChange, hiddenCount, onTileToggleHidden,
   items, total, loading, loadingMore, canLoadMore, isScanning, selectedRootName, onShowLogs,
   selectedIndices, focusIndex, gridRef, sentinelRef, onTileClick, onTileDoubleClick,
   onTileContextMenu,
@@ -56,6 +61,9 @@ export default function Content({
         onSortOrderChange={onSortOrderChange}
         hasTextQuery={hasTextQuery}
         onSaveSmartFolder={onSaveSmartFolder}
+        includeHidden={includeHidden}
+        onIncludeHiddenChange={onIncludeHiddenChange}
+        hiddenCount={hiddenCount}
       />
 
       <div className="content-body">
@@ -76,6 +84,7 @@ export default function Content({
           onTileClick={onTileClick}
           onTileDoubleClick={onTileDoubleClick}
           onTileContextMenu={onTileContextMenu}
+          onTileToggleHidden={onTileToggleHidden}
         />
 
         {canLoadMore && (

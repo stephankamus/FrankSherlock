@@ -11,9 +11,11 @@ type Props = {
   onClick: (index: number, e: React.MouseEvent) => void;
   onDoubleClick: (index: number) => void;
   onContextMenu: (index: number, e: React.MouseEvent) => void;
+  /** Hides or unhides this photo. Absent on the read-only web client. */
+  onToggleHidden?: (index: number) => void;
 };
 
-export default function ImageTile({ item, index, isSelected, isFocused, onClick, onDoubleClick, onContextMenu }: Props) {
+export default function ImageTile({ item, index, isSelected, isFocused, onClick, onDoubleClick, onContextMenu, onToggleHidden }: Props) {
   const thumb = item.thumbnailPath ? convertFileSrc(item.thumbnailPath) : null;
   // Thumbnails can be missing (stale cache after a root was re-added under a new
   // path, files cleaned up by an earlier scan). Falling back to the original
@@ -24,10 +26,13 @@ export default function ImageTile({ item, index, isSelected, isFocused, onClick,
     setSrc(thumb);
   }, [thumb]);
   const isVideo = item.mediaType === "video";
+  // Only ever set while the "show hidden" filter is on: the query drops hidden rows
+  // otherwise, so a badge here means the user asked to see them.
+  const isHidden = item.hiddenAt != null;
 
   return (
     <article
-      className={`tile${isSelected ? " tile-selected" : ""}${isFocused ? " tile-focused" : ""}`}
+      className={`tile${isSelected ? " tile-selected" : ""}${isFocused ? " tile-focused" : ""}${isHidden ? " tile-hidden" : ""}`}
       role="listitem"
       onClick={(e) => onClick(index, e)}
       onDoubleClick={() => onDoubleClick(index)}
@@ -54,6 +59,31 @@ export default function ImageTile({ item, index, isSelected, isFocused, onClick,
         )}
         {isVideo && (
           <span className="tile-video-badge" aria-label="Video">&#9654;</span>
+        )}
+        {onToggleHidden && (
+          // The click must not reach the tile: selecting the photo is a different
+          // gesture, and on a multi-selection it would clear it.
+          <button
+            type="button"
+            className={`tile-hide-btn${isHidden ? " tile-hide-btn-active" : ""}`}
+            title={isHidden ? "Unhide this photo" : "Hide this photo"}
+            aria-label={isHidden ? "Unhide this photo" : "Hide this photo"}
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleHidden(index);
+            }}
+            onDoubleClick={(e) => e.stopPropagation()}
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+              <path d="M8 3C4.5 3 1.7 5.4 1 8c.7 2.6 3.5 5 7 5s6.3-2.4 7-5c-.7-2.6-3.5-5-7-5zm0 8.2A3.2 3.2 0 118 4.8a3.2 3.2 0 010 6.4z"/>
+              <circle cx="8" cy="8" r="1.6"/>
+            </svg>
+          </button>
+        )}
+        {isHidden && (
+          <span className="tile-hidden-badge" title="Hidden — not shown in the web app">
+            hidden
+          </span>
         )}
         {item.sourceFormat && (
           // A JPEG copy made from a HEIC/NEF file: the grid shows a normal photo, and

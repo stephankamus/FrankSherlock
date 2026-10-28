@@ -1,0 +1,3 @@
+# Built by `cargo test` when this crate is exercised on its own; the two consumers
+# (desktop and web) compile it into their own target dirs.
+/target/

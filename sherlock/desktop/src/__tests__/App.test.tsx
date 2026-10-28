@@ -71,11 +71,17 @@ const initResult = (overrides: Partial<InitAppResult> = {}): InitAppResult => ({
 });
 
 vi.mock("../hooks/useToast", () => ({
-  useToast: () => ({ notice: null, error: null, setNotice: vi.fn(), setError: vi.fn() }),
+  useToast: () => ({
+    notice: null,
+    noticeAction: null,
+    error: null,
+    setNotice: vi.fn(),
+    setError: vi.fn(),
+  }),
 }));
 
 vi.mock("../hooks/useUserConfig", () => ({
-  useUserConfig: () => {},
+  useUserConfig: () => ({ zoom: 1.25, showHidden: false, setShowHidden: vi.fn() }),
 }));
 
 vi.mock("../hooks/useGridColumns", () => ({
