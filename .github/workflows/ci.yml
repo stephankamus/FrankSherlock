@@ -83,6 +83,20 @@ jobs:
         working-directory: sherlock/core
         run: cargo clippy -- -D warnings
 
+      # The web server is a third standalone crate: it links `core` and must never link
+      # the desktop (Tauri, ort, pdfium), which is exactly what this build proves.
+      - name: Run web server tests
+        working-directory: sherlock/web/server
+        run: cargo test
+
+      - name: Check web server formatting
+        working-directory: sherlock/web/server
+        run: cargo fmt --check
+
+      - name: Clippy (web server)
+        working-directory: sherlock/web/server
+        run: cargo clippy --all-targets -- -D warnings
+
       - name: Run Rust tests
         working-directory: sherlock/desktop/src-tauri
         run: cargo test

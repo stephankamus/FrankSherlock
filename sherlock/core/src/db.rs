@@ -4306,6 +4306,72 @@ pub fn set_files_hidden(db_path: &Path, file_ids: &[i64], hidden: bool) -> AppRe
     Ok(changed)
 }
 
+/// Everything a media endpoint needs to answer for one file id.
+///
+/// Deliberately a single row and not a search: the web server resolves a URL by id, and
+/// an endpoint that answered from a broader query would be tempted to trust a path the
+/// client sent. `hidden` is reported instead of filtered so the caller can decide — the
+/// API answers `404` for it, the same as a deleted row.
+#[derive(Debug, Clone)]
+pub struct ServeRow {
+    pub root_path: String,
+    pub rel_path: String,
+    pub thumb_path: Option<String>,
+    pub media_type: String,
+    pub hidden: bool,
+}
+
+/// Look up one live row for serving, or `None` when it is missing or deleted.
+pub fn serve_row(db_path: &Path, file_id: i64) -> AppResult<Option<ServeRow>> {
+    let conn = open_conn(db_path)?;
+    let row = conn
+        .query_row(
+            "SELECT r.root_path, f.rel_path, f.thumb_path, f.media_type, f.hidden_at
+             FROM files f
+             JOIN roots r ON r.id = f.root_id
+             WHERE f.id = ?1 AND f.deleted_at IS NULL",
+            params![file_id],
+            |row| {
+                Ok(ServeRow {
+                    root_path: row.get(0)?,
+                    rel_path: row.get(1)?,
+                    thumb_path: row.get(2)?,
+                    media_type: row.get(3)?,
+                    hidden: row.get::<_, Option<i64>>(4)?.is_some(),
+                })
+            },
+        )
+        .ok();
+    Ok(row)
+}
+
+/// Crop path of one face, plus whether its photo is hidden.
+///
+/// `None` when the face does not exist or its file was deleted. The crop path may be
+/// `None` on a face recorded before crops were generated.
+pub fn face_crop_for_serving(
+    db_path: &Path,
+    face_id: i64,
+) -> AppResult<Option<(Option<String>, bool)>> {
+    let conn = open_conn(db_path)?;
+    let row = conn
+        .query_row(
+            "SELECT fd.crop_path, f.hidden_at
+             FROM face_detections fd
+             JOIN files f ON f.id = fd.file_id
+             WHERE fd.id = ?1 AND f.deleted_at IS NULL",
+            params![face_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<i64>>(1)?.is_some(),
+                ))
+            },
+        )
+        .ok();
+    Ok(row)
+}
+
 /// How many rows are hidden, optionally scoped to a set of roots.
 pub fn hidden_count(db_path: &Path, root_scope: &[i64]) -> AppResult<u64> {
     let conn = open_conn(db_path)?;

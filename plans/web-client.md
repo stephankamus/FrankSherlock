@@ -159,6 +159,10 @@ root.
 | `GET /api/media/{id}?w=1600` | derivado redimensionado, cacheado em disco |
 | `GET /manifest.webmanifest` | PWA para instalar no celular |
 
+O servidor já implementa todas as rotas acima exceto `?w=` e o manifest do PWA, que
+entram junto com a UI: hoje `/api/media/{id}` entrega o original com `Range` via
+`ServeFile`, e o manifest só faz sentido quando existe SPA para instalar.
+
 Regras de mídia:
 
 - `Range` obrigatório para vídeo (a lógica de [`video_server.rs`](sherlock/desktop/src-tauri/src/video_server.rs:58) é portada para axum).
