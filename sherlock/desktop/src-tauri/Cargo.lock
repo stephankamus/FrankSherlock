@@ -4683,12 +4683,18 @@ dependencies = [
 name = "sherlock_core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "hex",
  "image",
  "kamadak-exif",
+ "log",
  "regex",
  "reverse_geocoder",
  "rusqlite",
+ "rusqlite_migration",
  "serde",
+ "serde_json",
+ "sha2",
  "thiserror 2.0.20",
 ]
 

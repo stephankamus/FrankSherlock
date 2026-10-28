@@ -74,7 +74,7 @@ WEBKIT_DISABLE_DMABUF_RENDERER=1 GDK_BACKEND=wayland,x11 npm run tauri:dev
 | `face.rs` | Native ONNX face detection (SCRFD) and recognition (ArcFace), 512-dim embeddings, cosine clustering, person management |
 | `thumbnail.rs` | 300px JPEG thumbnails, Lanczos3, skip-if-exists, GIF first-frame |
 | `scan.rs` | Two-phase incremental scan: metadata-only discovery (zero reads for unchanged), classification + thumbnail processing, move detection, cache cleanup, cooperative cancellation |
-| `db.rs` | SQLite + FTS5, scan job checkpointing, upsert/move/delete operations |
+| `core/src/db.rs` | SQLite + FTS5, scan checkpointing, upsert/move/delete, search — shared with the web server |
 | `config.rs` | AppPaths resolution, directory creation |
 | `lib.rs` | Tauri commands, scan worker spawning, setup/download flow, auto-cleanup, scan cancellation |
 | `query_parser.rs` | Natural language query parsing (media type, dates, confidence) |

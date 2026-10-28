@@ -1,6 +1,5 @@
 mod classify;
 mod config;
-mod db;
 mod descriptions;
 mod face;
 mod llm;
@@ -19,9 +18,10 @@ mod vision_estimate;
 mod vision_prep;
 
 // Shared with the web server (`sherlock/core`): one parser, one set of row shapes, one
-// EXIF reader and one set of path rules. Re-exported under the old paths so no call
-// site had to change.
-pub use sherlock_core::{error, exif, query_parser, similarity};
+// EXIF reader, one set of path rules and — the point of the exercise — one `db` module,
+// so both sides run the same SQL. Re-exported under the old paths so no call site had to
+// change.
+pub use sherlock_core::{db, error, exif, query_parser, similarity};
 
 #[cfg(test)]
 mod bench_cost;

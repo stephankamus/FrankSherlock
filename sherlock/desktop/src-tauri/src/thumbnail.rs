@@ -1,10 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use sha2::{Digest, Sha256};
-
-use crate::platform::paths::normalize_rel_path;
-
 /// Result of thumbnail generation, including optional perceptual hash.
 pub struct ThumbnailResult {
     pub path: String,
@@ -59,27 +55,15 @@ fn downscale_to(img: image::DynamicImage, new_w: u32, new_h: u32) -> image::Dyna
     image::DynamicImage::ImageRgba8(image::imageops::thumbnail(&img, new_w.max(1), new_h.max(1)))
 }
 
-/// Directory prefix of the thumbnail cache that belongs to one root.
-///
-/// Derived from the canonical root path instead of `root_id`: removing a root and
-/// adding it back reuses the cache, and two roots can never resolve to the same
-/// file — which is what allowed one root's purge to delete another root's
-/// thumbnails.
-pub fn root_key(root_path: &str) -> String {
-    let digest = Sha256::digest(normalize_rel_path(root_path).as_bytes());
-    hex::encode(digest)[..16].to_string()
-}
+// Where a thumbnail lives is part of the index format — the web server has to compute
+// the same path to serve it — so the rule moved to the shared core. The encoding side
+// stays here.
+pub use sherlock_core::thumbnail::{root_key, thumb_path_in};
 
-/// Canonical path of the thumbnail for `rel_path` under `<thumbnails>/<root_key>`.
-pub fn thumb_path_for(thumbnails_dir: &Path, root_key: &str, rel_path: &str) -> PathBuf {
-    thumb_path_in(&thumbnails_dir.join(root_key), rel_path)
-}
-
-/// Thumbnail path for `rel_path` inside an already root-scoped directory.
-fn thumb_path_in(thumb_dir: &Path, rel_path: &str) -> PathBuf {
-    let stem = normalize_rel_path(&Path::new(rel_path).with_extension("jpg").to_string_lossy());
-    thumb_dir.join(stem)
-}
+// Only the tests (here and in `scan`) still name the root-scoped variant directly; the
+// production code went with `db` to the core.
+#[allow(unused_imports)]
+pub use sherlock_core::thumbnail::thumb_path_for;
 
 /// Create `<thumb_dir>/<rel_path>.jpg` as a hard link to an existing thumbnail.
 ///

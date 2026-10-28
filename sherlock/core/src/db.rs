@@ -504,7 +504,11 @@ fn db_page_stats(conn: &Connection) -> AppResult<(u64, u64)> {
     ))
 }
 
-#[cfg(test)]
+/// Register a root path, returning its id.
+///
+/// Not test-only: the desktop's `publish` and `scan` tests build fixtures through this
+/// function, and a fixture that hand-wrote the `roots` row would be a second definition
+/// of what a root is.
 pub fn upsert_root(db_path: &Path, root_path: &str) -> AppResult<i64> {
     let conn = open_conn(db_path)?;
     upsert_root_conn(&conn, root_path)
@@ -612,7 +616,7 @@ pub fn adopt_child_files(
         }
         let sub_prefix = child
             .strip_prefix(parent)
-            .map(|p| crate::platform::paths::normalize_rel_path(&p.to_string_lossy()))
+            .map(|p| crate::paths::normalize_rel_path(&p.to_string_lossy()))
             .unwrap_or_default();
         if sub_prefix.is_empty() {
             continue;
@@ -1746,7 +1750,7 @@ pub fn failed_classification_count(db_path: &Path, root_id: i64) -> AppResult<u6
 /// The row therefore keeps its `failure_kind` (so the reason is not lost) and its
 /// `classify_attempts` grows, while `classify_state` only becomes `failed` — and the
 /// row only leaves the backlog — once the budget is spent
-/// ([`crate::scan`]'s `MAX_CLASSIFY_ATTEMPTS`).
+/// ([`scan`]'s `MAX_CLASSIFY_ATTEMPTS`).
 pub fn record_classification_failure(
     db_path: &Path,
     file_id: i64,
@@ -2781,7 +2785,7 @@ pub fn reassign_to_parent_root(db_path: &Path, child_root_id: i64) -> AppResult<
     // Compute the prefix to prepend when moving files back to parent
     let sub_prefix = child
         .strip_prefix(std::path::Path::new(&parent_path))
-        .map(|p| crate::platform::paths::normalize_rel_path(&p.to_string_lossy()))
+        .map(|p| crate::paths::normalize_rel_path(&p.to_string_lossy()))
         .unwrap_or_default();
 
     let tx = conn.unchecked_transaction()?;
@@ -3172,7 +3176,7 @@ pub fn probe_roots(db_path: &Path) -> AppResult<Vec<RootInfo>> {
     let now = now_epoch_secs();
 
     for root in &roots {
-        let probe = crate::platform::fs::probe_dir(Path::new(&root.root_path), ROOT_PROBE_TIMEOUT);
+        let probe = crate::fs::probe_dir(Path::new(&root.root_path), ROOT_PROBE_TIMEOUT);
         if probe.is_dir {
             conn.execute(
                 "UPDATE roots SET availability = 'online', last_seen_at = ?1, last_error = NULL
@@ -3238,13 +3242,13 @@ pub fn relink_root(db_path: &Path, root_id: i64, new_path: &str) -> AppResult<()
         )
         .map_err(|_| AppError::InvalidPath(format!("root {root_id} does not exist")))?;
 
-    let new_prefix = crate::platform::paths::normalize_rel_path(new_path);
+    let new_prefix = crate::paths::normalize_rel_path(new_path);
     let new_prefix = new_prefix.trim_end_matches('/').to_string();
     if new_prefix.is_empty() {
         return Err(AppError::InvalidPath("empty path".into()));
     }
 
-    let old_prefix = crate::platform::paths::normalize_rel_path(&old_path);
+    let old_prefix = crate::paths::normalize_rel_path(&old_path);
     let old_prefix = old_prefix.trim_end_matches('/').to_string();
     if old_prefix == new_prefix {
         return Ok(());
@@ -3774,7 +3778,7 @@ fn search_images_normalized(
     }
 
     if let Some(ref dir) = parsed.subdir {
-        let normalized_dir = crate::platform::paths::normalize_rel_path(dir);
+        let normalized_dir = crate::paths::normalize_rel_path(dir);
         where_clauses.push("f.rel_path LIKE ?".to_string());
         bind_values.push(Value::Text(format!("{}/%", normalized_dir)));
     }
@@ -3932,7 +3936,7 @@ fn search_like_fallback(
     }
 
     if let Some(ref dir) = parsed.subdir {
-        let normalized_dir = crate::platform::paths::normalize_rel_path(dir);
+        let normalized_dir = crate::paths::normalize_rel_path(dir);
         where_clauses.push("f.rel_path LIKE ?".to_string());
         bind_values.push(Value::Text(format!("{}/%", normalized_dir)));
     }
@@ -5029,7 +5033,7 @@ pub fn list_faces_for_person(
     let faces = stmt
         .query_map(params![person_id], |row| {
             let rel_path: String = row.get(3)?;
-            let filename = crate::platform::paths::rel_path_filename(&rel_path).to_string();
+            let filename = crate::paths::rel_path_filename(&rel_path).to_string();
             Ok(crate::models::FaceInfo {
                 id: row.get(0)?,
                 person_id: row.get(1)?,
@@ -5661,7 +5665,7 @@ pub fn list_subdirectories(
     parent_prefix: &str,
 ) -> AppResult<Vec<SubdirEntry>> {
     let conn = open_conn(db_path)?;
-    let normalized = crate::platform::paths::normalize_rel_path(parent_prefix);
+    let normalized = crate::paths::normalize_rel_path(parent_prefix);
     let prefix = normalized.trim_end_matches('/');
 
     let (like_pattern, segment_start) = if prefix.is_empty() {
@@ -6499,7 +6503,7 @@ mod tests {
             root_id,
             rel_path: rel.to_string(),
             abs_path: format!("/tmp/demo/{rel}"),
-            filename: crate::platform::paths::rel_path_filename(rel).to_string(),
+            filename: crate::paths::rel_path_filename(rel).to_string(),
             media_type: "photo".to_string(),
             description: format!("desc of {rel}"),
             extracted_text: String::new(),

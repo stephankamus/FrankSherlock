@@ -202,21 +202,19 @@ Extração em passos seguros (os dois primeiros já estão feitos):
    reexportados no desktop sob os caminhos antigos.
 2. `core::models` com os row shapes; `ScanContext`, `VisionSettings`, `ScanOverrides` e
    `RuntimeStatus` ficam em `desktop::models` porque dependem de `config` e `platform`.
-3. **`db.rs` não pode ser movido inteiro.** A inspeção mostrou que ele chama
-   `classify::derived_confidence` (backfill de confiança) e `face::{FaceDetection,
-   embedding_to_blob, blob_to_embedding, cosine_similarity}` (gravação de rostos e
-   clustering). Mover o arquivo arrastaria o `ort`/ONNX Runtime — e o `pdfium-render`, via
-   outras rotas — para dentro do crate que o container precisa compilar. O certo é extrair
-   só o **subconjunto de leitura** para `core::library`: `open_conn`, `search_images` e seus
-   helpers (FTS, datas, mídia), `list_roots`, `list_subdirectories`, `list_albums`,
-   `list_smart_folders`, `list_persons`, `list_files_with_faces`, `list_faces_for_person`,
-   `find_duplicates`, `get_file_metadata`, `get_file_properties`, `hidden_count` e
-   `attach_raw_provenance`. Nenhuma dessas toca `face`/`classify`, e todas são
-   `fn(db_path: &Path, …)`.
-4. O desktop mantém o lado de escrita no `db.rs` e faz `pub use sherlock_core::library::{…}`
-   para que todo `crate::db::search_images` continue resolvendo — os testes existentes
-   seguem no `db.rs` sem alteração. O `crate::platform::paths` usado por ele precisa virar
-   `crate::paths` no core (mesma função, caminho novo).
+3. **`db.rs` move inteiro, mas só depois de tirar as dependências impuras.** A primeira
+   inspeção mostrou que ele chama `classify::derived_confidence` (backfill de confiança) e
+   `face::{FaceDetection, embedding_to_blob, blob_to_embedding, cosine_similarity}`
+   (gravação de rostos e clustering). Mover o arquivo assim arrastaria o `ort`/ONNX Runtime
+   para o crate que o container precisa compilar — o oposto do objetivo. A saída foi mover
+   primeiro os itens **puros**, que são formato de índice e não inferência: o modelo de
+   confiança (`classify::{ParseKind, VALID_MEDIA_TYPES, derived_confidence}`), o tipo de
+   detecção e a álgebra dos embeddings (`face`), e a regra de caminho das thumbnails
+   (`thumbnail::{root_key, thumb_path_for}`). Com isso `db.rs` e `platform/fs.rs` (o probe
+   com timeout usado por `probe_roots`) vão inteiros para o core.
+4. O desktop vira reexport: `pub use sherlock_core::{db, exif, …}` no `lib.rs` e reexports em
+   `platform/{paths,fs}.rs`, `face.rs`, `classify.rs` e `thumbnail.rs`. Nenhum call site
+   mudou, e os ~150 testes de banco foram junto sem serem reescritos.
 5. `web::server` depende de `core` e nunca de `src-tauri`.
 
 No frontend, o único acoplamento real com Tauri são `invoke` e `convertFileSrc` — hoje

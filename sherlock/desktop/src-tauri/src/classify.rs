@@ -200,15 +200,10 @@ const RECEIPT_PROMPT: &str = concat!(
     " OCR text:\n",
 );
 
-const VALID_MEDIA_TYPES: &[&str] = &[
-    "screenshot",
-    "anime",
-    "manga",
-    "photo",
-    "document",
-    "artwork",
-    "other",
-];
+// The confidence model and the vocabulary it is predicated on are part of the index
+// format (`files.confidence`, `files.media_type`), not of the Ollama client, so they
+// live in the shared core. Re-exported here so the call sites below are unchanged.
+pub use sherlock_core::classify::{derived_confidence, ParseKind, VALID_MEDIA_TYPES};
 
 /// What the model is allowed to answer for `document_photo`.
 ///
@@ -634,58 +629,6 @@ pub fn primary_ctx_for(
 /// after four failures, and the reason is exactly what a retry has to be aimed at —
 /// so the first pass reports it instead of only logging it.
 type PrimaryOutcome = (Value, Option<&'static str>, ParseKind);
-
-/// How the first pass arrived at its answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ParseKind {
-    /// Valid JSON with a `media_type` on the first attempt.
-    Strict,
-    /// Recovered from the body text by [`salvage_primary_from_raw`].
-    Salvaged,
-    /// Nothing usable came back; the value is the safe default object.
-    Default,
-}
-
-/// A confidence number the **pipeline** can justify.
-///
-/// The model's own `confidence` field was removed from the primary schema after job #35
-/// (2026-10-28) measured **22,809 of 36,744** described rows at exactly 0.0: the schema
-/// showed `"confidence":0.0` and the model copied that literal at temperature 0. A number
-/// the model supplies cannot measure the model's own certainty, so the score is derived
-/// from evidence that exists outside the answer:
-///
-/// - how the answer was obtained (strict JSON > salvage);
-/// - whether `media_type` came back as one of the values we accept;
-/// - whether the description has a usable length;
-/// - whether a second signal corroborated it (OCR text, or a confirmed document kind).
-///
-/// `Default` returns exactly 0.0, which is what keeps [`is_empty_result`] honest: a row
-/// with no description must stay pending, not be stored with a small score.
-///
-/// The ceiling is 0.95 on purpose — nothing the model says is certain enough for 1.0.
-pub fn derived_confidence(
-    parse: ParseKind,
-    media_type: &str,
-    description: &str,
-    corroborated: bool,
-) -> f32 {
-    let mut score: f32 = match parse {
-        ParseKind::Strict => 0.80,
-        ParseKind::Salvaged => 0.55,
-        ParseKind::Default => return 0.0,
-    };
-    if media_type == "other" || !VALID_MEDIA_TYPES.contains(&media_type) {
-        score -= 0.15;
-    }
-    let words = description.split_whitespace().count();
-    if !(3..=24).contains(&words) {
-        score -= 0.10;
-    }
-    if corroborated {
-        score += 0.10;
-    }
-    score.clamp(0.05, 0.95)
-}
 
 /// Why a request produced nothing, as a short taxonomy.
 ///

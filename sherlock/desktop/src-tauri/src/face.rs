@@ -16,14 +16,16 @@ use crate::error::{AppError, AppResult};
 
 // ── Public types ────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
-pub struct FaceDetection {
-    pub bbox: [f32; 4], // [x1, y1, x2, y2] in original image coords
-    pub confidence: f32,
-    #[allow(dead_code)] // Used during alignment, stored for future face crop display
-    pub keypoints: [[f32; 2]; 5], // left_eye, right_eye, nose, left_mouth, right_mouth
-    pub embedding: Vec<f32>, // 512-dim ArcFace embedding
-}
+// The detection shape and the embedding math are part of the index format — they are
+// what `face_detections` stores — so they live in the shared core. Re-exported here so
+// every `crate::face::…` path keeps resolving.
+//
+// The three helpers are used by the tests below and by `db` (which now lives in the
+// core); the non-test build of this crate only needs `FaceDetection`, hence the allow.
+#[allow(unused_imports)]
+pub use sherlock_core::face::{
+    blob_to_embedding, cosine_similarity, embedding_to_blob, FaceDetection,
+};
 
 pub struct FaceDetector {
     scrfd_session: Session,
@@ -1017,30 +1019,7 @@ where
 }
 
 // ── Embedding helpers ───────────────────────────────────────────────
-
-pub fn embedding_to_blob(embedding: &[f32]) -> Vec<u8> {
-    embedding.iter().flat_map(|f| f.to_le_bytes()).collect()
-}
-
-pub fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
-    blob.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
-}
-
-pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm_a < 1e-10 || norm_b < 1e-10 {
-        0.0
-    } else {
-        dot / (norm_a * norm_b)
-    }
-}
+// Moved to `sherlock_core::face` and re-exported at the top of this module.
 
 // ── Tests ───────────────────────────────────────────────────────────
 

@@ -10,9 +10,14 @@
 //! re-export in the desktop crate — the modules themselves are already stateless
 //! (`fn(db_path: &Path)` everywhere), so nothing here ever learned about Tauri.
 
+pub mod classify;
+pub mod db;
 pub mod error;
 pub mod exif;
+pub mod face;
+pub mod fs;
 pub mod models;
 pub mod paths;
 pub mod query_parser;
 pub mod similarity;
+pub mod thumbnail;
