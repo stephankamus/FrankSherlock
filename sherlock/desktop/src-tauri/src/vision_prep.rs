@@ -29,10 +29,18 @@ pub struct PreparedImage {
     pub path: PathBuf,
     /// Original file. OCR engines that need full resolution use this instead.
     pub source: PathBuf,
+    /// Dimensions of the file that will be uploaded (after the downscale).
     pub width: u32,
     pub height: u32,
-    /// Size of the file on disk before preparation (used by tests and logs).
-    #[allow(dead_code)]
+    /// Dimensions of the source before preparation.
+    ///
+    /// They are what the resolution floor is decided on (`min_pixels` compares these,
+    /// not the prepared size), so they belong next to the prepared ones in the log: a
+    /// 4000x3000 photo uploads as 768x576 and ~70 KB, which reads like a tiny file and
+    /// looks like the floor was ignored.
+    pub source_width: u32,
+    pub source_height: u32,
+    /// Size of the file on disk before preparation.
     pub original_bytes: u64,
     /// Size of the bytes that will actually be uploaded.
     pub prepared_bytes: u64,
@@ -137,6 +145,8 @@ fn passthrough(source: &Path, original_bytes: u64, width: u32, height: u32) -> P
         source: source.to_path_buf(),
         width,
         height,
+        source_width: width,
+        source_height: height,
         original_bytes,
         prepared_bytes: original_bytes,
         temp: false,
@@ -258,6 +268,8 @@ pub fn prepare_from_decoded(
         source: source.to_path_buf(),
         width: out_w,
         height: out_h,
+        source_width: w,
+        source_height: h,
         original_bytes,
         prepared_bytes,
         temp: true,

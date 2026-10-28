@@ -1357,11 +1357,18 @@ pub struct BacklogTick {
 /// One file handed from the producer to the consumer.
 struct BacklogItem {
     row: db::BacklogRow,
-    /// Ready-to-upload JPEG. `None` for video/PDF (legacy path) and for rows that
-    /// only needed a thumbnail.
+    /// Ready-to-upload JPEG. `None` for video/PDF (legacy path), for rows that only
+    /// needed a thumbnail, and for rows the producer already matched to a donor.
     prepared: Option<vision_prep::PreparedImage>,
     /// Perceptual hash of the decoded image, for the near-duplicate index.
     dhash: Option<u64>,
+    /// Donor the producer already found for this row, with the Hamming distance.
+    ///
+    /// A `Some` here means the JPEG and the face detections were deliberately
+    /// skipped: the row is going to inherit the donor's description and faces, so
+    /// encoding a picture the model will never see and running SCRFD on it would
+    /// both be thrown away by [`db::copy_faces`].
+    dedupe_hint: Option<(i64, u32)>,
     /// Video/PDF keep the legacy classification path: their frames or pages come
     /// from ffmpeg/pdfium, which this iteration does not share.
     legacy: bool,
@@ -1666,6 +1673,8 @@ fn produce_backlog_items(
     moves: Option<&MoveIndex>,
     faces_enabled: bool,
     face_threads: usize,
+    // Shared near-duplicate index. `None` in the tests that do not care about it.
+    dedupe: Option<&std::sync::RwLock<DedupeIndex>>,
 ) {
     let vision = ctx.vision_settings();
     // Must match [`crate::classify::effective_profile`]: the deferral check below
@@ -1759,6 +1768,33 @@ fn produce_backlog_items(
                         legacy: false,
                         failed: true,
                         skipped: false,
+                        dedupe_hint: None,
+                    };
+                    if tx.send(item).is_err() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        }
+
+        // A row that kept its thumbnail hash can be recognised as a near-duplicate
+        // without opening the image at all: `stamp_modified_rows` clears `dhash`
+        // whenever the bytes change, so a stored hash describes the file on disk now.
+        // This is what turns a duplicated album from "decode + encode + SCRFD, then
+        // throw it all away" into one hard link and one `UPDATE`.
+        if row.needs_classification && matches!(row.media_type.as_str(), "photo" | "screenshot") {
+            let stored = row.dhash.map(|hash| hash as u64);
+            if let Some(hint) = stored.and_then(|hash| dedupe_hint_for(dedupe, hash)) {
+                if dedupe_thumbnail_ready(ctx, root_id, thumb_dir, &row, hint.0, counters) {
+                    let item = BacklogItem {
+                        row,
+                        prepared: None,
+                        dhash: stored,
+                        legacy: false,
+                        failed: false,
+                        skipped: false,
+                        dedupe_hint: Some(hint),
                     };
                     if tx.send(item).is_err() {
                         break;
@@ -1790,6 +1826,7 @@ fn produce_backlog_items(
                 legacy: true,
                 failed: false,
                 skipped: false,
+                dedupe_hint: None,
             };
             if tx.send(item).is_err() {
                 break;
@@ -1810,6 +1847,7 @@ fn produce_backlog_items(
                 legacy: false,
                 failed: true,
                 skipped: false,
+                dedupe_hint: None,
             };
             if tx.send(item).is_err() {
                 break;
@@ -1868,8 +1906,25 @@ fn produce_backlog_items(
                 < u64::from(ctx.min_pixels);
         if below_floor && row.needs_classification {
             counters.skipped.fetch_add(1, Ordering::Relaxed);
+            log::debug!(
+                "Backlog: {} is below the floor (source {}x{} = {} px < {} px)",
+                row.rel_path,
+                decoded.image.width(),
+                decoded.image.height(),
+                u64::from(decoded.image.width()) * u64::from(decoded.image.height()),
+                ctx.min_pixels
+            );
         }
-        let prepared = if row.needs_classification && !below_floor {
+        // Asked before the two expensive steps below: a row that is going to inherit
+        // a description needs neither the vision JPEG (the model never sees it) nor
+        // the SCRFD pass — `copy_faces` deletes what this thread stored and copies the
+        // donor's rows. On job #35 those two were the entire cost of a deduped row.
+        let dedupe_hint = if row.needs_classification && !below_floor {
+            dedupe_hint_for(dedupe, dhash)
+        } else {
+            None
+        };
+        let prepared = if row.needs_classification && !below_floor && dedupe_hint.is_none() {
             match vision_prep::prepare_from_decoded(
                 abs,
                 row.size_bytes.max(0) as u64,
@@ -1892,13 +1947,17 @@ fn produce_backlog_items(
         } else {
             None
         };
-        let failed = row.needs_classification && prepared.is_none() && !below_floor;
+        let failed = row.needs_classification
+            && prepared.is_none()
+            && !below_floor
+            && dedupe_hint.is_none();
 
         // Faces, on the buffer that is already in memory — no second read, no second
         // decode. Off unless the scan was started with `face_detection`; rows left
         // here keep `faces_scanned_at = NULL` and are exactly what Detect Faces picks
-        // up later.
-        if faces_enabled && row.needs_faces() {
+        // up later. A row with a donor skips it: the detections would be replaced by
+        // the donor's rows on the consumer side anyway.
+        if faces_enabled && row.needs_faces() && dedupe_hint.is_none() {
             faces_for_row(
                 ctx,
                 &row,
@@ -1921,9 +1980,72 @@ fn produce_backlog_items(
             legacy: false,
             failed,
             skipped: below_floor,
+            dedupe_hint,
         };
         if tx.send(item).is_err() {
             break;
+        }
+    }
+}
+
+/// Donor for `dhash`, with the Hamming distance, from the shared dedupe index.
+///
+/// A poisoned lock yields `None` instead of panicking: the pass then does the full
+/// work for that row, which is exactly what it did before the index was shared.
+fn dedupe_hint_for(
+    dedupe: Option<&std::sync::RwLock<DedupeIndex>>,
+    dhash: u64,
+) -> Option<(i64, u32)> {
+    let index = dedupe?.read().ok()?;
+    index.representative_for_hash(dhash)
+}
+
+/// Give a row that is about to inherit a classification its thumbnail pointer.
+///
+/// The row still needs a picture in the grid and the donor already has the same one:
+/// linking it costs a `stat` and an `UPDATE` instead of a decode plus a JPEG encode.
+/// Returns `false` when there is nothing to link, so the caller takes the normal path
+/// and builds the thumbnail from the source.
+fn dedupe_thumbnail_ready(
+    ctx: &ScanContext,
+    root_id: i64,
+    thumb_dir: &Path,
+    row: &db::BacklogRow,
+    donor: i64,
+    counters: &BacklogCounters,
+) -> bool {
+    let thumb_missing = match row.thumb_path.as_deref() {
+        Some(path) => !Path::new(path).exists(),
+        None => true,
+    };
+    if !thumb_missing {
+        return true;
+    }
+    counters.thumbs_needed.fetch_add(1, Ordering::Relaxed);
+    let Some(shared) = db::thumb_path_for_file(&ctx.db_path, donor)
+        .ok()
+        .flatten()
+    else {
+        return false;
+    };
+    let Some(reused) =
+        thumbnail::reuse_thumbnail(Path::new(&shared), None, thumb_dir, &row.rel_path)
+    else {
+        return false;
+    };
+    match db::update_file_thumb_and_dhash(&ctx.db_path, root_id, &row.rel_path, &reused.path, None)
+    {
+        Ok(()) => {
+            counters.thumbnailed.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        Err(e) => {
+            log::warn!(
+                "Backlog: could not record the reused thumbnail for {}: {e}",
+                row.rel_path
+            );
+            counters.failed.fetch_add(1, Ordering::Relaxed);
+            false
         }
     }
 }
@@ -2511,11 +2633,22 @@ fn run_pipeline_blocks(
     )?;
 
     let cancelled = || cancel_flag.is_some_and(|flag| flag.load(Ordering::Relaxed));
-    let mut dedupe = DedupeIndex::seed(db_path, job.root_id, ctx.dedupe_dhash_distance)?;
+    // Shared with the producer on purpose. The consumer stays the only writer, but a
+    // producer that can *read* the index decides a near-duplicate before encoding a
+    // JPEG the model will never see and running SCRFD on faces it is going to replace.
+    let dedupe = std::sync::RwLock::new(DedupeIndex::seed(
+        db_path,
+        job.root_id,
+        ctx.dedupe_dhash_distance,
+    )?);
     let counters = BacklogCounters::default();
     let mut processed: u64 = 0;
     let mut classified: u64 = 0;
     let mut deduped: u64 = 0;
+    // Reuse lines name the donor by path, but the row is looked up once per donor
+    // instead of once per reuse: a duplicated album points thousands of rows at a
+    // few hundred representatives.
+    let mut donor_paths: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
     // A systemic failure — Ollama down, or the model runner dying on every
     // request — would otherwise grind through thousands of files producing
     // nothing. One bad file does not look like this; 25 in a row does.
@@ -2543,6 +2676,9 @@ fn run_pipeline_blocks(
     let thumb_dir = ctx.thumb_dir_for(&thumbnail::root_key(&job.root_path));
     let thumb_dir_ref: &Path = &thumb_dir;
     let counters_ref = &counters;
+    // A shared reference travels into the spawned producers; the `RwLock` itself stays
+    // owned by this scope so the consumer can keep writing to it.
+    let dedupe_ref: &std::sync::RwLock<DedupeIndex> = &dedupe;
     let root_id = job.root_id;
     let ctx_ref = ctx;
 
@@ -2620,6 +2756,7 @@ fn run_pipeline_blocks(
                             moves,
                             faces_enabled,
                             face_threads,
+                            Some(dedupe_ref),
                         );
                     }))
                     .is_ok();
@@ -2636,9 +2773,14 @@ fn run_pipeline_blocks(
                     break;
                 }
 
+                // Whether the model actually answered this row. Declared here because the
+                // circuit breaker below reads it, and set only on the paths that really
+                // spent a request.
+                let mut answered = false;
                 let item_ok = if item.legacy {
                     classify_and_update(ctx, item.row.id, &item.row.abs_path);
                     classified += 1;
+                    answered = true;
                     true
                 } else if item.failed {
                     // The producer already counted it in `unreadable`. Returning `true`
@@ -2650,12 +2792,17 @@ fn run_pipeline_blocks(
                     // Below the resolution floor: no request was made, so nothing can
                     // have failed. `true` keeps it out of the circuit breaker.
                     true
-                } else if let Some(prepared) = item.prepared.as_ref() {
-                    let representative = item
-                        .dhash
-                        .and_then(|dhash| dedupe.representative_for_hash(dhash));
+                } else {
+                    // The producer may already know the donor — it asks this same index
+                    // after decoding, and before decoding at all when the row still had
+                    // its thumbnail hash — and then the item arrives without a prepared
+                    // image on purpose.
+                    let representative = item.dedupe_hint.or_else(|| {
+                        item.dhash
+                            .and_then(|dhash| dedupe_hint_for(Some(&dedupe), dhash))
+                    });
                     match representative {
-                        Some(representative) => {
+                        Some((representative, distance)) => {
                             if db::copy_classification(db_path, item.row.id, representative).is_ok()
                             {
                                 // The duplicate is the same picture, so its faces are
@@ -2675,50 +2822,93 @@ fn run_pipeline_blocks(
                                 // `processed` on its own. Without it a pass left ~4,700
                                 // rows (job #35) that were processed but never logged, and
                                 // the only place that knew about them was the summary.
+                                //
+                                // The donor's path and the Hamming distance belong in the
+                                // line: a bare `#57460` cannot be checked by whoever reads
+                                // the log, and `distance 6/64` is a marginal neighbour, not
+                                // the same picture stored twice. Without both, a correct
+                                // reuse and a false positive look identical.
+                                let donor = donor_paths
+                                    .entry(representative)
+                                    .or_insert_with(|| {
+                                        db::file_rel_path(db_path, representative)
+                                            .ok()
+                                            .flatten()
+                                            .unwrap_or_else(|| format!("#{representative}"))
+                                    })
+                                    .as_str();
                                 log::info!(
-                                    "Reused classification: {} (near-duplicate of file #{representative})",
-                                    item.row.rel_path
+                                    "Reused classification: {} (near-duplicate of {donor}, \
+                                     dHash distance {distance}/64 of {} allowed)",
+                                    item.row.rel_path,
+                                    ctx.dedupe_dhash_distance
                                 );
                                 deduped += 1;
                                 true
-                            } else if classify_prepared_and_update(
-                                ctx,
-                                item.row.id,
-                                &item.row.abs_path,
-                                prepared,
-                            ) {
-                                classified += 1;
-                                true
-                            } else {
-                                counters.failed.fetch_add(1, Ordering::Relaxed);
-                                false
-                            }
-                        }
-                        None => {
-                            if classify_prepared_and_update(
-                                ctx,
-                                item.row.id,
-                                &item.row.abs_path,
-                                prepared,
-                            ) {
-                                classified += 1;
-                                if let Some(dhash) = item.dhash {
-                                    dedupe.insert(dhash, item.row.id);
+                            } else if let Some(prepared) = item.prepared.as_ref() {
+                                if classify_prepared_and_update(
+                                    ctx,
+                                    item.row.id,
+                                    &item.row.abs_path,
+                                    prepared,
+                                ) {
+                                    classified += 1;
+                                    answered = true;
+                                    true
+                                } else {
+                                    counters.failed.fetch_add(1, Ordering::Relaxed);
+                                    false
                                 }
-                                true
                             } else {
+                                // Nothing was prepared because the copy was expected to
+                                // succeed. Leaving the row pending is the cheapest correct
+                                // outcome: the next pass retries it.
+                                log::warn!(
+                                    "Backlog: could not copy the classification of {} from file #{representative}; left pending",
+                                    item.row.rel_path
+                                );
                                 counters.failed.fetch_add(1, Ordering::Relaxed);
                                 false
                             }
                         }
+                        None => match item.prepared.as_ref() {
+                            Some(prepared) => {
+                                if classify_prepared_and_update(
+                                    ctx,
+                                    item.row.id,
+                                    &item.row.abs_path,
+                                    prepared,
+                                ) {
+                                    classified += 1;
+                                    answered = true;
+                                    if let Some(dhash) = item.dhash {
+                                        if let Ok(mut index) = dedupe.write() {
+                                            index.insert(dhash, item.row.id);
+                                        }
+                                    }
+                                    true
+                                } else {
+                                    counters.failed.fetch_add(1, Ordering::Relaxed);
+                                    false
+                                }
+                            }
+                            // Thumbnail-only row: nothing left that can fail here.
+                            None => true,
+                        },
                     }
-                } else {
-                    // Thumbnail-only row: nothing left that can fail here.
-                    true
                 };
 
                 if item_ok {
-                    consecutive_failures = 0;
+                    // Only a real answer clears the breaker. A reused classification, a
+                    // skipped row and a thumbnail-only row say nothing about the runner,
+                    // and letting them reset it is how a wedged model survived an entire
+                    // block on job #35 (2026-10-28): every row that needed a request came
+                    // back with the zero-value frame, the deduped ones "succeeded", and
+                    // the pass kept paying the unload/reload dance for every remaining
+                    // file instead of aborting.
+                    if answered {
+                        consecutive_failures = 0;
+                    }
                 } else {
                     consecutive_failures += 1;
                     if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
@@ -3037,16 +3227,18 @@ impl DedupeIndex {
         }
     }
 
-    /// Representative for a raw dHash.
+    /// Representative for a raw dHash, with the distance that matched.
     ///
     /// The backlog pipeline has no `UnclassifiedFile`: it knows the hash and
     /// whether the row is a still image from the file itself, not from a
-    /// pre-classification `media_type`.
-    fn representative_for_hash(&self, dhash: u64) -> Option<i64> {
+    /// pre-classification `media_type`. The distance travels to the caller because
+    /// it is the only thing that tells a real duplicate from a neighbour at the
+    /// edge of the threshold once the reuse is in the log.
+    fn representative_for_hash(&self, dhash: u64) -> Option<(i64, u32)> {
         if self.is_disabled() {
             return None;
         }
-        self.index.find_near(dhash, self.threshold)
+        self.index.find_near_with_distance(dhash, self.threshold)
     }
 
     fn insert(&mut self, dhash: u64, file_id: i64) {
@@ -3993,6 +4185,7 @@ mod tests {
             None,
             false,
             FACE_THREADS_WITH_GPU_WORK,
+            None,
         );
 
         let item = rx.try_recv().expect("one item for one row");
@@ -4047,6 +4240,7 @@ mod tests {
             None,
             false,
             FACE_THREADS_WITH_GPU_WORK,
+            None,
         );
 
         assert!(
@@ -4140,6 +4334,7 @@ mod tests {
             None,
             false,
             FACE_THREADS_WITH_GPU_WORK,
+            None,
         );
 
         assert!(
@@ -4186,6 +4381,7 @@ mod tests {
             None,
             false,
             FACE_THREADS_WITH_GPU_WORK,
+            None,
         );
         assert!(
             rx.try_recv().is_ok(),
@@ -4216,8 +4412,12 @@ mod tests {
             index: crate::similarity::DhashIndex::new(),
         };
         index.insert(0b1010, 7);
-        assert_eq!(index.representative_for_hash(0b1010), Some(7));
-        assert_eq!(index.representative_for_hash(0b1011), Some(7));
+        assert_eq!(index.representative_for_hash(0b1010), Some((7, 0)));
+        assert_eq!(
+            index.representative_for_hash(0b1011),
+            Some((7, 1)),
+            "the line has to carry how far the match was, not only who it was"
+        );
         assert_eq!(index.representative_for_hash(u64::MAX), None);
     }
 
@@ -4297,6 +4497,7 @@ mod tests {
             media_type: "photo".to_string(),
             needs_classification: pending,
             thumb_path: thumb.then(|| format!("/thumbs/{rel}")),
+            dhash: None,
             image_width: dims.map(|d| d.0),
             image_height: dims.map(|d| d.1),
             fingerprint: String::new(),
@@ -4404,6 +4605,7 @@ mod tests {
             None,
             true,
             FACE_THREADS_WITH_GPU_WORK,
+            None,
         );
 
         assert!(
@@ -4483,6 +4685,160 @@ mod tests {
             ..candidate
         };
         assert_eq!(dedupe.representative_for(&far), None);
+    }
+
+    /// A video already in the database has a `dhash` (one keyframe), and the seed
+    /// used to insert it like any other row. A photo within a few bits then copied
+    /// the video's description during a backlog pass.
+    #[test]
+    fn dedupe_seed_ignores_video_donors() {
+        let db_dir = tempfile::tempdir().expect("dbdir");
+        let db_path = db_dir.path().join("index.sqlite");
+        db::init_database(&db_path).expect("init");
+        let root_id = db::upsert_root(&db_path, "/tmp/dedupe").expect("root");
+        db::upsert_file_record(
+            &db_path,
+            &crate::models::FileRecordUpsert {
+                root_id,
+                rel_path: "clip.mp4".to_string(),
+                abs_path: "/tmp/dedupe/clip.mp4".to_string(),
+                filename: "clip.mp4".to_string(),
+                media_type: "video".to_string(),
+                description: "a dog running on the beach".to_string(),
+                extracted_text: String::new(),
+                canonical_mentions: String::new(),
+                confidence: 0.8,
+                lang_hint: "en".to_string(),
+                mtime_ns: 1,
+                size_bytes: 1,
+                fingerprint: "fp-video".to_string(),
+                scan_marker: 1,
+                location_text: String::new(),
+                dhash: Some(42),
+                duration_secs: Some(12.0),
+                video_width: None,
+                video_height: None,
+                video_codec: None,
+                audio_codec: None,
+            },
+        )
+        .expect("insert");
+
+        let dedupe = DedupeIndex::seed(&db_path, root_id, 6).expect("seed");
+        assert_eq!(
+            dedupe.len(),
+            0,
+            "a keyframe hash must not become a donor for still photos"
+        );
+    }
+
+    /// The fast path: a row that kept its thumbnail hash is matched against the index
+    /// *before* the image is opened, so a duplicated album costs a hard link and an
+    /// `UPDATE` instead of a decode, a JPEG encode and a SCRFD pass.
+    #[test]
+    fn dedupe_fast_path_skips_decode_and_prepare() {
+        let (ctx, root_id, root_path, _dirs) = backlog_fixture();
+        let db_path = ctx.db_path.clone();
+        let thumb_dir = ctx.thumb_dir_for(&thumbnail::root_key(&root_path));
+        std::fs::create_dir_all(&thumb_dir).expect("thumb dir");
+
+        // A donor classified in an earlier run, plus the JPEG it already has.
+        let shared = thumb_dir.join("donor.jpg");
+        std::fs::write(&shared, b"jpeg").expect("shared thumbnail");
+        let donor_id = db::upsert_file_record(
+            &db_path,
+            &crate::models::FileRecordUpsert {
+                root_id,
+                rel_path: "donor.png".to_string(),
+                abs_path: format!("{root_path}/donor.png"),
+                filename: "donor.png".to_string(),
+                media_type: "photo".to_string(),
+                description: "a beach at sunset".to_string(),
+                extracted_text: String::new(),
+                canonical_mentions: String::new(),
+                confidence: 0.9,
+                lang_hint: "en".to_string(),
+                mtime_ns: 1,
+                size_bytes: 1,
+                fingerprint: "fp-donor".to_string(),
+                scan_marker: 1,
+                location_text: String::new(),
+                dhash: Some(42),
+                duration_secs: None,
+                video_width: None,
+                video_height: None,
+                video_codec: None,
+                audio_codec: None,
+            },
+        )
+        .expect("donor");
+        db::update_file_thumb_and_dhash(
+            &db_path,
+            root_id,
+            "donor.png",
+            shared.to_str().expect("utf8"),
+            Some(42),
+        )
+        .expect("donor thumbnail");
+
+        // The row under test keeps the hash of a thumbnail it already had, but the file
+        // it pointed at is gone — the state after a purge of the cache.
+        db::update_file_thumb_and_dhash(&db_path, root_id, "a.png", "/nonexistent/a.jpg", Some(42))
+            .expect("target hash");
+
+        let dedupe = std::sync::RwLock::new(DedupeIndex::seed(&db_path, root_id, 6).expect("seed"));
+        assert_eq!(dedupe.read().expect("lock").len(), 1);
+
+        let rows = db::list_backlog_rows(&db_path, root_id, false).expect("backlog");
+        assert_eq!(rows.len(), 1, "only the pending row needs a visit");
+
+        let counters = BacklogCounters::default();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<BacklogItem>(4);
+        produce_backlog_items(
+            tx,
+            &ctx,
+            root_id,
+            &thumb_dir,
+            &block_of(rows, crate::llm::MIN_NUM_CTX),
+            None,
+            &counters,
+            0,
+            None,
+            true,
+            FACE_THREADS_WITH_GPU_WORK,
+            Some(&dedupe),
+        );
+
+        let item = rx.try_recv().expect("one item for one row");
+        assert_eq!(
+            item.dedupe_hint,
+            Some((donor_id, 0)),
+            "the producer must recognise the donor without decoding"
+        );
+        assert!(
+            item.prepared.is_none(),
+            "no JPEG for a row that is going to inherit a description"
+        );
+        assert!(!item.failed, "a deduped row is not a failure");
+        assert_eq!(
+            counters.faces.load(Ordering::Relaxed),
+            0,
+            "SCRFD must not run on a row that copies the donor's faces"
+        );
+
+        let target = db::list_backlog_rows(&db_path, root_id, false)
+            .expect("backlog")
+            .into_iter()
+            .find(|row| row.rel_path == "a.png")
+            .expect("target row");
+        assert!(
+            target
+                .thumb_path
+                .as_deref()
+                .is_some_and(|path| Path::new(path).exists()),
+            "the donor thumbnail must be linked, not regenerated"
+        );
+        assert_eq!(counters.thumbnailed.load(Ordering::Relaxed), 1);
     }
 
     /// An unreadable file must not abort the job: the scan completes and the
@@ -5259,6 +5615,7 @@ mod tests {
             Some(&moves),
             false,
             FACE_THREADS_WITH_GPU_WORK,
+            None,
         );
         let items: Vec<BacklogItem> = rx.try_iter().collect();
         assert_eq!(items.len(), 2);

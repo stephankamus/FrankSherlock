@@ -50,6 +50,16 @@ impl DhashIndex {
 
     /// Closest indexed file within `threshold` bits, if any.
     pub fn find_near(&self, dhash: u64, threshold: u32) -> Option<i64> {
+        self.find_near_with_distance(dhash, threshold)
+            .map(|(file_id, _)| file_id)
+    }
+
+    /// Closest indexed file within `threshold` bits, with the distance that matched.
+    ///
+    /// The distance is what separates a real duplicate (0-2 bits: the same picture
+    /// stored twice) from a marginal neighbour sitting at the edge of the threshold,
+    /// so a reuse can be audited from the log instead of from the database.
+    pub fn find_near_with_distance(&self, dhash: u64, threshold: u32) -> Option<(i64, u32)> {
         let mut best: Option<(u32, i64)> = None;
         for band in 0..DEDUPE_BANDS {
             let Some(candidates) = self.bands[band].get(&Self::band_key(dhash, band)) else {
@@ -62,7 +72,7 @@ impl DhashIndex {
                 }
             }
         }
-        best.map(|(_, file_id)| file_id)
+        best.map(|(dist, file_id)| (file_id, dist))
     }
 
     /// Number of indexed hashes.

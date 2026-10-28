@@ -696,7 +696,17 @@ pub fn derived_confidence(
 /// does not parse, and the transport errors.
 fn failure_kind_from(raw: &str) -> &'static str {
     let lower = raw.to_ascii_lowercase();
-    if lower.contains("exceeds the available context size") {
+    // The zero-value frame wins over everything else: the runner answered without
+    // doing any work, so a `token repeat limit` that follows it was produced by the
+    // wedged model, not by the picture. Keeping this branch first is what stops a
+    // runner wedge from being filed as a permanent `repeat_limit`.
+    if lower.starts_with("empty_frame:")
+        || lower.contains("\"model\":\"\"")
+        || lower.contains("done=false")
+    {
+        // The Go zero-value frame: the runner never saw the request (§5.7.5).
+        "empty_frame"
+    } else if lower.contains("exceeds the available context size") {
         "ctx_overflow"
     } else if lower.contains("token repeat limit") {
         "repeat_limit"
@@ -704,14 +714,27 @@ fn failure_kind_from(raw: &str) -> &'static str {
         "io"
     } else if lower.contains("timed out") || lower.contains("timeout") {
         "timeout"
-    } else if lower.contains("\"model\":\"\"") || lower.contains("done=false") {
-        // The Go zero-value frame: the runner never saw the request (§5.7.5).
-        "empty_frame"
     } else if raw.trim().is_empty() {
         "no_response"
     } else {
         "parse"
     }
+}
+
+/// Failure kind for a primary that produced nothing, given its answers.
+///
+/// When the **first** attempt never ran, the rest is noise from a wedged runner: the
+/// client unloads and reloads the model, and the retries that follow come back as
+/// `500 prediction aborted, token repeat limit reached` *because* the runner is wedged.
+/// Job #35 (2026-10-28) filed 619 rows as `repeat_limit` — a permanent kind, hidden
+/// from the backlog until a manual retry — purely because the later 500s won
+/// [`failure_kind_from`] over the zero-value frame that started it all.
+fn primary_failure_kind(first: &str, combined: &str) -> &'static str {
+    let kind = failure_kind_from(first);
+    if kind == "empty_frame" {
+        return kind;
+    }
+    failure_kind_from(combined)
 }
 
 fn classify_primary(
@@ -913,20 +936,31 @@ fn classify_primary(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "image.jpg".to_string())
     ));
+    // Both sizes go in the line. The source dimensions are what the resolution floor
+    // compares (`min_pixels`), so a 4000x3000 photo that uploads as 768x576 and 70 KB
+    // must not read like a file that slipped under a 1 MP floor.
     match std::fs::copy(&prepared.path, &keep) {
         Ok(bytes) => log::error!(
-            "primary gave up on {} ({}x{}, {} B, kept at {})",
+            "primary gave up on {} (source {}x{} at {} B, sent {}x{} at {} B, kept at {})",
             prepared.source.display(),
+            prepared.source_width,
+            prepared.source_height,
+            prepared.original_bytes,
             prepared.width,
             prepared.height,
             bytes,
             keep.display()
         ),
         Err(err) => log::error!(
-            "primary gave up on {} ({}x{}, and the prepared image could not be kept: {err})",
+            "primary gave up on {} (source {}x{} at {} B, sent {}x{} at {} B, and the \
+             prepared image could not be kept: {err})",
             prepared.source.display(),
+            prepared.source_width,
+            prepared.source_height,
+            prepared.original_bytes,
             prepared.width,
-            prepared.height
+            prepared.height,
+            prepared.prepared_bytes
         ),
     }
 
@@ -942,7 +976,7 @@ fn classify_primary(
             "character_candidates": [],
             "confidence": 0.0,
         }),
-        Some(failure_kind_from(&combined)),
+        Some(primary_failure_kind(&resp1.raw, &combined)),
         ParseKind::Default,
     )
 }
@@ -2183,6 +2217,30 @@ mod tests {
         );
         assert_eq!(failure_kind_from("   "), "no_response");
         assert_eq!(failure_kind_from("{\"media_type\":"), "parse");
+        // The client's own message for the zero-value frame, which used to fall
+        // through to "parse" (also a permanent kind) because it carries no body.
+        assert_eq!(
+            failure_kind_from("empty_frame: Ollama answered with its zero-value response"),
+            "empty_frame"
+        );
+    }
+
+    /// A wedged runner used to be filed as `repeat_limit`: permanent, and hidden from
+    /// the backlog until a manual retry. That is what condemned 619 rows in job #35.
+    #[test]
+    fn a_wedged_runner_is_not_a_repeat_limit() {
+        let wedged = "empty_frame: Ollama answered with its zero-value response";
+        let looped = "http_error: status 500: prediction aborted, token repeat limit reached";
+        assert_eq!(
+            primary_failure_kind(wedged, &format!("{wedged}\n{looped}\n{looped}\n{looped}")),
+            "empty_frame",
+            "the frame came first: the 500s are the wedged runner, not the picture"
+        );
+        assert_eq!(
+            primary_failure_kind(looped, &format!("{looped}\n{looped}\n{looped}")),
+            "repeat_limit",
+            "a picture that loops on a healthy runner stays a per-picture failure"
+        );
     }
 
     #[test]

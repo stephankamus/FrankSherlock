@@ -1568,6 +1568,12 @@ pub struct BacklogRow {
     /// for the files it touches, and `repair_thumbnails` covers the rows it does
     /// not.
     pub thumb_path: Option<String>,
+    /// Perceptual hash of the thumbnail this row already has.
+    ///
+    /// It is the same number the dedupe index compares, and [`stamp_modified_rows`]
+    /// clears it whenever the bytes change, so it always describes the file on disk.
+    /// That lets the producer recognise a near-duplicate without decoding anything.
+    pub dhash: Option<i64>,
     /// Pixel dimensions of a still image, when they have been measured. Only used
     /// to predict the context window before the file is opened — a `None` here is
     /// not an error, it just means the row has to be probed once.
@@ -1779,7 +1785,7 @@ fn query_backlog_rows(
     // in the selection, or a row could never be measured in the first place.
     let sql = format!(
         "SELECT id, rel_path, abs_path, size_bytes, media_type,
-                {PENDING_CLASSIFICATION_SQL} AS pending, thumb_path,
+                {PENDING_CLASSIFICATION_SQL} AS pending, thumb_path, dhash,
                 image_width, image_height, fingerprint, scan_marker, mtime_ns,
                 faces_scanned_at
          FROM files
@@ -1801,12 +1807,13 @@ fn query_backlog_rows(
             media_type: row.get(4)?,
             needs_classification: row.get::<_, i64>(5)? != 0,
             thumb_path: row.get(6)?,
-            image_width: row.get::<_, Option<i64>>(7)?.map(|v| v as u32),
-            image_height: row.get::<_, Option<i64>>(8)?.map(|v| v as u32),
-            fingerprint: row.get(9)?,
-            scan_marker: row.get(10)?,
-            mtime_ns: row.get(11)?,
-            faces_scanned_at: row.get(12)?,
+            dhash: row.get(7)?,
+            image_width: row.get::<_, Option<i64>>(8)?.map(|v| v as u32),
+            image_height: row.get::<_, Option<i64>>(9)?.map(|v| v as u32),
+            fingerprint: row.get(10)?,
+            scan_marker: row.get(11)?,
+            mtime_ns: row.get(12)?,
+            faces_scanned_at: row.get(13)?,
         })
     })?;
     let mut out = Vec::new();
@@ -2213,11 +2220,17 @@ pub fn list_thumb_cache_seed(
 ///
 /// Seeds the dedupe index so a photo that duplicates something classified in an
 /// earlier run costs no vision request at all.
+///
+/// Videos and PDFs are excluded: their `dhash` is one keyframe or one page, so a
+/// still photo landing within a few bits of it would inherit a description written
+/// for a different medium. The backlog comments say the same thing where it decides
+/// which rows may be deduped at all.
 pub fn list_classified_dhashes(db_path: &Path, root_id: i64) -> AppResult<Vec<(i64, i64)>> {
     let conn = open_conn(db_path)?;
     let sql = format!(
         "SELECT id, dhash FROM files
          WHERE root_id = ?1 AND deleted_at IS NULL
+           AND media_type NOT IN ('video', 'pdf')
            AND NOT {PENDING_CLASSIFICATION_SQL} AND dhash IS NOT NULL"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -2229,6 +2242,32 @@ pub fn list_classified_dhashes(db_path: &Path, root_id: i64) -> AppResult<Vec<(i
         out.push(row?);
     }
     Ok(out)
+}
+
+/// `rel_path` of `file_id`, for log lines that name a row by something a human can
+/// find again. `None` when the row disappeared between the lookup and the log.
+pub fn file_rel_path(db_path: &Path, file_id: i64) -> AppResult<Option<String>> {
+    let conn = open_conn(db_path)?;
+    let mut stmt = conn.prepare("SELECT rel_path FROM files WHERE id = ?1")?;
+    let mut rows = stmt.query_map(params![file_id], |row| row.get::<_, String>(0))?;
+    match rows.next() {
+        Some(row) => Ok(Some(row?)),
+        None => Ok(None),
+    }
+}
+
+/// Thumbnail recorded for `file_id`, if any.
+///
+/// Used to hard-link the JPEG a near-duplicate donor already has instead of decoding
+/// the source just to encode the same picture again.
+pub fn thumb_path_for_file(db_path: &Path, file_id: i64) -> AppResult<Option<String>> {
+    let conn = open_conn(db_path)?;
+    let mut stmt = conn.prepare("SELECT thumb_path FROM files WHERE id = ?1")?;
+    let mut rows = stmt.query_map(params![file_id], |row| row.get::<_, Option<String>>(0))?;
+    match rows.next() {
+        Some(row) => Ok(row?),
+        None => Ok(None),
+    }
 }
 
 pub fn update_file_thumb_path_by_id_conn(
