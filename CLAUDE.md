@@ -23,8 +23,9 @@ sherlock/               <- THE MAIN APP (Tauri v2 desktop)
     src-tauri/          <- Rust backend (scan, classify, thumbnail, publish, config)
     src/                <- React frontend (VSCode-inspired UI)
   web/
-    server/             <- axum read-only API over the published snapshot
+    server/             <- axum read-only API + embedded SPA (feature `embed-ui`)
     ui/                 <- Vite + React web client (PWA)
+    Dockerfile          <- multi-stage image; compose and deploy notes next to it
 _classification/        <- PoC: Python classification pipeline (informed classify.rs)
 _research_ab_test/      <- A/B benchmark research (scripts, docs, test files)
   scripts/              <- Benchmark scripts for model selection

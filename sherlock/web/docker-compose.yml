@@ -1,0 +1,29 @@
+services:
+  sherlock-web:
+    image: ghcr.io/OWNER/frank-sherlock-web:latest
+    build:
+      context: ../..
+      dockerfile: sherlock/web/Dockerfile
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      LIBRARY_DIR: /library
+      MEDIA_MAP: /config/media.map.json
+      AUTH_TOKEN: ${AUTH_TOKEN:?set AUTH_TOKEN before starting}
+      CACHE_DIR: /tmp/fs-web-cache
+      RUST_LOG: info
+    volumes:
+      # PUBLISH_DIR is the folder chosen in Settings -> Publicação.
+      - ${PUBLISH_DIR:-/mnt/publish}:/library:ro
+      # One bind mount per root in media.map.json. Add more as needed.
+      - ${PHOTOS_DIR:-/mnt/fotos}:/mnt/fotos:ro
+      - ./config:/config:ro
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "/app/sherlock-web", "--health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

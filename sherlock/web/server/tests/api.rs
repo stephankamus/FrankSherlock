@@ -475,3 +475,47 @@ async fn an_invalid_range_is_416_not_a_panic() {
         assert!(content_range.starts_with("bytes */"), "{content_range}");
     }
 }
+
+/// Only compiled when the bundle was embedded (`cargo test --features embed-ui`).
+#[cfg(feature = "embed-ui")]
+#[tokio::test]
+async fn the_spa_is_embedded_and_answers_client_side_routes() {
+    let fixture = build();
+
+    let (status, headers, body) = get_with_headers(&fixture.state, "/", &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers["content-type"]
+        .to_str()
+        .expect("content type")
+        .starts_with("text/html"));
+    assert!(String::from_utf8(body)
+        .expect("html")
+        .contains("id=\"root\""));
+
+    // A route the SPA owns falls back to the shell.
+    let (status, _, body) = get_with_headers(&fixture.state, "/people/42", &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(String::from_utf8(body)
+        .expect("html")
+        .contains("id=\"root\""));
+
+    // A missing asset must not be answered with HTML: the browser needs a 404.
+    let (status, _, _) = get_with_headers(&fixture.state, "/assets/missing.js", &[]).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Without the feature the server still answers the API pointer on `/`.
+#[cfg(not(feature = "embed-ui"))]
+#[tokio::test]
+async fn the_root_serves_the_api_pointer_without_the_bundle() {
+    let fixture = build();
+    let (status, _, body) = get_with_headers(&fixture.state, "/", &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(String::from_utf8(body)
+        .expect("html")
+        .contains("/api/health"));
+
+    // Unknown paths are 404, not a pretend SPA.
+    let (status, _, _) = get_with_headers(&fixture.state, "/people/42", &[]).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

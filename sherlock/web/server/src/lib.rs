@@ -7,6 +7,7 @@
 //! disagree about what a search means.
 
 pub mod api;
+pub mod assets;
 pub mod config;
 pub mod library;
 pub mod media;

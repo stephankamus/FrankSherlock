@@ -485,20 +485,32 @@ Branch `feat/web-client`, 2026-10-28 (terceira sessão).
 - Cuidados que o web exigiu: `Sidebar` esconde o bloco de Info quando não há `dbStats` e os
   cards de álbum/smart folder não renderizam exclusão em modo leitura; `DuplicatesView` ganhou
   `showNearDuplicates` (o snapshot publicado só serve grupos exatos).
+- O SPA é embarcado no binário com a feature `embed-ui` (`assets.rs`, `rust-embed`): `/` serve
+  o shell, rotas do client caem no `index.html`, asset ausente é `404` (nunca HTML) e o build
+  sem a feature mantém o placeholder da API. Integração testada com `cargo test --features
+  embed-ui`.
+- Empacotamento: [`Dockerfile`](sherlock/web/Dockerfile:1) multi-stage (Vite → Rust com
+  `embed-ui` → Debian non-root com `/tmp` tmpfs e healthcheck), `docker-compose.yml` com
+  `AUTH_TOKEN`, `PUBLISH_DIR` e um bind mount por root, `.dockerignore` e
+  [`docs/web-deploy.md`](docs/web-deploy.md:1) (media map, auth/TLS no proxy, instalação no
+  celular, troubleshooting). O CI ganhou o job `web-image`, que constrói a imagem.
 
-**Números no momento do handoff**: 241 no `core`, 294 no desktop (Rust), 43 no servidor web
-(25 unitários + 18 de integração), 428 no frontend do desktop, 21 no `shared`, 5 no
-`sherlock/web/ui`; `cargo fmt --check` e `cargo clippy -- -D warnings` limpos nos três
-crates; `tsc --noEmit` limpo em `shared`, `desktop` e `web/ui`. Os itens 5 e 6 estão
-completos.
+**Números no momento do handoff**: 241 no `core`, 294 no desktop (Rust), 47 no servidor web
+(28 unitários + 19 de integração; `--features embed-ui` roda os mesmos 28 + 19), 428 no
+frontend do desktop, 21 no `shared`, 5 no `sherlock/web/ui`; `cargo fmt --check` e
+`cargo clippy -- -D warnings` limpos nos três crates (com e sem `embed-ui`); `tsc --noEmit`
+limpo em `shared`, `desktop` e `web/ui`. Os itens 5, 6 e o empacotamento estão completos.
+Nota: o `docker build` não foi executado nesta máquina (o daemon não é acessível ao usuário);
+a validação da imagem fica com o job `web-image` do CI.
 
 **Próximo, em ordem**
 
-1. Embarcar o `web/ui/dist` no binário axum (rota `/` servindo o SPA e fallback para
-   `index.html`) — hoje a rota `/` ainda é o placeholder.
-2. Dockerfile multi-stage, compose, job de CI da imagem e `docs/web-deploy.md` (incluir
-   `CACHE_DIR` no tmpfs e `LIBRARY_DIR` read-only).
-3. Validação ponta a ponta no celular.
+1. Validação ponta a ponta no celular: publicar uma revisão, subir o compose, abrir por
+   `?token=`, instalar como PWA, conferir preview `?w=`, vídeo com `Range`, PDF no iframe e o
+   banner de root não mapeado. Ajustar o que aparecer (tamanho de página, gesto de preview,
+   botão de voltar no Android).
+2. Se o compose rodar em PROXMOX com Caddy/Traefik, documentar o bloco de proxy no
+   `docs/web-deploy.md` (TLS + Basic/Authentik) e o `healthcheck` no monitoramento.
 
 **Invariantes que não podem quebrar**
 

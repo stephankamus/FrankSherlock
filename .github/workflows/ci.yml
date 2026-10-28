@@ -139,3 +139,24 @@ jobs:
         run: |
           cargo install cargo-audit --locked
           cargo audit
+
+  # Proves the deployable artifact: the SPA is built, embedded in the axum binary and
+  # the runtime image satisfies its (read-only, non-root, healthcheck) contract.
+  web-image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build the web image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: sherlock/web/Dockerfile
+          push: false
+          tags: frank-sherlock-web:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

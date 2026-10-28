@@ -102,6 +102,8 @@ pub fn app(state: Arc<AppState>) -> Router {
         .nest("/api", api)
         .route("/", get(index))
         .route("/healthz", get(|| async { "ok" }))
+        // Client-side routes of the SPA; a build without the UI answers 404 here.
+        .fallback(fallback)
         // Applied to every route, including the nested API and the media responses.
         .layer(axum::middleware::from_fn(security_headers))
 }
@@ -130,13 +132,14 @@ async fn security_headers(request: Request, next: Next) -> Response {
     response
 }
 
-/// Placeholder until the SPA is embedded: proving the server is up beats a 404.
-async fn index() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        "<!doctype html><title>Frank Sherlock</title><p>Library API is up. \
-         Try <a href=\"/api/health\">/api/health</a>.</p>",
-    )
+/// The SPA when embedded; the API pointer otherwise.
+async fn index() -> Response {
+    crate::assets::index()
+}
+
+/// Any path that is not `/api`, `/healthz` or `/`: SPA route or 404.
+async fn fallback(uri: axum::http::Uri) -> Response {
+    crate::assets::serve(uri.path())
 }
 
 /// Bearer token, or `?token=` for the requests a browser cannot add headers to.

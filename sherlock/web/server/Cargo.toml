@@ -18,6 +18,11 @@ path = "src/main.rs"
 # Reads `sherlock_core`, never `sherlock_app_lib`: pulling the desktop crate in would drag
 # Tauri, `ort` and `pdfium-render` into the image the container builds, for code this
 # server never calls.
+[features]
+# Embed `sherlock/web/ui/dist` into the binary (built in the Docker image and in CI).
+# Off by default so `cargo test` works without a frontend build.
+embed-ui = ["dep:rust-embed", "dep:mime_guess"]
+
 [dependencies]
 axum = "0.8"
 env_logger = "0.11"
@@ -25,6 +30,8 @@ env_logger = "0.11"
 # `sherlock_core` already compiles, so the container does not build two copies.
 image = "0.25"
 log = "0.4"
+mime_guess = { version = "2", optional = true }
+rust-embed = { version = "8", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sherlock_core = { path = "../../core" }
