@@ -384,20 +384,45 @@ pub fn ollama_generate(
     match send_once(&agent, &payload) {
         Ok(resp) => resp,
         // The runner is wedged: no retry of any kind helps, only a fresh model load.
+        //
+        // Two cycles, because one was not enough in practice: job #35 (2026-10-28) has
+        // the request sent 3 s after a reload coming back with the zero-value frame
+        // *again*, and the caller then burned a whole classify attempt on it. The first
+        // cycle respects the reload throttle (a runner that wedges immediately has to
+        // stop the pass, not spin); the second bypasses it, because by then the caller
+        // has just seen the freshly loaded runner fail and reusing the old one is
+        // strictly worse.
         Err(err) if err.degenerate => {
-            if !super::management::reload_model(model) {
-                // Throttled: the previous reload did not take. Retrying the same
-                // wedged runner would only burn the caller's attempts.
-                return OllamaResponse::error(err.message);
-            }
-            log::warn!("Reloaded {model} after a zero-value frame; retrying the request");
-            match send_once(&agent, &payload) {
-                Ok(resp) => resp,
-                Err(again) => {
-                    log::error!("Retry after reload failed: {}", again.message);
-                    OllamaResponse::error(again.message)
+            let mut wedged = err;
+            for cycle in 1..=2u8 {
+                let reloaded = if cycle == 1 {
+                    super::management::reload_model(model)
+                } else {
+                    super::management::reload_model_now(model)
+                };
+                if !reloaded {
+                    // Throttled: the previous reload did not take. Retrying the same
+                    // wedged runner would only burn the caller's attempts.
+                    return OllamaResponse::error(wedged.message);
+                }
+                log::warn!(
+                    "Reloaded {model} after a zero-value frame (cycle {cycle} of 2); \
+                     retrying the request"
+                );
+                match send_once(&agent, &payload) {
+                    Ok(resp) => return resp,
+                    Err(again) if again.degenerate => {
+                        log::warn!("Still getting the zero-value frame after the reload");
+                        wedged = again;
+                    }
+                    Err(again) => {
+                        log::error!("Retry after reload failed: {}", again.message);
+                        return OllamaResponse::error(again.message);
+                    }
                 }
             }
+            log::error!("Gave up on {model}: the zero-value frame survived two reloads");
+            OllamaResponse::error(wedged.message)
         }
         Err(err) if params.json_mode && err.worth_retrying() => {
             match err.status {

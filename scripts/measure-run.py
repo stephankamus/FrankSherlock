@@ -54,10 +54,30 @@ DEFAULT_LOG = os.path.expanduser(
 )
 DEFAULT_DB = os.path.expanduser("~/.local/share/frank_sherlock/db/index.sqlite")
 
-CLASSIFY = re.compile(r"^\[(\d{4}-\d{2}-\d{2})\]\[(\d{2}:\d{2}:\d{2})\].*Classifying: (.+)$")
+# `Classifying: x` for a still image, `Classifying video: x` and `Classifying PDF: x`
+# for the legacy paths. Matching only the first one made the log count impossible to
+# reconcile with the job counter and hid both legacy paths from every report.
+CLASSIFY = re.compile(
+    r"^\[(\d{4}-\d{2}-\d{2})\]\[(\d{2}:\d{2}:\d{2})\].*Classifying(?: (video|PDF|pdf))?: (.+)$"
+)
 GIN = re.compile(
     r"\[GIN\].*?\|\s*(\d{3})\s*\|\s*([0-9.]+)(ns|µs|us|ms|s|m|h)\s*\|.*\"(/api/[^\"]+)\""
 )
+# The pass summary the scan already logs. It is the only place that reports `deduped`,
+# `failed`, `deferred` and `unreadable`, so the report stops guessing them.
+BACKLOG_SUMMARY = re.compile(
+    r"Backlog(?: \(retry failed\))?: (\d+) processed, (\d+) classified \((\d+) deduped\), "
+    r"(\d+) thumbnailed, (\d+) failed, (\d+) deferred to the next pass, "
+    r"(\d+) unreadable, (\d+) face\(s\) stored"
+)
+DOC_BUCKET = re.compile(r"Scan job \d+: (\d+) document row\(s\) in the bucket \((.+)\)$")
+# Rows that inherited a classification from a near-duplicate. They never reach the model,
+# so they have no `Classifying:` line — before this they were invisible in the log and the
+# only place that knew about them was the summary's `deduped`.
+REUSED_CLASSIFICATION = "Reused classification: "
+# A file that takes longer than this is what makes the mean meaningless: the median is
+# ~2 s while the tail is where most of the wall goes.
+SLOW_FILE_SECONDS = 30.0
 # One `Operation:fit` line per model load, and it carries the runner identity:
 # `BatchSize:512 FlashAttention:Enabled KvSize:4096`.
 LOAD = re.compile(r"Operation:fit.*?BatchSize:(\d+).*?KvSize:(\d+)")
@@ -122,6 +142,24 @@ def total_rows(con, root_id: int) -> int:
         ).fetchone()[0]
     except sqlite3.Error:
         return -1
+
+
+def failed_breakdown(con, root_id: int) -> list[tuple[str, int, int]]:
+    """Rows the pass gave up on, by reason — and they are still counted as pending.
+
+    `pending` counts `description = ''` and does not look at `classify_state`, so a row
+    that burned every attempt appears in it forever and the "did this pass finish"
+    number can never reach zero. Printing the two apart is the only way to read it.
+    """
+    try:
+        return con.execute(
+            "select coalesce(failure_kind, ''), count(*), max(classify_attempts)"
+            " from files where root_id = ? and deleted_at is null"
+            " and classify_state = 'failed' group by 1 order by 2 desc",
+            (root_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
 
 
 def low_confidence_rows(con, root_id: int) -> int:
@@ -208,26 +246,63 @@ def journal_stats(lines: list[str]) -> dict:
 # ----------------------------------------------------------------------------- log
 
 
-def classify_entries(path: str) -> list[tuple[datetime, str]]:
-    """Every `Classifying:` line as (timestamp, file path)."""
-    entries: list[tuple[datetime, str]] = []
+def log_entries(path: str) -> tuple[list[tuple[datetime, str, str]], dict]:
+    """Every `Classifying*` line as (timestamp, kind, path), plus the pass summary.
+
+    Files that come out of the dedupe index never log a line at all, so reconciling the
+    log against the job counter has to subtract `deduped` from `processed` — the summary
+    line reports both, which is why it is parsed here instead of being guessed.
+    """
+    entries: list[tuple[datetime, str, str]] = []
+    summary: dict = {}
     if not os.path.exists(path):
-        return entries
+        return entries, summary
     with open(path, encoding="utf-8", errors="replace") as handle:
         for raw in handle:
-            match = CLASSIFY.match(raw.strip())
-            if match is None:
-                continue
-            day, clock, file_path = match.groups()
-            entries.append(
-                (
-                    datetime.strptime(f"{day} {clock}", "%Y-%m-%d %H:%M:%S").replace(
-                        tzinfo=timezone.utc
-                    ),
-                    file_path.strip(),
+            line = raw.strip()
+            match = CLASSIFY.match(line)
+            if match is not None:
+                day, clock, kind, file_path = match.groups()
+                entries.append(
+                    (
+                        datetime.strptime(f"{day} {clock}", "%Y-%m-%d %H:%M:%S").replace(
+                            tzinfo=timezone.utc
+                        ),
+                        (kind or "image").lower(),
+                        file_path.strip(),
+                    )
                 )
-            )
-    return entries
+                continue
+            backlog = BACKLOG_SUMMARY.search(line)
+            if backlog is not None:
+                (
+                    processed,
+                    classified,
+                    deduped,
+                    thumbnailed,
+                    failed,
+                    deferred,
+                    unreadable,
+                    faces,
+                ) = (int(value) for value in backlog.groups())
+                summary["backlog"] = {
+                    "processed": processed,
+                    "classified": classified,
+                    "deduped": deduped,
+                    "thumbnailed": thumbnailed,
+                    "failed": failed,
+                    "deferred": deferred,
+                    "unreadable": unreadable,
+                    "faces": faces,
+                }
+                continue
+            bucket = DOC_BUCKET.search(line)
+            if bucket is not None:
+                summary["documents"] = (int(bucket.group(1)), bucket.group(2))
+                continue
+            if REUSED_CLASSIFICATION in line:
+                summary["reused_logged"] = summary.get("reused_logged", 0) + 1
+    return entries, summary
 
 
 def line_stamp(line: str) -> datetime | None:
@@ -341,9 +416,11 @@ def main() -> int:
 
     stats = journal_stats(lines)
     durations = stats["durations"]
-    entries = classify_entries(args.log)
-    in_window = [(stamp, path) for stamp, path in entries if start_dt <= stamp <= end_dt]
-    logged_files = len({path for _, path in in_window})
+    entries, summary = log_entries(args.log)
+    in_window = [
+        (stamp, kind, path) for stamp, kind, path in entries if start_dt <= stamp <= end_dt
+    ]
+    logged_files = len({path for _, _, path in in_window})
     counted = job.get("processed_files") or 0
     processed = max(counted, logged_files)
     pending = pending_rows(con, job["root_id"])
@@ -372,6 +449,33 @@ def main() -> int:
 
     print()
     print(f"pending now         : {pending} of {total} rows still have no description")
+    failed = failed_breakdown(con, job["root_id"])
+    if failed:
+        total_failed = sum(count for _, count, _ in failed)
+        print(
+            f"  of which failed   : {total_failed} row(s) with classify_state='failed'"
+            " (only `Retry failed` brings them back)"
+        )
+        for kind, count, attempts in failed:
+            print(f"    {kind or 'unknown':<16} {count:>6}   max attempts {attempts}")
+    if summary.get("backlog"):
+        backlog = summary["backlog"]
+        print(
+            "job summary (log)   : "
+            f"{backlog['processed']} processed, {backlog['classified']} classified "
+            f"({backlog['deduped']} deduped), {backlog['thumbnailed']} thumbnailed, "
+            f"{backlog['failed']} failed, {backlog['deferred']} deferred, "
+            f"{backlog['unreadable']} unreadable, {backlog['faces']} face(s)"
+        )
+    if summary.get("documents"):
+        doc_total, doc_breakdown = summary["documents"]
+        print(f"documents bucket    : {doc_total} row(s) ({doc_breakdown})")
+    if summary.get("reused_logged"):
+        # Cross-check for `deduped` in the summary: these rows now log one line each.
+        print(
+            f"reused lines        : {summary['reused_logged']} near-duplicate row(s)"
+            " that skipped the model"
+        )
     if low_conf > 0:
         print(f"confidence 0        : {low_conf} classified row(s) the model scored 0.0")
 
@@ -410,9 +514,16 @@ def main() -> int:
         )
 
     print()
-    print(f"log lines           : {len(entries)} total, {len(in_window)} inside this run")
-    stamps = [stamp for stamp, _ in in_window]
+    kinds: dict[str, int] = {}
+    for _, kind, _ in in_window:
+        kinds[kind] = kinds.get(kind, 0) + 1
+    print(
+        f"log lines           : {len(entries)} Classifying line(s) total,"
+        f" {len(in_window)} inside this run ({table(kinds)})"
+    )
+    stamps = [stamp for stamp, _, _ in in_window]
     if len(stamps) > 1:
+        # delta[i] is the time spent on the file that logged stamps[i]
         deltas = [(b - a).total_seconds() for a, b in zip(stamps, stamps[1:])]
         print(
             "per file (log)      : "
@@ -420,13 +531,30 @@ def main() -> int:
             f"p50/p95 {percentile(deltas, 0.5):.2f}/{percentile(deltas, 0.95):.2f} s, "
             f"max {max(deltas):.2f} s"
         )
+        slow = [delta for delta in deltas if delta >= SLOW_FILE_SECONDS]
+        if slow:
+            share = 100 * sum(slow) / max(1.0, sum(deltas))
+            print(
+                f"  tail              : {len(slow)} file(s) at or above"
+                f" {SLOW_FILE_SECONDS:.0f} s = {sum(slow):.0f} s of wall ({share:.0f} %)"
+            )
+        ranked = sorted(zip(deltas, in_window[:-1]), key=lambda pair: pair[0], reverse=True)
+        print("  slowest files     :")
+        for delta, (_, kind, path) in ranked[:10]:
+            print(f"    {delta:8.1f} s  {kind:<5} {path}")
     if len(stamps) < 2 and entries:
         print("  note: the log keeps no lines from this run — it is truncated on start")
-    elif processed and len(in_window) < processed // 2:
-        print(
-            f"  note: {len(in_window)} of {processed} files logged — the log is only a tail,"
-            " trust the index and the journal"
-        )
+    else:
+        # Files served from the dedupe index never log a line, so the number the log can
+        # be reconciled against is `processed - deduped`, not `processed`.
+        expected = None
+        if summary.get("backlog"):
+            expected = summary["backlog"]["processed"] - summary["backlog"]["deduped"]
+        if expected and len(in_window) < expected * 0.9:
+            print(
+                f"  note: {len(in_window)} of ~{expected} classified file(s) logged — the rest"
+                " are in a rotated log or were deduped"
+            )
     if stats["crashes"]:
         print(
             f"  note: the runner crashed {stats['crashes']} time(s) during this run; those"

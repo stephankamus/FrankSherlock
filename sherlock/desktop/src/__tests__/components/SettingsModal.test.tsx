@@ -90,12 +90,19 @@ describe("SettingsModal", () => {
     await user.click(
       screen.getByRole("checkbox", { name: /A full scan continues into the pipeline/ }),
     );
+    // The resolution floor is stored as a pixel count, so the preset must round-trip as
+    // 500000 and not as "0.5".
+    await user.selectOptions(screen.getByLabelText("Ignore images below"), "500000");
+    // The library profile is what decides whether the anime enrichment pass runs.
+    await user.selectOptions(screen.getByLabelText("Library profile"), "anime");
     await user.click(screen.getByRole("button", { name: "Save" }));
 
     await waitFor(() =>
       expect(updateSettings).toHaveBeenCalledWith({
         model: null,
         imageMaxSide: 1024,
+        minPixels: 500_000,
+        libraryKind: "anime",
         promptProfile: "concise",
         descriptionLanguage: "pt_br",
         imageFilter: "box",

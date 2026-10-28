@@ -224,6 +224,10 @@ export async function updateSettings(update: SettingsUpdatePayload): Promise<Vis
 export type VisionSettingsUpdate = {
   model: string | null;
   imageMaxSide: number;
+  /** Resolution floor in total pixels; `0` (or omitted) disables it. */
+  minPixels?: number;
+  /** `auto` | `photos` | `anime`; omitted keeps whatever is stored. */
+  libraryKind?: "auto" | "photos" | "anime";
   promptProfile: VisionPromptProfile;
   ocrEngine: VisionOcrEngine;
 };

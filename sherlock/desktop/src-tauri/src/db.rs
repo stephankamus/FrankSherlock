@@ -979,10 +979,20 @@ pub fn pending_scan_info(
         [root_id],
         |row| row.get(0),
     )?;
+    // Inside `unclassified`, but out of reach of the backlog pass: a row that spent its
+    // attempt budget has no description and is excluded by `classify_state`, so telling
+    // the user only "N pending" promises work that "continue classifying" will not do.
+    let failed: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM files
+          WHERE root_id = ?1 AND deleted_at IS NULL AND classify_state = 'failed'",
+        [root_id],
+        |row| row.get(0),
+    )?;
 
     Ok(Some(crate::models::PendingScanInfo {
         root_id,
         unclassified: unclassified.max(0) as u64,
+        failed: failed.max(0) as u64,
         last_scan_at,
     }))
 }
@@ -1549,10 +1559,29 @@ impl BacklogRow {
 /// Rows marked failed are **excluded**: they already burned every attempt, and
 /// sending them again on every pass is what kept a backlog from ever converging.
 /// [`list_failed_rows`] is the way back in, through an explicit retry.
+/// Kept for the tests and for callers that genuinely have no floor; production goes
+/// through [`list_backlog_rows_above`] with `ctx.min_pixels`.
+#[allow(dead_code)]
 pub fn list_backlog_rows(
     db_path: &Path,
     root_id: i64,
     include_faces: bool,
+) -> AppResult<Vec<BacklogRow>> {
+    list_backlog_rows_above(db_path, root_id, include_faces, 0)
+}
+
+/// The same selection, minus the still images below a resolution floor.
+///
+/// The floor is a *filter*, not a state: `image_width * image_height` is already on the
+/// row, so lowering `min_pixels` later brings those rows back on the next pass without a
+/// single new request — and raising it takes them out again without a migration. Rows
+/// whose dimensions were never measured stay in the selection; the producer measures them
+/// once (header only) and records the value.
+pub fn list_backlog_rows_above(
+    db_path: &Path,
+    root_id: i64,
+    include_faces: bool,
+    min_pixels: u32,
 ) -> AppResult<Vec<BacklogRow>> {
     query_backlog_rows(
         db_path,
@@ -1560,10 +1589,15 @@ pub fn list_backlog_rows(
         None,
         "AND classify_state <> 'failed'",
         include_faces,
+        min_pixels,
     )
 }
 
 /// Rows that gave up: every attempt failed. Used by `Retry failed`.
+///
+/// Ignores the resolution floor on purpose: an explicit retry is the user saying "try
+/// these again", and silently hiding half of them would be the same trap the floor is
+/// meant to avoid.
 pub fn list_failed_rows(db_path: &Path, root_id: i64) -> AppResult<Vec<BacklogRow>> {
     query_backlog_rows(
         db_path,
@@ -1571,6 +1605,7 @@ pub fn list_failed_rows(db_path: &Path, root_id: i64) -> AppResult<Vec<BacklogRo
         None,
         "AND classify_state = 'failed'",
         false,
+        0,
     )
 }
 
@@ -1583,11 +1618,24 @@ pub fn list_failed_rows(db_path: &Path, root_id: i64) -> AppResult<Vec<BacklogRo
 /// (`plans/pipeline-cpu-gpu-overlap.md` §5.12).
 ///
 /// Rows marked failed stay out for the same reason as in [`list_backlog_rows`].
+/// Kept for the tests; production goes through [`list_backlog_rows_for_scan_above`].
+#[allow(dead_code)]
 pub fn list_backlog_rows_for_scan(
     db_path: &Path,
     root_id: i64,
     scan_marker: i64,
     include_faces: bool,
+) -> AppResult<Vec<BacklogRow>> {
+    list_backlog_rows_for_scan_above(db_path, root_id, scan_marker, include_faces, 0)
+}
+
+/// [`list_backlog_rows_for_scan`] with the resolution floor applied.
+pub fn list_backlog_rows_for_scan_above(
+    db_path: &Path,
+    root_id: i64,
+    scan_marker: i64,
+    include_faces: bool,
+    min_pixels: u32,
 ) -> AppResult<Vec<BacklogRow>> {
     query_backlog_rows(
         db_path,
@@ -1595,6 +1643,7 @@ pub fn list_backlog_rows_for_scan(
         Some(scan_marker),
         "AND classify_state <> 'failed'",
         include_faces,
+        min_pixels,
     )
 }
 
@@ -1610,22 +1659,40 @@ pub fn failed_classification_count(db_path: &Path, root_id: i64) -> AppResult<u6
     Ok(count as u64)
 }
 
-/// Record that every attempt for this row failed, and why.
+/// Record a failure that is a property of the file, but only give up at the budget.
 ///
-/// `kind` is a short taxonomy (`repeat_limit`, `ctx_overflow`, `empty_frame`,
-/// `parse`, `io`, `prepare`, ...) so a retry can be aimed at it; `detail` keeps the
-/// text Ollama sent back, truncated by the caller.
-pub fn mark_file_failed(db_path: &Path, file_id: i64, kind: &str, detail: &str) -> AppResult<()> {
+/// `kind` is a short taxonomy (`repeat_limit`, `ctx_overflow`, `empty_frame`, `parse`,
+/// `io`, `prepare`, ...) so a retry can be aimed at it; `detail` keeps the text Ollama
+/// sent back, truncated by the caller.
+///
+/// Marking the row `failed` on the **first** failure is what left 622 rows waiting for
+/// a manual `Retry failed` after job #35 (2026-10-28): `repeat_limit` is not a stable
+/// property of a file — the same image answers correctly on a later pass, and the code
+/// in `classify_primary` already recorded that one image "answered fine minutes later".
+/// The row therefore keeps its `failure_kind` (so the reason is not lost) and its
+/// `classify_attempts` grows, while `classify_state` only becomes `failed` — and the
+/// row only leaves the backlog — once the budget is spent
+/// ([`crate::scan`]'s `MAX_CLASSIFY_ATTEMPTS`).
+pub fn record_classification_failure(
+    db_path: &Path,
+    file_id: i64,
+    kind: &str,
+    detail: &str,
+    max_attempts: i64,
+) -> AppResult<()> {
     let conn = open_conn(db_path)?;
     conn.execute(
         "UPDATE files
-            SET classify_state = 'failed',
-                failure_kind = ?2,
+            SET failure_kind = ?2,
                 failure_detail = ?3,
                 classify_attempts = classify_attempts + 1,
-                failed_at = ?4
+                failed_at = ?4,
+                classify_state = CASE
+                    WHEN classify_attempts + 1 >= ?5 THEN 'failed'
+                    ELSE ''
+                END
           WHERE id = ?1 AND deleted_at IS NULL",
-        params![file_id, kind, detail, now_epoch_secs()],
+        params![file_id, kind, detail, now_epoch_secs(), max_attempts.max(1)],
     )?;
     Ok(())
 }
@@ -1641,6 +1708,7 @@ fn query_backlog_rows(
     scan_marker: Option<i64>,
     filter: &str,
     include_faces: bool,
+    min_pixels: u32,
 ) -> AppResult<Vec<BacklogRow>> {
     let conn = open_conn(db_path)?;
     // `include_faces` is what the scan's face toggle turns on: with it off the
@@ -1651,6 +1719,8 @@ fn query_backlog_rows(
     } else {
         ""
     };
+    // `?3 = 0` disables the floor; NULL dimensions mean "not measured yet" and must stay
+    // in the selection, or a row could never be measured in the first place.
     let sql = format!(
         "SELECT id, rel_path, abs_path, size_bytes, media_type,
                 {PENDING_CLASSIFICATION_SQL} AS pending, thumb_path,
@@ -1660,11 +1730,13 @@ fn query_backlog_rows(
          WHERE deleted_at IS NULL AND root_id = ?1
            AND (?2 IS NULL OR scan_marker = ?2)
            AND ({PENDING_CLASSIFICATION_SQL} OR thumb_path IS NULL{face_clause})
+           AND (?3 = 0 OR image_width IS NULL OR image_height IS NULL
+                OR image_width * image_height >= ?3)
            {filter}
          ORDER BY rel_path"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![root_id, scan_marker], |row| {
+    let rows = stmt.query_map(params![root_id, scan_marker, min_pixels as i64], |row| {
         Ok(BacklogRow {
             id: row.get(0)?,
             rel_path: row.get(1)?,
@@ -2215,6 +2287,20 @@ pub fn migrate_thumbnail_layout(
     // Best effort: a read-only cache directory would redo the (idempotent) move.
     let _ = std::fs::write(&sentinel, b"v2\n");
     Ok(result)
+}
+
+/// Canonical path of a root row.
+///
+/// Used by the pipeline's share-reachability probe: it needs the root itself, because a
+/// missing *file* and a missing *share* look identical from the file path alone.
+pub fn root_path_by_id(db_path: &Path, root_id: i64) -> AppResult<Option<String>> {
+    let conn = open_conn(db_path)?;
+    let path = conn
+        .query_row("SELECT root_path FROM roots WHERE id = ?1", [root_id], |row| {
+            row.get::<_, String>(0)
+        })
+        .ok();
+    Ok(path)
 }
 
 /// Canonical path of the root that owns `file_id`.
@@ -3355,7 +3441,8 @@ pub fn update_file_classification(
         "UPDATE files SET media_type = ?2, description = ?3, extracted_text = ?4,
                 canonical_mentions = ?5, confidence = ?6, lang_hint = ?7, updated_at = ?8,
                 document_hint = ?9, description_lang = ?10,
-                classify_state = '', failure_kind = '', failure_detail = '', failed_at = NULL
+                classify_state = '', failure_kind = '', failure_detail = '', failed_at = NULL,
+                classify_attempts = 0
          WHERE id = ?1 AND deleted_at IS NULL",
         params![
             file_id,
@@ -5935,9 +6022,58 @@ mod tests {
         assert_eq!(again.moved, 0);
     }
 
-    /// A failed row must leave the default selection: otherwise the next pass sends
-    /// it to the GPU again, forever — 63 of 886 files per pass, 3–4 requests each,
-    /// measured on 2026-10-25. `Retry failed` is the only way back in.
+    /// The resolution floor is a filter, not a state.
+    ///
+    /// Three properties matter and each one is a different way to get it wrong: a row
+    /// whose dimensions were never measured must stay in the selection (otherwise it
+    /// could never be measured), a measured small row must leave it, and lowering the
+    /// floor must bring it back without touching the index — that last one is what makes
+    /// the setting reversible without a single new request.
+    #[test]
+    fn backlog_floor_excludes_only_measured_small_images() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/floor").expect("root");
+        let big =
+            upsert_file_record(&db_path, &sample_record(root_id, "big.jpg", "fp1")).expect("big");
+        let small =
+            upsert_file_record(&db_path, &sample_record(root_id, "small.jpg", "fp2")).expect("small");
+        upsert_file_record(&db_path, &sample_record(root_id, "unmeasured.jpg", "fp3"))
+            .expect("unmeasured");
+
+        set_image_dimensions(&db_path, big, 4000, 3000).expect("big dims");
+        set_image_dimensions(&db_path, small, 432, 768).expect("small dims");
+
+        let all = list_backlog_rows_above(&db_path, root_id, false, 0).expect("all");
+        assert_eq!(all.len(), 3, "a floor of 0 keeps everything");
+
+        let floored = list_backlog_rows_above(&db_path, root_id, false, 500_000).expect("floored");
+        let paths: Vec<&str> = floored.iter().map(|row| row.rel_path.as_str()).collect();
+        assert!(paths.contains(&"big.jpg"), "12 MP is above the floor");
+        assert!(
+            paths.contains(&"unmeasured.jpg"),
+            "a row with no dimensions must be probed, not hidden"
+        );
+        assert!(
+            !paths.contains(&"small.jpg"),
+            "432x768 is 0.33 MP and must stay out of the pass"
+        );
+
+        let lowered = list_backlog_rows_above(&db_path, root_id, false, 300_000).expect("lowered");
+        assert_eq!(
+            lowered.len(),
+            3,
+            "lowering the floor must bring the row back without reindexing"
+        );
+    }
+
+    /// A row leaves the default selection only when the attempt budget is spent.
+    ///
+    /// Without persistence the row came back on every pass, forever (63 of 886 files,
+    /// 3–4 requests each, measured on 2026-10-25). Giving up on the **first** failure
+    /// is the opposite mistake: `repeat_limit` is not deterministic, and that rule left
+    /// 622 rows waiting for `Retry failed` after job #35 (2026-10-28). `Retry failed`
+    /// is still the way back in once the budget is gone.
     #[test]
     fn failed_rows_leave_the_backlog_until_a_retry() {
         let (_dir, db_path) = test_db_path();
@@ -5954,19 +6090,27 @@ mod tests {
             2
         );
 
-        mark_file_failed(
-            &db_path,
-            failed,
-            "repeat_limit",
-            "token repeat limit reached",
-        )
-        .expect("mark");
+        const BUDGET: i64 = 3;
+        record_classification_failure(&db_path, failed, "repeat_limit", "first", BUDGET)
+            .expect("first");
+        assert_eq!(
+            list_backlog_rows(&db_path, root_id, false)
+                .expect("backlog")
+                .len(),
+            2,
+            "one bad pass must not take the row out of the queue"
+        );
+
+        record_classification_failure(&db_path, failed, "repeat_limit", "second", BUDGET)
+            .expect("second");
+        record_classification_failure(&db_path, failed, "repeat_limit", "third", BUDGET)
+            .expect("third");
 
         let backlog = list_backlog_rows(&db_path, root_id, false).expect("backlog");
         assert_eq!(
             backlog.len(),
             1,
-            "the failed row must leave the default pass"
+            "the row must leave the default pass once the budget is spent"
         );
         assert_eq!(backlog[0].rel_path, "b.jpg");
 
@@ -5988,7 +6132,7 @@ mod tests {
             )
             .expect("row");
         assert_eq!(kind, "repeat_limit");
-        assert_eq!(attempts, 1);
+        assert_eq!(attempts, BUDGET);
 
         // A successful classification clears the failure, so the row stops counting
         // as failed without ever leaving the index.

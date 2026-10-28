@@ -31,6 +31,29 @@ use crate::video;
 /// rows without a description afterwards.
 const MAX_CONSECUTIVE_FAILURES: u32 = 25;
 
+/// How many unreadable files in a row before the producer suspects the share itself.
+///
+/// One unreadable file is normal — a broken or vanished file. A run of them means the
+/// mount went away, and the old behaviour (count it as `unreadable` and move on) would
+/// "finish" a 33k-file pass in minutes with every row still pending, which is worse than
+/// failing loudly because it looks like a completed pass.
+const SHARE_FAILURE_THRESHOLD: u32 = 5;
+
+/// How often the pass writes an aggregate progress line.
+///
+/// One line per thumbnail or per face would be ~36,000 lines in a 55k pass (job #35:
+/// 21,598 thumbnails + 14,762 detections) and would push the app log out of its rotation
+/// window. The useful thing is the rate and where the time goes, which is what this line
+/// carries — 110 lines for the same pass.
+const PROGRESS_LOG_EVERY: u64 = 500;
+
+/// Backoff between reachability probes, in seconds; the last entry repeats forever.
+///
+/// There is no overall timeout on purpose: the decision was to wait out a NAS that went
+/// down overnight, with the pause button as the only way out. The sequence starts short
+/// because the commonest outage is a blip.
+const SHARE_BACKOFF_SECONDS: [u64; 6] = [1, 2, 5, 10, 20, 30];
+
 const SUPPORTED_EXTS: [&str; 20] = [
     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif", ".pdf", ".mp4", ".mkv",
     ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".ts", ".mpg", ".mpeg",
@@ -884,11 +907,12 @@ fn run_scan_job_impl(
             );
         }
 
-        let rows = db::list_backlog_rows_for_scan(
+        let rows = db::list_backlog_rows_for_scan_above(
             db_path,
             job.root_id,
             job.scan_marker,
             ctx.face_detection,
+            ctx.min_pixels,
         )?;
         // Renames can only be seen here, while the vanished rows are still live: the
         // cleanup at the end of this job is what turns them into soft deletes.
@@ -936,14 +960,16 @@ fn run_scan_job_impl(
         processed_files = total_files;
         log::info!(
             "Scan job {job_id}: pipeline complete — {} processed, {} classified ({} deduped), \
-             {} thumbnailed, {} moved, {} failed, {} deferred, {} unreadable, \
-             {} face(s) stored ({} face failure(s))",
+             {} thumbnailed, {} moved, {} failed, {} skipped below {} px, {} deferred, \
+             {} unreadable, {} face(s) stored ({} face failure(s))",
             outcome.processed,
             outcome.classified,
             outcome.deduped,
             outcome.thumbnailed,
             outcome.moved,
             outcome.failed,
+            outcome.skipped,
+            ctx.min_pixels,
             outcome.deferred,
             outcome.unreadable,
             outcome.faces,
@@ -1341,6 +1367,12 @@ struct BacklogItem {
     legacy: bool,
     /// The producer could not decode or prepare this file.
     failed: bool,
+    /// The image was decoded and thumbnailed, but sits below `min_pixels`.
+    ///
+    /// A third outcome on purpose: reusing `failed` would feed the circuit breaker with
+    /// rows that are behaving exactly as configured, and would count them as failures in
+    /// the pass summary.
+    skipped: bool,
 }
 
 /// Counters written by the producer and read by the summary.
@@ -1351,6 +1383,8 @@ struct BacklogCounters {
     /// pointers that only a `stat` can reveal.
     thumbs_needed: AtomicU64,
     failed: AtomicU64,
+    /// Rows left out of the vision request because they are below `min_pixels`.
+    skipped: AtomicU64,
     /// Rows whose context window is bigger than the one this block runs at. They
     /// get a block of their own on the next pass, now that the size is recorded.
     deferred: AtomicU64,
@@ -1483,7 +1517,9 @@ struct CtxBlock {
 /// defers the rest to the next pass.
 fn ctx_blocks(rows: &[db::BacklogRow], ctx: &ScanContext) -> Vec<CtxBlock> {
     let vision = ctx.vision_settings();
-    let profile = vision.prompt_profile;
+    // Same profile the first pass will really use, or the block would be planned for a
+    // window the request does not match — and Ollama would rebuild the runner.
+    let profile = crate::classify::effective_profile(&vision);
     let language = vision.description_language;
     let mut work: std::collections::BTreeMap<u32, Vec<db::BacklogRow>> =
         std::collections::BTreeMap::new();
@@ -1547,6 +1583,67 @@ fn ctx_blocks(rows: &[db::BacklogRow], ctx: &ScanContext) -> Vec<CtxBlock> {
     blocks
 }
 
+/// Wait until the root answers again, or the pass is cancelled.
+///
+/// Returns `true` when the share is back and the pass may resume, `false` only when the
+/// user cancelled. There is **no timeout**: the call blocks for as long as it takes, and
+/// the UI is expected to say so (the root row is marked offline here, and the sidebar
+/// already polls `roots.availability`).
+///
+/// Nothing is consumed while this runs, so no row is counted and no file is skipped: the
+/// producer resumes from the same row once `is_dir()` answers. The known limit is the
+/// probe itself — on a mount whose socket died, `is_dir()` blocks in the kernel and only
+/// the pause button (or the mount coming back) gets the thread out.
+fn share_wait(ctx: &ScanContext, root_id: i64, cancel: Option<&AtomicBool>) -> bool {
+    let root_path = match db::root_path_by_id(&ctx.db_path, root_id) {
+        Ok(Some(path)) => std::path::PathBuf::from(path),
+        other => {
+            // Without the path there is nothing to probe. Do not spin forever on a DB
+            // problem: say it and let the pass continue (the circuit breaker still guards
+            // against a pass that produces nothing).
+            log::warn!("Backlog: cannot resolve the root path for root {root_id}: {other:?}");
+            return true;
+        }
+    };
+
+    let started = std::time::Instant::now();
+    let _ = db::mark_root_offline(
+        &ctx.db_path,
+        root_id,
+        "stopped answering during the pass; waiting for it to come back",
+    );
+    log::warn!(
+        "Backlog: {} stopped answering after {SHARE_FAILURE_THRESHOLD} unreadable file(s) \
+         in a row; holding the pass until it comes back (pause to stop)",
+        root_path.display()
+    );
+
+    let mut attempt: u64 = 0;
+    loop {
+        let index = (attempt as usize).min(SHARE_BACKOFF_SECONDS.len() - 1);
+        let delay = SHARE_BACKOFF_SECONDS[index];
+        // Sleep in one-second slices so a pause is noticed immediately instead of after
+        // the full backoff.
+        for _ in 0..delay {
+            if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                log::info!("Backlog: stopped waiting for {} (cancelled)", root_path.display());
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        attempt += 1;
+        if root_path.is_dir() {
+            let _ = db::mark_root_online(&ctx.db_path, root_id);
+            log::info!(
+                "Backlog: {} is back after {:.0}s and {attempt} probe(s); resuming",
+                root_path.display(),
+                started.elapsed().as_secs_f64()
+            );
+            return true;
+        }
+    }
+}
+
 /// Producer half of the pipeline: decode once, thumbnail, prepare for the model.
 ///
 /// Runs on its own thread. Because the consumer is a single GPU request at a
@@ -1571,11 +1668,15 @@ fn produce_backlog_items(
     face_threads: usize,
 ) {
     let vision = ctx.vision_settings();
-    let profile = vision.prompt_profile;
+    // Must match [`crate::classify::effective_profile`]: the deferral check below
+    // predicts the window from this profile.
+    let profile = crate::classify::effective_profile(&vision);
     let language = vision.description_language;
     // Only video and PDF consult these caches, and seeding them would cost a `stat`
     // per indexed row; every still image is decoded here anyway.
     let mut legacy_caches = ThumbCaches::default();
+    // Unreadable files since the last successful read, for SHARE_FAILURE_THRESHOLD.
+    let mut consecutive_unreadable: u32 = 0;
     // Filled on the first row that needs faces, so a pass with the toggle on but
     // nothing pending never pays for the ~180 MB of models.
     let mut detector: Option<crate::face::FaceDetector> = None;
@@ -1584,6 +1685,17 @@ fn produce_backlog_items(
     for original in &block.rows {
         if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             break;
+        }
+
+        // A run of unreadable files is the share, not the files: hold the pass here
+        // instead of counting the rest of the list as unreadable. Checked before the
+        // read, so the rows already counted are the only ones lost to the outage — they
+        // stay pending and come back on the next pass.
+        if consecutive_unreadable >= SHARE_FAILURE_THRESHOLD {
+            if !share_wait(ctx, root_id, cancel) {
+                break;
+            }
+            consecutive_unreadable = 0;
         }
 
         let abs_path = Path::new(&original.abs_path);
@@ -1646,6 +1758,7 @@ fn produce_backlog_items(
                         dhash: None,
                         legacy: false,
                         failed: true,
+                        skipped: false,
                     };
                     if tx.send(item).is_err() {
                         break;
@@ -1676,6 +1789,7 @@ fn produce_backlog_items(
                 dhash: None,
                 legacy: true,
                 failed: false,
+                skipped: false,
             };
             if tx.send(item).is_err() {
                 break;
@@ -1687,6 +1801,7 @@ fn produce_backlog_items(
             // Not counted toward the circuit breaker and not persisted: a file the
             // NAS no longer has (or an unmounted share) says nothing about Ollama,
             // and hiding the row would need a rescan to undo.
+            consecutive_unreadable += 1;
             counters.unreadable.fetch_add(1, Ordering::Relaxed);
             let item = BacklogItem {
                 row,
@@ -1694,12 +1809,14 @@ fn produce_backlog_items(
                 dhash: None,
                 legacy: false,
                 failed: true,
+                skipped: false,
             };
             if tx.send(item).is_err() {
                 break;
             }
             continue;
         };
+        consecutive_unreadable = 0;
 
         // The index only knows whether a pointer exists. A pointer to a file that
         // is gone is the common case after the cache bug, so verify before
@@ -1740,7 +1857,19 @@ fn produce_backlog_items(
         }
 
         let dhash = decoded.dhash;
-        let prepared = if row.needs_classification {
+        // Resolution floor. The decode above happened for the thumbnail, not for the
+        // model, so skipping the vision request here keeps the file in the grid and saves
+        // the whole request: on job #35 (2026-10-28) the images that burned four attempts
+        // each and ended `failed` were 432x768 (0.33 MP) and 576x768 (0.44 MP).
+        // `set_image_dimensions` already recorded this size, so the next pass filters the
+        // row in SQL — and lowering the floor brings it back without a single request.
+        let below_floor = ctx.min_pixels > 0
+            && u64::from(decoded.image.width()) * u64::from(decoded.image.height())
+                < u64::from(ctx.min_pixels);
+        if below_floor && row.needs_classification {
+            counters.skipped.fetch_add(1, Ordering::Relaxed);
+        }
+        let prepared = if row.needs_classification && !below_floor {
             match vision_prep::prepare_from_decoded(
                 abs,
                 row.size_bytes.max(0) as u64,
@@ -1763,7 +1892,7 @@ fn produce_backlog_items(
         } else {
             None
         };
-        let failed = row.needs_classification && prepared.is_none();
+        let failed = row.needs_classification && prepared.is_none() && !below_floor;
 
         // Faces, on the buffer that is already in memory — no second read, no second
         // decode. Off unless the scan was started with `face_detection`; rows left
@@ -1791,6 +1920,7 @@ fn produce_backlog_items(
             dhash: Some(dhash),
             legacy: false,
             failed,
+            skipped: below_floor,
         };
         if tx.send(item).is_err() {
             break;
@@ -2157,8 +2287,9 @@ fn prepare_scan_rows(
 /// Failure kinds worth persisting on the row.
 ///
 /// Only the ones that are a property of **this file with this model**: a repetition
-/// loop, a context overflow, a body that does not parse after four attempts. Those
-/// would fail again the same way, so re-sending them every pass is pure waste.
+/// loop, a context overflow, a body that does not parse after four attempts. Those are
+/// worth recording — but they are **not** proof that the file is hopeless, which is
+/// what [`MAX_CLASSIFY_ATTEMPTS`] exists for.
 ///
 /// The environmental ones (`io`, `timeout`, `empty_frame`, `no_response`, `decode`,
 /// `prepare`, and an empty `unknown`) are deliberately **not** persisted: an
@@ -2171,19 +2302,33 @@ fn is_permanent_failure(kind: &str) -> bool {
     matches!(kind, "repeat_limit" | "ctx_overflow" | "parse")
 }
 
-/// Persist why a row produced nothing, so the next pass does not send it again.
+/// How many passes a file-intrinsic failure may be recorded before the row is taken
+/// out of the backlog.
 ///
-/// Without this the row came back on every pass — 63 of 886 files, 3–4 requests
+/// Giving up on the **first** failure condemned 622 rows after job #35 (2026-10-28),
+/// even though `repeat_limit` is not a stable property of an image: the same file
+/// answers correctly on a later pass, and the classifier's own comment records one
+/// image that "answered fine minutes later". Three passes is enough to tell a broken
+/// file from an unlucky sample, and the later passes also run with the repetition
+/// guard that the recovery attempts now actually send.
+const MAX_CLASSIFY_ATTEMPTS: i64 = 3;
+
+/// Persist why a row produced nothing, and give up only when the budget is spent.
+///
+/// Without persistence the row came back on every pass — 63 of 886 files, 3–4 requests
 /// each, measured on 2026-10-25 — so a backlog could never converge and the reason
-/// existed only as a `WARN` in a log the next start truncates. `Retry failed` is the
-/// explicit way back in ([`db::list_failed_rows`]).
+/// existed only as a `WARN` in a log the next start truncates. `Retry failed` stays the
+/// explicit way back in ([`db::list_failed_rows`]), but it is now reached after
+/// [`MAX_CLASSIFY_ATTEMPTS`] bad passes instead of after the first one.
 fn mark_failed(ctx: &ScanContext, file_id: i64, kind: &str, detail: &str) {
     if !is_permanent_failure(kind) {
-        log::debug!("Not marking file {file_id} as failed: '{kind}' is environmental");
+        log::debug!("Not recording file {file_id} as failed: '{kind}' is environmental");
         return;
     }
     let detail: String = detail.chars().take(400).collect();
-    if let Err(e) = db::mark_file_failed(&ctx.db_path, file_id, kind, &detail) {
+    if let Err(e) =
+        db::record_classification_failure(&ctx.db_path, file_id, kind, &detail, MAX_CLASSIFY_ATTEMPTS)
+    {
         log::error!("Could not record the failure for file {file_id}: {e}");
     }
 }
@@ -2235,6 +2380,8 @@ fn classify_prepared_and_update(
 #[derive(Debug, Default)]
 struct PipelineOutcome {
     processed: u64,
+    /// Rows that were decoded and thumbnailed but deliberately not sent to the model.
+    skipped: u64,
     classified: u64,
     deduped: u64,
     failed: u64,
@@ -2451,6 +2598,8 @@ fn run_pipeline_blocks(
         };
 
         let (tx, rx) = std::sync::mpsc::sync_channel::<BacklogItem>(QUEUE_DEPTH);
+        // Start of this block, for the aggregate progress line below.
+        let block_started = std::time::Instant::now();
 
         std::thread::scope(|scope| -> AppResult<()> {
             for run in &runs {
@@ -2497,6 +2646,10 @@ fn run_pipeline_blocks(
                     // not evidence that the runner keeps crashing, and counting it as
                     // such aborted a whole pass on 2026-10-26.
                     true
+                } else if item.skipped {
+                    // Below the resolution floor: no request was made, so nothing can
+                    // have failed. `true` keeps it out of the circuit breaker.
+                    true
                 } else if let Some(prepared) = item.prepared.as_ref() {
                     let representative = item
                         .dhash
@@ -2518,6 +2671,14 @@ fn run_pipeline_blocks(
                                         );
                                     }
                                 }
+                                // One line per row, so the log reconciles with
+                                // `processed` on its own. Without it a pass left ~4,700
+                                // rows (job #35) that were processed but never logged, and
+                                // the only place that knew about them was the summary.
+                                log::info!(
+                                    "Reused classification: {} (near-duplicate of file #{representative})",
+                                    item.row.rel_path
+                                );
                                 deduped += 1;
                                 true
                             } else if classify_prepared_and_update(
@@ -2585,6 +2746,22 @@ fn run_pipeline_blocks(
                     faces_total,
                     failed: counters.failed.load(Ordering::Relaxed),
                 });
+                // Aggregate line instead of one per thumbnail/face: 110 lines for a 55k
+                // pass, carrying the rate and where the rows went. One line per event
+                // would be ~36,000 (job #35) and would push the log out of its rotation.
+                if processed % PROGRESS_LOG_EVERY == 0 {
+                    let secs = block_started.elapsed().as_secs_f64().max(0.001);
+                    log::info!(
+                        "Backlog: {processed}/{total} in {secs:.0}s ({:.2} s/file) — \
+                         {} classified, {} deduped, {} thumbnailed, {} failed, {} skipped",
+                        secs / processed as f64,
+                        classified,
+                        deduped,
+                        counters.thumbnailed.load(Ordering::Relaxed),
+                        counters.failed.load(Ordering::Relaxed),
+                        counters.skipped.load(Ordering::Relaxed),
+                    );
+                }
                 if processed % 25 == 0 {
                     db::checkpoint_scan_job(
                         db_path,
@@ -2633,6 +2810,7 @@ fn run_pipeline_blocks(
         classified,
         deduped,
         failed: counters.failed.load(Ordering::Relaxed),
+        skipped: counters.skipped.load(Ordering::Relaxed),
         deferred: counters.deferred.load(Ordering::Relaxed),
         unreadable: counters.unreadable.load(Ordering::Relaxed),
         thumbnailed: counters.thumbnailed.load(Ordering::Relaxed),
@@ -2660,7 +2838,7 @@ fn run_backlog_pipeline(
     let rows = if only_failed {
         db::list_failed_rows(db_path, job.root_id)?
     } else {
-        db::list_backlog_rows(db_path, job.root_id, ctx.face_detection)?
+        db::list_backlog_rows_above(db_path, job.root_id, ctx.face_detection, ctx.min_pixels)?
     };
     // The phase is what the sidebar uses to resume in the right mode, so a retry
     // must not be recorded as a backlog pass.
@@ -2727,14 +2905,16 @@ fn run_backlog_pipeline(
     }
     log::info!(
         "Backlog{}: {} processed, {} classified ({} deduped), {} thumbnailed, \
-         {} failed, {} deferred to the next pass, {} unreadable, {} face(s) stored \
-         ({} face failure(s))",
+         {} failed, {} skipped below {} px, {} deferred to the next pass, {} unreadable, \
+         {} face(s) stored ({} face failure(s))",
         if only_failed { " (retry failed)" } else { "" },
         outcome.processed,
         outcome.classified,
         outcome.deduped,
         outcome.thumbnailed,
         outcome.failed,
+        outcome.skipped,
+        ctx.min_pixels,
         outcome.deferred,
         outcome.unreadable,
         outcome.faces,
@@ -3649,6 +3829,8 @@ mod tests {
             surya_script: tmp.path().join("surya_ocr.py"),
             model: "qwen2.5vl:7b".to_string(),
             image_max_side: vision.image_max_side,
+            min_pixels: vision.min_pixels,
+            library_kind: vision.library_kind,
             prompt_profile: vision.prompt_profile,
             description_language: vision.description_language,
             image_filter: vision.image_filter,
@@ -3692,6 +3874,23 @@ mod tests {
             fingerprint: Some(fingerprint.to_string()),
             status: FileStatus::New,
         }
+    }
+
+    /// The wait has no timeout, so cancellation is the only way out of it and it has to
+    /// be noticed inside the first backoff slice.
+    #[test]
+    fn share_wait_gives_up_when_cancelled() {
+        let (ctx, root_id, _root_path, _dirs) = backlog_fixture();
+        let cancel = AtomicBool::new(true);
+        let started = std::time::Instant::now();
+        assert!(
+            !share_wait(&ctx, root_id, Some(&cancel)),
+            "a cancelled pass must not resume into the missing share"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "cancelling has to be noticed inside the first backoff slice"
+        );
     }
 
     /// A byte-identical copy must not be decoded again: the source is never opened

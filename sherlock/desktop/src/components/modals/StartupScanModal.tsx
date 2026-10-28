@@ -79,6 +79,13 @@ export default function StartupScanModal({
         <p className="startup-scan-subtitle">
           {info.unclassified.toLocaleString()} arquivo(s) sem classificação ·{" "}
           {lastVerified(info.lastScanAt)}
+          {(info.failed ?? 0) > 0 && (
+            <>
+              {" · "}
+              {(info.failed ?? 0).toLocaleString()} já esgotaram as tentativas (Retry
+              failed)
+            </>
+          )}
         </p>
 
         <div className="startup-scan-options">

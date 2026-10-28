@@ -166,6 +166,15 @@ model_override = ""
 # large photos, so this is the single most effective speed knob.
 image_max_side = 1024
 
+# Total pixels (width x height) below which a still image is NOT sent to the model.
+# 0 disables the floor. The thumbnail and the EXIF location are still produced, so the
+# file stays visible in the grid; only the vision request is skipped, and lowering the
+# value later brings the rows back without a single new request.
+# 300000 = 0.3 MP, 500000 = 0.5 MP, 1000000 = 1.0 MP.
+# Measured on job #35 (2026-10-28): the images that burned four requests each and ended
+# as `failed` were 432x768 (0.33 MP) and 576x768 (0.44 MP) — 500000 skips exactly those.
+min_pixels = 0
+
 # Description style for the primary classification pass.
 # - concise   classifies + short description (max 12 words): ~30 output tokens
 # - detailed  adds anime series/character candidates: ~78 output tokens (slower)
@@ -188,6 +197,15 @@ description_language = "pt_br"
 # - box      always area-average: the fastest option
 # - lanczos  always Lanczos3: sharpest thin text, several times slower
 image_filter = "auto"
+
+# What the library mostly holds. Decides whether the anime enrichment pass runs.
+# - auto    decide per file, from what the first pass answered (default)
+# - photos  never spend a second image request on anime metadata
+# - anime   ask for series/characters in the FIRST pass, so one request does the work
+#           of two; images the model does not call anime keep a short description
+# Changing this only affects files classified from now on; rows already in the index
+# keep what they have (use "Enriquecer animes" to fill the gaps afterwards).
+library_kind = "auto"
 
 # OCR engine used for screenshots/documents.
 # - off    never run OCR
@@ -251,6 +269,9 @@ pub const DEFAULT_DESCRIPTION_LANGUAGE: DescriptionLanguage = DescriptionLanguag
 pub const MIN_IMAGE_MAX_SIDE: u32 = 640;
 /// Largest accepted longest-side. Above this Ollama caps image tokens anyway.
 pub const MAX_IMAGE_MAX_SIDE: u32 = 2048;
+/// Largest accepted resolution floor (20 MP). A floor above this would skip a whole
+/// library, and the setting exists to drop tiny thumbnails, not real photos.
+pub const MAX_MIN_PIXELS: u32 = 20_000_000;
 
 /// Description style for the primary classification pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -431,18 +452,63 @@ impl StartupScan {
     }
 }
 
+/// What the library mostly holds, which decides how the first pass is asked.
+///
+/// The anime enrichment pass costs a **second** image request for the same picture, and
+/// job #35 (2026-10-28) measured 1.48 requests per file. `Anime` folds that question into
+/// the first pass — the detailed prompt already carries `series_candidates` and
+/// `character_candidates` — and `Photos` drops the pass entirely, which also removes the
+/// false-positive path where a photo comes back as `artwork` and pays for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LibraryKind {
+    /// Decide per file from what the model answered (the historical behaviour).
+    #[default]
+    Auto,
+    /// Never spend a second request on anime metadata.
+    Photos,
+    /// Ask for series and characters in the first pass.
+    Anime,
+}
+
+impl LibraryKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Photos => "photos",
+            Self::Anime => "anime",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" | "automatic" | "automático" | "automatico" => Some(Self::Auto),
+            "photos" | "fotos" => Some(Self::Photos),
+            "anime" | "animes" => Some(Self::Anime),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeSettings {
     pub model_override: Option<String>,
     /// Longest side of the image handed to the model. `0` = original bytes.
     pub image_max_side: u32,
+    /// Total pixels below which a still image is not sent to the model. `0` disables it.
+    ///
+    /// Stored as a pixel count, not as megapixels, so this struct can stay `Eq` and the
+    /// comparison in SQL is exact (`image_width * image_height >= min_pixels`).
+    pub min_pixels: u32,
     pub prompt_profile: PromptProfile,
     /// Language of the free-text description (PT-BR by default).
     pub description_language: DescriptionLanguage,
     /// Resampler used when downscaling the image for the model.
     pub image_filter: ImageFilter,
     pub ocr_engine: OcrEngine,
+    /// What the library mostly holds; decides whether anime enrichment runs.
+    pub library_kind: LibraryKind,
     /// Behaviour when opening a folder that is already indexed.
     pub startup_scan: StartupScan,
     /// Hamming distance under which two photos are considered the same picture.
@@ -476,10 +542,12 @@ impl Default for RuntimeSettings {
         Self {
             model_override: None,
             image_max_side: DEFAULT_IMAGE_MAX_SIDE,
+            min_pixels: 0,
             prompt_profile: PromptProfile::Concise,
             description_language: DEFAULT_DESCRIPTION_LANGUAGE,
             image_filter: DEFAULT_IMAGE_FILTER,
             ocr_engine: OcrEngine::Llm,
+            library_kind: LibraryKind::Auto,
             startup_scan: StartupScan::Ask,
             dedupe_dhash_distance: DEFAULT_DEDUPE_DHASH_DISTANCE,
             chain_backlog: true,
@@ -500,11 +568,19 @@ pub struct SettingsUpdate {
     /// `None` or empty restores automatic model selection from the hardware.
     pub model: Option<String>,
     pub image_max_side: u32,
+    /// Total pixels below which a still image is not sent to the model (`0` = off).
+    ///
+    /// Defaulted so an older frontend that does not send the field keeps working.
+    #[serde(default)]
+    pub min_pixels: u32,
     pub prompt_profile: String,
     /// `pt_br` | `en`.
     pub description_language: String,
     pub image_filter: String,
     pub ocr_engine: String,
+    /// `auto` | `photos` | `anime`. Defaulted so an older frontend keeps working.
+    #[serde(default)]
+    pub library_kind: String,
     pub startup_scan: String,
     pub dedupe_dhash_distance: u32,
     pub chain_backlog: bool,
@@ -541,15 +617,25 @@ impl RuntimeSettings {
             .ok_or_else(|| format!("invalid image_filter '{}'", update.image_filter))?;
         let ocr_engine = OcrEngine::parse(&update.ocr_engine)
             .ok_or_else(|| format!("invalid ocr_engine '{}'", update.ocr_engine))?;
+        // Empty means "not sent by this frontend": keep whatever is stored instead of
+        // failing an update that only touched an unrelated field.
+        let library_kind = if update.library_kind.trim().is_empty() {
+            self.library_kind
+        } else {
+            LibraryKind::parse(&update.library_kind)
+                .ok_or_else(|| format!("invalid library_kind '{}'", update.library_kind))?
+        };
         let startup_scan = StartupScan::parse(&update.startup_scan)
             .ok_or_else(|| format!("invalid startup_scan '{}'", update.startup_scan))?;
 
         self.model_override = model_override;
         self.image_max_side = Self::normalize_image_max_side(update.image_max_side);
+        self.min_pixels = Self::normalize_min_pixels(update.min_pixels);
         self.prompt_profile = prompt_profile;
         self.description_language = description_language;
         self.image_filter = image_filter;
         self.ocr_engine = ocr_engine;
+        self.library_kind = library_kind;
         self.startup_scan = startup_scan;
         self.dedupe_dhash_distance = Self::normalize_dedupe_distance(update.dedupe_dhash_distance);
         self.chain_backlog = update.chain_backlog;
@@ -561,6 +647,16 @@ impl RuntimeSettings {
     /// `0` keeps "all cores"; anything else is clamped to the supported ceiling.
     pub fn normalize_face_threads(value: u32) -> u32 {
         value.min(crate::face::MAX_FACE_THREADS)
+    }
+
+    /// `0` disables the resolution floor; anything else is clamped so a typo cannot skip
+    /// an entire library in one keystroke.
+    ///
+    /// The ceiling is deliberately generous (20 MP): the point of the setting is to drop
+    /// tiny WhatsApp thumbnails, and a value that high only ever affects an intentional
+    /// "describe nothing below 20 megapixels" request.
+    pub fn normalize_min_pixels(value: u32) -> u32 {
+        value.min(MAX_MIN_PIXELS)
     }
 
     /// `0` is preserved (meaning "original bytes"); anything else is clamped to the
@@ -638,6 +734,15 @@ fn parse_runtime_settings(data: &str) -> AppResult<RuntimeSettings> {
                     ),
                 }
             }
+            "min_pixels" => {
+                let parsed = parse_settings_string(value.trim())?;
+                match parsed.trim().parse::<u32>() {
+                    Ok(v) => settings.min_pixels = RuntimeSettings::normalize_min_pixels(v),
+                    Err(_) => log::warn!(
+                        "settings.toml: ignoring min_pixels '{parsed}' (expected a pixel count, e.g. 500000)"
+                    ),
+                }
+            }
             "prompt_profile" => {
                 let parsed = parse_settings_string(value.trim())?;
                 match PromptProfile::parse(&parsed) {
@@ -671,6 +776,15 @@ fn parse_runtime_settings(data: &str) -> AppResult<RuntimeSettings> {
                     Some(v) => settings.ocr_engine = v,
                     None => log::warn!(
                         "settings.toml: ignoring ocr_engine '{parsed}' (expected: off | llm | surya)"
+                    ),
+                }
+            }
+            "library_kind" => {
+                let parsed = parse_settings_string(value.trim())?;
+                match LibraryKind::parse(&parsed) {
+                    Some(v) => settings.library_kind = v,
+                    None => log::warn!(
+                        "settings.toml: ignoring library_kind '{parsed}' (expected: auto | photos | anime)"
                     ),
                 }
             }
@@ -744,10 +858,12 @@ pub fn save_runtime_settings(settings: &RuntimeSettings) -> AppResult<()> {
     let known = [
         "model_override",
         "image_max_side",
+        "min_pixels",
         "prompt_profile",
         "description_language",
         "image_filter",
         "ocr_engine",
+        "library_kind",
         "startup_scan",
         "dedupe_dhash_distance",
         "chain_backlog",
@@ -767,6 +883,17 @@ pub fn save_runtime_settings(settings: &RuntimeSettings) -> AppResult<()> {
     replacements.insert(
         "image_max_side",
         format!("image_max_side = {}", settings.image_max_side),
+    );
+    replacements.insert(
+        "min_pixels",
+        format!("min_pixels = {}", settings.min_pixels),
+    );
+    replacements.insert(
+        "library_kind",
+        format!(
+            "library_kind = {}",
+            serde_json::json!(settings.library_kind.as_str())
+        ),
     );
     replacements.insert(
         "prompt_profile",
@@ -1058,6 +1185,42 @@ mod tests {
             "PT-BR is the default so a fresh install reads in the owner's language"
         );
         assert_eq!(settings.ocr_engine, OcrEngine::Llm);
+        assert_eq!(settings.library_kind, LibraryKind::Auto);
+        assert_eq!(settings.min_pixels, 0, "the floor is off by default");
+    }
+
+    #[test]
+    fn parse_runtime_settings_library_kind() {
+        // The three values the UI offers, plus the spellings people type by hand.
+        for (raw, expected) in [
+            ("auto", LibraryKind::Auto),
+            ("automatic", LibraryKind::Auto),
+            ("photos", LibraryKind::Photos),
+            ("fotos", LibraryKind::Photos),
+            ("anime", LibraryKind::Anime),
+        ] {
+            let settings =
+                parse_runtime_settings(&format!("library_kind = \"{raw}\"")).expect("settings");
+            assert_eq!(settings.library_kind, expected, "library_kind = {raw}");
+        }
+        let invalid = parse_runtime_settings(r#"library_kind = "klingon""#).expect("settings");
+        assert_eq!(
+            invalid.library_kind,
+            LibraryKind::Auto,
+            "an unknown profile keeps the default instead of failing the whole file"
+        );
+    }
+
+    #[test]
+    fn applying_an_update_without_library_kind_keeps_the_stored_one() {
+        // An older frontend does not send the field; that must not silently reset the
+        // profile to `auto` and start paying for anime enrichment again.
+        let mut settings = RuntimeSettings::default();
+        settings.library_kind = LibraryKind::Anime;
+        let mut update = full_update();
+        update.library_kind = String::new();
+        settings.apply_update(&update).expect("update");
+        assert_eq!(settings.library_kind, LibraryKind::Anime);
     }
 
     #[test]
@@ -1157,6 +1320,8 @@ mod tests {
         SettingsUpdate {
             model: Some("qwen2.5vl:7b".to_string()),
             image_max_side: 768,
+            min_pixels: 500_000,
+            library_kind: "anime".to_string(),
             prompt_profile: "detailed".to_string(),
             description_language: "en".to_string(),
             image_filter: "box".to_string(),
@@ -1225,6 +1390,8 @@ mod tests {
         let settings = RuntimeSettings {
             model_override: Some("qwen2.5vl:3b".to_string()),
             image_max_side: 768,
+            min_pixels: 500_000,
+            library_kind: LibraryKind::Anime,
             prompt_profile: PromptProfile::Detailed,
             description_language: DescriptionLanguage::En,
             image_filter: ImageFilter::Box,

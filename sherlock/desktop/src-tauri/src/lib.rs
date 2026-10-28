@@ -2716,6 +2716,8 @@ fn vision_settings_from_config() -> models::VisionSettings {
     let settings = config::load_runtime_settings().unwrap_or_default();
     models::VisionSettings {
         image_max_side: settings.image_max_side,
+        min_pixels: settings.min_pixels,
+        library_kind: settings.library_kind,
         prompt_profile: settings.prompt_profile,
         description_language: settings.description_language,
         image_filter: settings.image_filter,
@@ -2746,6 +2748,8 @@ fn build_scan_context(app_state: &AppState, app_handle: &tauri::AppHandle) -> mo
         surya_script,
         model: model_selection.scan_model,
         image_max_side: vision.image_max_side,
+        min_pixels: vision.min_pixels,
+        library_kind: vision.library_kind,
         prompt_profile: vision.prompt_profile,
         description_language: vision.description_language,
         image_filter: vision.image_filter,
@@ -2775,6 +2779,12 @@ struct VisionSettingsUpdate {
     /// `None` or empty restores automatic model selection from the hardware.
     model: Option<String>,
     image_max_side: u32,
+    /// Total pixels below which a still image is not sent to the model (`0` = off).
+    #[serde(default)]
+    min_pixels: u32,
+    /// `auto` | `photos` | `anime`; empty keeps whatever is stored.
+    #[serde(default)]
+    library_kind: String,
     prompt_profile: String,
     ocr_engine: String,
 }
@@ -2802,10 +2812,15 @@ fn set_vision_settings(update: VisionSettingsUpdate) -> Result<config::RuntimeSe
         .filter(|m| !m.is_empty());
     settings.image_max_side =
         config::RuntimeSettings::normalize_image_max_side(update.image_max_side);
+    settings.min_pixels = config::RuntimeSettings::normalize_min_pixels(update.min_pixels);
     settings.prompt_profile = config::PromptProfile::parse(&update.prompt_profile)
         .ok_or_else(|| format!("invalid prompt_profile '{}'", update.prompt_profile))?;
     settings.ocr_engine = config::OcrEngine::parse(&update.ocr_engine)
         .ok_or_else(|| format!("invalid ocr_engine '{}'", update.ocr_engine))?;
+    if !update.library_kind.trim().is_empty() {
+        settings.library_kind = config::LibraryKind::parse(&update.library_kind)
+            .ok_or_else(|| format!("invalid library_kind '{}'", update.library_kind))?;
+    }
     config::save_runtime_settings(&settings).map_err(|e| e.to_string())?;
     Ok(settings)
 }

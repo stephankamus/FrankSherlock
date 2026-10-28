@@ -250,6 +250,13 @@ pub struct PendingScanInfo {
     ///
     /// Deliberately not `confidence = 0`: that is a value the model returns.
     pub unclassified: u64,
+    /// How many of `unclassified` already spent their attempt budget.
+    ///
+    /// They are inside `unclassified` because they have no description, but the backlog
+    /// pass skips them ([`crate::db::list_backlog_rows`] filters `classify_state`), so
+    /// only `Retry failed` picks them up. Without this number the prompt promises work
+    /// that "continue classifying" will not do.
+    pub failed: u64,
     /// Unix seconds of the last completed scan, if any.
     pub last_scan_at: Option<i64>,
 }
@@ -396,6 +403,14 @@ pub struct ScanContext {
     pub model: String,
     /// Longest side of the image sent to the model (`0` = original bytes).
     pub image_max_side: u32,
+    /// Total pixels below which a still image is not sent to the model (`0` = off).
+    ///
+    /// The thumbnail and the EXIF location are still produced, so the file stays in the
+    /// grid; only the vision request is skipped. Kept as a pixel count so the backlog
+    /// can filter it in SQL (`image_width * image_height`) and stay comparable.
+    pub min_pixels: u32,
+    /// What the library mostly holds, which decides the anime enrichment policy.
+    pub library_kind: crate::config::LibraryKind,
     pub prompt_profile: crate::config::PromptProfile,
     /// Language the free-text description is written in.
     pub description_language: crate::config::DescriptionLanguage,
@@ -437,6 +452,8 @@ impl ScanContext {
     pub fn vision_settings(&self) -> VisionSettings {
         VisionSettings {
             image_max_side: self.image_max_side,
+            min_pixels: self.min_pixels,
+            library_kind: self.library_kind,
             prompt_profile: self.prompt_profile,
             description_language: self.description_language,
             image_filter: self.image_filter,
@@ -450,6 +467,10 @@ impl ScanContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VisionSettings {
     pub image_max_side: u32,
+    /// Total pixels below which a still image is not sent to the model (`0` = off).
+    pub min_pixels: u32,
+    /// What the library mostly holds; decides whether anime enrichment runs at all.
+    pub library_kind: crate::config::LibraryKind,
     pub prompt_profile: crate::config::PromptProfile,
     pub description_language: crate::config::DescriptionLanguage,
     pub image_filter: crate::config::ImageFilter,
@@ -461,6 +482,8 @@ impl Default for VisionSettings {
         let defaults = crate::config::RuntimeSettings::default();
         Self {
             image_max_side: defaults.image_max_side,
+            min_pixels: defaults.min_pixels,
+            library_kind: defaults.library_kind,
             prompt_profile: defaults.prompt_profile,
             description_language: defaults.description_language,
             image_filter: defaults.image_filter,

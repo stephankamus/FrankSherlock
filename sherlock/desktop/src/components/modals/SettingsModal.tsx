@@ -52,6 +52,21 @@ const OCR_ENGINES: { value: VisionOcrEngine; label: string }[] = [
   { value: "off", label: "Off" },
 ];
 
+/** Library profile options; decides whether the anime enrichment pass runs. */
+const LIBRARY_KINDS: { value: "auto" | "photos" | "anime"; label: string }[] = [
+  { value: "auto", label: "Automatic (decided per file)" },
+  { value: "photos", label: "Photos (no anime enrichment)" },
+  { value: "anime", label: "Anime (series and characters in the first pass)" },
+];
+
+/** Resolution floor presets, in total pixels (`0` = describe every image). */
+const RESOLUTION_FLOORS: { value: number; label: string }[] = [
+  { value: 0, label: "Off (describe every image)" },
+  { value: 300_000, label: "0.3 MP" },
+  { value: 500_000, label: "0.5 MP" },
+  { value: 1_000_000, label: "1 MP" },
+];
+
 const STARTUP_SCANS: { value: StartupScanSetting; label: string }[] = [
   { value: "ask", label: "Ask every time" },
   { value: "classify_only", label: "Resume classification" },
@@ -64,6 +79,8 @@ export function toSettingsPayload(settings: VisionSettings): SettingsUpdatePaylo
   return {
     model: settings.modelOverride,
     imageMaxSide: settings.imageMaxSide,
+    minPixels: settings.minPixels ?? 0,
+    libraryKind: settings.libraryKind ?? "auto",
     promptProfile: settings.promptProfile,
     descriptionLanguage: settings.descriptionLanguage,
     imageFilter: settings.imageFilter,
@@ -224,6 +241,43 @@ export default function SettingsModal({ onClose, onSaved, onOpenLogs }: Props) {
               />
               <span className="settings-hint">
                 0 sends the original bytes. Below 768 px the descriptions get worse.
+              </span>
+            </div>
+
+            <div className="settings-field">
+              <label htmlFor="settings-min-pixels">Ignore images below</label>
+              <select
+                id="settings-min-pixels"
+                value={settings.minPixels ?? 0}
+                onChange={(e) => patch({ minPixels: Number(e.target.value) })}
+              >
+                {RESOLUTION_FLOORS.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+              <span className="settings-hint">
+                Thumbnail and EXIF are still produced, so the file stays in the grid; only
+                the vision request is skipped. Lower it later and those rows come back
+                without a single new request.
+              </span>
+            </div>
+
+            <div className="settings-field">
+              <label htmlFor="settings-library-kind">Library profile</label>
+              <select
+                id="settings-library-kind"
+                value={settings.libraryKind ?? "auto"}
+                onChange={(e) =>
+                  patch({ libraryKind: e.target.value as "auto" | "photos" | "anime" })
+                }
+              >
+                {LIBRARY_KINDS.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+              <span className="settings-hint">
+                Anime asks for series and characters in the first pass, so one image
+                request does the work of two; Photos skips that pass entirely.
               </span>
             </div>
 

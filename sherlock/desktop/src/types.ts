@@ -527,17 +527,43 @@ export type StartupScanSetting = "ask" | "classify_only" | "full" | "none";
 export type PendingScanInfo = {
   rootId: number;
   unclassified: number;
+  /**
+   * How many of `unclassified` already spent their attempt budget. They are not part
+   * of the next pass: only "Retry failed" brings them back, so the prompt shows them
+   * apart instead of counting them as work that will happen.
+   */
+  failed?: number;
   lastScanAt: number | null;
 };
 
 /** Resampler used when downscaling the image sent to the model. */
 export type ImageFilterSetting = "auto" | "box" | "lanczos";
 
+/**
+ * What the library mostly holds, which decides the anime enrichment policy.
+ *
+ * `anime` asks for series/characters in the first pass (one image request instead of
+ * two); `photos` drops the enrichment entirely; `auto` decides per file, from what the
+ * model answered.
+ */
+export type LibraryKindSetting = "auto" | "photos" | "anime";
+
 /** Mirrors `config::RuntimeSettings` in the Rust backend. */
 export type VisionSettings = {
   modelOverride: string | null;
   /** Longest side sent to the model. 0 keeps the original bytes. */
   imageMaxSide: number;
+  /**
+   * Total pixels (width × height) below which a photo is not sent to the model.
+   *
+   * `0` disables the floor. The thumbnail and the EXIF are still produced, so the file
+   * stays in the grid; only the vision request is skipped, and lowering this value later
+   * brings those rows back without a single new request. Optional because an older
+   * `settings.toml` has no line for it and reads as "off".
+   */
+  minPixels?: number;
+  /** Library profile; decides whether anime enrichment runs. Optional = `auto`. */
+  libraryKind?: LibraryKindSetting;
   promptProfile: VisionPromptProfile;
   /** Language of the description; PT-BR by default. */
   descriptionLanguage: DescriptionLanguageSetting;
@@ -583,6 +609,10 @@ export type FaceThreadPlan = {
 export type SettingsUpdatePayload = {
   model: string | null;
   imageMaxSide: number;
+  /** Resolution floor in total pixels; `0` (or omitted) disables it. */
+  minPixels?: number;
+  /** Library profile; omitted keeps whatever `settings.toml` already has. */
+  libraryKind?: LibraryKindSetting;
   promptProfile: VisionPromptProfile;
   descriptionLanguage: DescriptionLanguageSetting;
   imageFilter: ImageFilterSetting;

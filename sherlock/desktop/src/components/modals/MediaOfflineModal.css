@@ -1,0 +1,12 @@
+.media-offline-hint {
+  font-size: 0.8rem;
+  opacity: 0.75;
+}
+
+/* Pausing is the destructive-looking action here: it is the only thing that ends the
+   wait, so it should not look like the default one. */
+.media-offline-modal .modal-actions button.media-offline-pause {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}

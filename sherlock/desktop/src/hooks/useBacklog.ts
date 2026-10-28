@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { cancelScan, getBacklogStatus } from "../api";
+import { cancelScan, getBacklogStatus, listRoots } from "../api";
 import type { BacklogProgress } from "../types";
 import { errorMessage } from "../utils";
 
@@ -25,6 +25,17 @@ type BacklogCallbacks = {
  */
 export function useBacklog({ pollMs, onNotice, onError, onFinished }: BacklogCallbacks) {
   const [backlog, setBacklog] = useState<BacklogProgress | null>(null);
+  /**
+   * Root of the running pass that stopped answering.
+   *
+   * A held pass produces no progress at all (nothing is consumed while it waits), so
+   * this cannot come from `backlog_status`: it is read from `roots.availability`, which
+   * the pass itself updates when it starts and stops waiting.
+   */
+  const [shareOffline, setShareOffline] = useState<{ rootId: number; rootName: string } | null>(
+    null,
+  );
+  const rootProbeTick = useRef(0);
   const failureReported = useRef(false);
   const finishedReported = useRef(true);
   // Kept in a ref so a new inline callback on every render does not reset the
@@ -49,6 +60,26 @@ export function useBacklog({ pollMs, onNotice, onError, onFinished }: BacklogCal
           finishedReported.current = false;
         }
         setBacklog(status);
+
+        // While the pass runs, look at the root every few ticks: a share that went away
+        // holds the pipeline, and that is the only signal the UI gets for it. One
+        // `listRoots` every five polls is cheap next to the 1 s cadence.
+        const running = status?.phase === "counting" || status?.phase === "running";
+        if (running && status?.rootId) {
+          rootProbeTick.current += 1;
+          if (rootProbeTick.current % 5 === 1) {
+            const roots = await listRoots();
+            const root = roots.find((candidate) => candidate.id === status.rootId);
+            setShareOffline(
+              root?.availability === "offline"
+                ? { rootId: root.id, rootName: root.rootName }
+                : null,
+            );
+          }
+        } else {
+          // Keep the same object when already cleared, so this does not re-render.
+          setShareOffline((previous) => (previous ? null : previous));
+        }
         if (
           (status?.phase === "done" || status?.phase === "cancelled") &&
           !finishedReported.current
@@ -83,5 +114,5 @@ export function useBacklog({ pollMs, onNotice, onError, onFinished }: BacklogCal
   const running =
     backlog != null && (backlog.phase === "counting" || backlog.phase === "running");
 
-  return { backlog, running, onCancelBacklog };
+  return { backlog, running, onCancelBacklog, shareOffline };
 }

@@ -5,7 +5,7 @@ use crate::platform::process::silent_command;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::config::{DescriptionLanguage, OcrEngine, PromptProfile};
+use crate::config::{DescriptionLanguage, LibraryKind, OcrEngine, PromptProfile};
 use crate::llm::{num_ctx_for, ollama_generate, parse_json_response, GenerateParams};
 use crate::models::{ClassificationResult, VisionSettings};
 use crate::vision_prep::{self, PreparedImage};
@@ -118,6 +118,33 @@ fn primary_num_predict(profile: PromptProfile) -> u32 {
         PromptProfile::Concise => 180,
         PromptProfile::Detailed => 500,
     }
+}
+
+/// Repetition guard for the recovery attempts of the first pass.
+///
+/// Ollama aborts a request with `500 prediction aborted, token repeat limit reached`
+/// when the decoder repeats itself too many times, and a low-information photo (a
+/// WhatsApp thumbnail, a flat wall, a concrete slab) is exactly that case. Measured
+/// on job #35 (2026-10-28): 1,512 requests died this way — **with and without** the
+/// JSON grammar — and the follow-up attempts looped again because nothing about the
+/// sampling had changed. [`GenerateParams`] documents this very remedy, but the two
+/// options were never set by the classifier: they were dead code.
+///
+/// 1.3 / 256 instead of Ollama's 1.1 / 64: the loop has to be broken inside a window
+/// wide enough to contain it, and the JSON keys repeat within ~200 tokens.
+const RECOVERY_REPEAT_PENALTY: f32 = 1.3;
+const RECOVERY_REPEAT_LAST_N: u32 = 256;
+
+/// Output budget for a recovery attempt.
+///
+/// A loop is cut by Ollama's own repeat limit, not by the budget, so a larger
+/// `num_predict` only lets a loop run longer before dying — and growing it on the
+/// third attempt is exactly what the old code did. The context window is unaffected
+/// by this number on its own (it is derived from the image size, the prompt length
+/// and the reserved output budget inside `num_ctx_for`), so shrinking it cannot make
+/// Ollama rebuild the runner.
+fn recovery_num_predict(primary: u32) -> u32 {
+    primary.min(260)
 }
 
 const ANIME_PROMPT: &str = concat!(
@@ -566,6 +593,20 @@ fn original_fits_window(
     Some(num_ctx_for(width, height, prompt_chars, num_predict) <= num_ctx)
 }
 
+/// Prompt profile the first pass really uses.
+///
+/// `library_kind = anime` upgrades the first pass to the detailed schema, which already
+/// asks for `series_candidates` and `character_candidates`. The value has to be the same
+/// in every place that derives `num_ctx` from it — here, the backlog block planner and the
+/// producer's deferral check — because a mismatch changes the context window and makes
+/// Ollama rebuild the runner per file.
+pub fn effective_profile(vision: &VisionSettings) -> PromptProfile {
+    match vision.library_kind {
+        LibraryKind::Anime => PromptProfile::Detailed,
+        LibraryKind::Auto | LibraryKind::Photos => vision.prompt_profile,
+    }
+}
+
 /// Context window a still image of `width × height` will need once prepared.
 ///
 /// The backlog pipeline groups rows by this value before opening them, so one
@@ -675,10 +716,13 @@ fn classify_primary(
     // wording is what makes qwen2.5-VL loop on flat images — Ollama answers 500
     // `prediction aborted, token repeat limit reached` (measured on 107 photos of a
     // construction site: 107 of 107 failed). With this prompt and no grammar the
-    // same 107 answer correctly, so the retry only changes the sampling mode.
+    // same 107 answer correctly, so the retry keeps the prompt and changes only the
+    // sampling: no grammar, the repetition guard, and a bounded budget.
     let params2 = GenerateParams {
         json_mode: false,
-        ..GenerateParams::vision(num_predict.min(260), Some(num_ctx))
+        repeat_penalty: Some(RECOVERY_REPEAT_PENALTY),
+        repeat_last_n: Some(RECOVERY_REPEAT_LAST_N),
+        ..GenerateParams::vision(recovery_num_predict(num_predict), Some(num_ctx))
     };
     let resp2 = ollama_generate(model, prompt, Some(&prepared.path), &params2);
     if resp2.ok {
@@ -700,16 +744,19 @@ fn classify_primary(
         );
     }
 
-    // Attempt 3: same prompt, no grammar, and a little entropy.
+    // Attempt 3: same prompt, no grammar, the repetition guard, and a little entropy.
     //
     // The repetition loop that kills attempts 1 and 2 is not deterministic — the same
     // image answered fine minutes later — so one more sample with temperature is the
-    // cheap way out. `num_predict` grows a little because a free-form answer is longer
-    // than the JSON.
+    // cheap way out. The budget does **not** grow here any more: the abort comes from
+    // Ollama's repeat limit, not from the budget, so a bigger `num_predict` only keeps
+    // a loop running longer before it dies.
     let params3 = GenerateParams {
         json_mode: false,
         temperature: 0.3,
-        ..GenerateParams::vision(num_predict.max(260), Some(num_ctx))
+        repeat_penalty: Some(RECOVERY_REPEAT_PENALTY),
+        repeat_last_n: Some(RECOVERY_REPEAT_LAST_N),
+        ..GenerateParams::vision(recovery_num_predict(num_predict), Some(num_ctx))
     };
     let resp3 = ollama_generate(model, prompt, Some(&prepared.path), &params3);
     if resp3.ok {
@@ -740,9 +787,26 @@ fn classify_primary(
     // when the prepared image is a temp copy (a passthrough already *is* the original)
     // and only when those bytes fit the window already requested — see
     // [`original_fits_window`].
+    // Two looping attempts in a row mean the problem is the picture, not the
+    // sampling: the original bytes are the *same* picture at a higher resolution, so
+    // the full-resolution request loops too — measured on job #35 (2026-10-28), where
+    // the attempt-4 request answered with the very same `repeat limit` 500. It is
+    // also the most expensive request of the file, so it is not worth sending.
+    let looped_twice = failure_kind_from(&resp2.raw) == "repeat_limit"
+        && failure_kind_from(&resp3.raw) == "repeat_limit";
+
     let mut resp4_raw = String::new();
-    let original_fits = (prepared.source != prepared.path)
-        .then(|| original_fits_window(&prepared.source, num_ctx, prompt.len(), num_predict));
+    let original_fits = if looped_twice {
+        log::info!(
+            "primary: not sending the original file for {} — attempts 2 and 3 both hit \
+             the token repeat limit",
+            prepared.source.display()
+        );
+        None
+    } else {
+        (prepared.source != prepared.path)
+            .then(|| original_fits_window(&prepared.source, num_ctx, prompt.len(), num_predict))
+    };
     match original_fits {
         Some(Some(false)) => log::info!(
             "primary: not sending the original file for {} — it needs more than the \
@@ -753,7 +817,9 @@ fn classify_primary(
             let params4 = GenerateParams {
                 json_mode: false,
                 temperature: 0.3,
-                ..GenerateParams::vision(num_predict.max(260), Some(num_ctx))
+                repeat_penalty: Some(RECOVERY_REPEAT_PENALTY),
+                repeat_last_n: Some(RECOVERY_REPEAT_LAST_N),
+                ..GenerateParams::vision(recovery_num_predict(num_predict), Some(num_ctx))
             };
             let resp4 = ollama_generate(model, prompt, Some(&prepared.source), &params4);
             if resp4.ok {
@@ -1256,10 +1322,12 @@ pub fn classify_image_prepared(
 ) -> ClassificationResult {
     log::info!("Classifying: {}", image_path.display());
 
+    // `library_kind = anime` asks for series and characters in the *first* pass; see
+    // [`effective_profile`].
     let (primary, primary_failure) = classify_primary(
         model,
         prepared,
-        vision.prompt_profile,
+        effective_profile(&vision),
         vision.description_language,
     );
 
@@ -1292,8 +1360,19 @@ pub fn classify_image_prepared(
     let mut extracted_text = String::new();
     let mut canonical_mentions = String::new();
 
-    // Anime enrichment
-    if should_run_anime_enrichment(&primary) {
+    // Anime enrichment, under the policy declared for this library.
+    //
+    // This is the request that costs a second image pass: the same picture, sent again
+    // with a bigger schema. `Photos` drops it even for the false positive path (a photo
+    // the model calls `artwork`), and `Anime` drops it because the first pass already
+    // asked. The mentions can still be filled later by the explicit "Enriquecer animes"
+    // pass, which selects exactly the rows that have `media_type` anime-ish and no
+    // `canonical_mentions`.
+    let enrich_anime = match vision.library_kind {
+        LibraryKind::Photos | LibraryKind::Anime => false,
+        LibraryKind::Auto => should_run_anime_enrichment(&primary),
+    };
+    if enrich_anime {
         if let Some(anime) = classify_anime_details(model, prepared, vision.description_language) {
             if let Some(series) = anime.get("series").and_then(clean_nullable_str) {
                 full_description = format!("{full_description} [Series: {series}]");
@@ -1373,7 +1452,9 @@ pub fn classify_image_prepared(
 // ---------------------------------------------------------------------------
 
 const VIDEO_PROMPT: &str = concat!(
-    "These are keyframes from a video. Analyze them and respond ONLY with valid JSON. Schema: ",
+    // Singular on purpose: one keyframe is sent, and a prompt that promised several made
+    // the model talk about frames it could not see.
+    "This is a keyframe from a video. Analyze it and respond ONLY with valid JSON. Schema: ",
     r#"{"media_type":"video","#,
     r#""video_category":"movie|tv_episode|personal|music_video|tutorial|other","#,
     r#""is_anime_related":false,"#,
@@ -1397,7 +1478,7 @@ const VIDEO_PROMPT: &str = concat!(
 /// category explanation do follow `description_language`; the category values stay
 /// English because `video_category` is matched in Rust.
 const VIDEO_PROMPT_PT: &str = concat!(
-    "Estes são quadros-chave de um vídeo. Analise e responda SOMENTE com JSON válido. Schema: ",
+    "Este é um quadro-chave de um vídeo. Analise e responda SOMENTE com JSON válido. Schema: ",
     r#"{"media_type":"video","#,
     r#""video_category":"movie|tv_episode|personal|music_video|tutorial|other","#,
     r#""is_anime_related":false,"#,
@@ -1481,7 +1562,14 @@ pub fn classify_video(
             .unwrap_or_else(|| "vid".to_string())
     ));
     let _ = std::fs::create_dir_all(&video_tmp);
-    let keyframes = crate::video::extract_keyframes(video_path, &video_tmp, 5);
+    // Only the first frame is ever sent to the model (`prepared_frame` below), so asking
+    // for five bought four extra `ffmpeg` seek+decodes per video, each of them a read of
+    // the file over the network share. Measured on job #35 (2026-10-28): 2,175 videos at
+    // ~5 s each is ~16 % of the whole pass. Two frames instead of one is deliberate — the
+    // extractor drops all-black frames, so the second is the fallback when the middle of
+    // the video is a cut to black. The thumbnail pass already extracts a single frame
+    // with the same reasoning (`thumbnail::generate_video_thumbnail`).
+    let keyframes = crate::video::extract_keyframes(video_path, &video_tmp, 2);
 
     // Step 3: Extract subtitle text
     let subtitle_text = crate::video::collect_subtitle_text(video_path, &video_tmp);
@@ -2283,6 +2371,9 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let vision = crate::models::VisionSettings {
             image_max_side: 1024,
+            // The smoke test wants every image described, floor off.
+            min_pixels: 0,
+            library_kind: crate::config::LibraryKind::Auto,
             prompt_profile: PromptProfile::Concise,
             description_language: DescriptionLanguage::En,
             image_filter: crate::config::ImageFilter::Auto,

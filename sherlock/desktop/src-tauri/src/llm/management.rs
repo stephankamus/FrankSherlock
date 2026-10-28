@@ -179,6 +179,20 @@ pub fn note_success() {
 ///
 /// Returns whether a reload was actually performed.
 pub fn reload_model(model: &str) -> bool {
+    reload_model_inner(model, true)
+}
+
+/// The same reload, bypassing the 10 s throttle.
+///
+/// Used by the second recovery cycle of a request that came back with the zero-value
+/// frame *again* after the first reload. The throttle exists to survive a runner that
+/// wedges immediately after every load, but in that case the answer is to stop sending
+/// requests, not to reuse a runner the caller has just seen fail.
+pub fn reload_model_now(model: &str) -> bool {
+    reload_model_inner(model, false)
+}
+
+fn reload_model_inner(model: &str, respect_throttle: bool) -> bool {
     use std::time::{Duration, Instant};
     let state = reload_state();
     let mut last = match state.lock() {
@@ -186,7 +200,9 @@ pub fn reload_model(model: &str) -> bool {
         Err(poisoned) => poisoned.into_inner(),
     };
     let now = Instant::now();
-    if last.is_some_and(|previous| now.duration_since(previous) < Duration::from_secs(10)) {
+    if respect_throttle
+        && last.is_some_and(|previous| now.duration_since(previous) < Duration::from_secs(10))
+    {
         return false;
     }
     *last = Some(now);
@@ -201,10 +217,42 @@ pub fn reload_model(model: &str) -> bool {
         Ok(_) => log::info!("Unloaded {model} to reset a wedged runner"),
         Err(e) => log::warn!("Could not unload {model}: {e}"),
     }
-    // The unload is asynchronous: the retry has to arrive after the runner is gone,
-    // otherwise Ollama cancels the unload and the wedged runner keeps serving.
-    std::thread::sleep(Duration::from_millis(400));
+    // The unload is asynchronous, and a fixed 400 ms sleep was not enough: measured on
+    // job #35 (2026-10-28), the retry arrived 3 s after the unload request and Ollama
+    // still answered with the **same** zero-value frame, because the wedged runner was
+    // the one that served it. `/api/ps` no longer listing the model is the condition
+    // that actually has to hold before the caller retries.
+    if !wait_until_unloaded(model, UNLOAD_TIMEOUT) {
+        log::warn!(
+            "{model} was still listed by /api/ps after {UNLOAD_TIMEOUT:?}; the retry may \
+             hit the old runner"
+        );
+    }
     true
+}
+
+/// How long the unload may take before the caller retries anyway.
+const UNLOAD_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// True once `/api/ps` no longer lists `model`.
+///
+/// The poll starts with a 100 ms pause so a healthy unload costs one short wait. It
+/// returns early when Ollama itself is unreachable: waiting proves nothing in that
+/// case, and the retry will produce the honest transport error instead.
+fn wait_until_unloaded(model: &str, timeout: Duration) -> bool {
+    let started = std::time::Instant::now();
+    std::thread::sleep(Duration::from_millis(100));
+    while started.elapsed() < timeout {
+        let (reachable, models) = list_loaded_models();
+        if !reachable {
+            return false;
+        }
+        if !models.iter().any(|loaded| loaded == model) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    false
 }
 
 pub fn cleanup_loaded_models() -> AppResult<()> {

@@ -47,6 +47,49 @@ const RESOLUTIONS: { value: number; label: string; hint: string }[] = [
   },
 ];
 
+/**
+ * Resolution floor: photos below this are thumbnailed but never sent to the model.
+ *
+ * `0` keeps every image, and that is the default — a small screenshot of a receipt is
+ * still a receipt. The presets exist for libraries dominated by chat thumbnails, where
+ * the 432x768 and 576x768 images answered `repeat_limit` four times and then became
+ * `failed` (job #35, 2026-10-28).
+ */
+const FLOORS: { value: number; label: string; hint: string }[] = [
+  { value: 0, label: "Sem piso", hint: "descreve toda imagem, inclusive as minúsculas" },
+  { value: 300_000, label: "0,3 MP", hint: "descarta ícones e miniaturas de conversa" },
+  {
+    value: 500_000,
+    label: "0,5 MP",
+    hint: "descarta as 432x768 e 576x768 que travavam em repeat_limit",
+  },
+  { value: 1_000_000, label: "1 MP", hint: "só fotos com pelo menos 1 megapixel" },
+];
+
+/**
+ * Library profile: whether the anime enrichment pass runs at all.
+ *
+ * It costs a **second** image request for the same picture, which is why `Animes` moves
+ * the question into the first pass and `Fotos` removes it.
+ */
+const LIBRARY_KINDS: { value: "auto" | "photos" | "anime"; label: string; hint: string }[] = [
+  {
+    value: "auto",
+    label: "Automático",
+    hint: "o modelo decide por arquivo — 1 request extra quando a imagem parece anime",
+  },
+  {
+    value: "photos",
+    label: "Fotos",
+    hint: "nunca faz o enrichment de anime, nem no falso positivo",
+  },
+  {
+    value: "anime",
+    label: "Animes",
+    hint: "pede séries e personagens já no primeiro passe: 1 request em vez de 2",
+  },
+];
+
 const PROFILES: { value: "concise" | "detailed"; label: string; hint: string }[] = [
   {
     value: "concise",
@@ -166,6 +209,8 @@ export default function ModelPickerModal({
     const next: VisionSettingsUpdate = {
       model: settings.modelOverride,
       imageMaxSide: settings.imageMaxSide,
+      minPixels: settings.minPixels ?? 0,
+      libraryKind: settings.libraryKind ?? "auto",
       promptProfile: settings.promptProfile,
       ocrEngine: settings.ocrEngine,
       ...patch,
@@ -267,6 +312,51 @@ export default function ModelPickerModal({
                       name="vision-resolution"
                       checked={settings.imageMaxSide === option.value}
                       onChange={() => apply({ imageMaxSide: option.value })}
+                    />
+                    <span className="model-picker-option-body">
+                      <strong>{option.label}</strong>
+                      <span className="model-picker-hint">{option.hint}</span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </section>
+
+            <section className="model-picker-section">
+              <h4>Ignorar imagens abaixo de</h4>
+              <p className="model-picker-hint">
+                A thumbnail e o EXIF continuam sendo gerados, então o arquivo segue na
+                grade — o que não acontece é o pedido ao modelo. Baixar o piso depois
+                traz as linhas de volta sem nenhum request novo.
+              </p>
+              <div className="model-picker-options">
+                {FLOORS.map((option) => (
+                  <label className="model-picker-option" key={option.value}>
+                    <input
+                      type="radio"
+                      name="vision-floor"
+                      checked={(settings.minPixels ?? 0) === option.value}
+                      onChange={() => apply({ minPixels: option.value })}
+                    />
+                    <span className="model-picker-option-body">
+                      <strong>{option.label}</strong>
+                      <span className="model-picker-hint">{option.hint}</span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </section>
+
+            <section className="model-picker-section">
+              <h4>Tipo de biblioteca</h4>
+              <div className="model-picker-options">
+                {LIBRARY_KINDS.map((option) => (
+                  <label className="model-picker-option" key={option.value}>
+                    <input
+                      type="radio"
+                      name="vision-library-kind"
+                      checked={(settings.libraryKind ?? "auto") === option.value}
+                      onChange={() => apply({ libraryKind: option.value })}
                     />
                     <span className="model-picker-option-body">
                       <strong>{option.label}</strong>

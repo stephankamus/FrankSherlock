@@ -35,6 +35,7 @@ import StatusBar from "./components/StatusBar/StatusBar";
 import ToastContainer from "./components/Toasts/ToastContainer";
 import SetupModal from "./components/modals/SetupModal";
 import ResumeModal from "./components/modals/ResumeModal";
+import MediaOfflineModal from "./components/modals/MediaOfflineModal";
 import StartupScanModal from "./components/modals/StartupScanModal";
 import ScanSummaryModal from "./components/modals/ScanSummaryModal";
 import PreviewModal from "./components/modals/PreviewModal";
@@ -379,7 +380,18 @@ export default function App() {
   usePolling(POLL_MS, scanManager.pollRuntimeAndScans, [scanManager.trackedJobIds]);
   useInfiniteScroll(sentinelRef, onLoadMore, [items.length, total, loadingMore]);
 
-  const hasModalOpen = !!(confirmDeleteFiles || renameItem || editMetadataItem || propertiesItem || albumManager.showCreateAlbum || smartFolderManager.showCreateSmartFolder || visionPicker || startupPrompt || showLogs);
+  /**
+   * The media-server dialog was dismissed by the user, but the wait keeps running.
+   *
+   * Cleared as soon as the share is back, so a later outage warns again instead of
+   * silently inheriting a dismissal from hours ago.
+   */
+  const [mediaOfflineHidden, setMediaOfflineHidden] = useState(false);
+  useEffect(() => {
+    if (!backlog.shareOffline) setMediaOfflineHidden(false);
+  }, [backlog.shareOffline]);
+
+  const hasModalOpen = !!(confirmDeleteFiles || renameItem || editMetadataItem || propertiesItem || albumManager.showCreateAlbum || smartFolderManager.showCreateSmartFolder || visionPicker || startupPrompt || showLogs || (backlog.shareOffline && !mediaOfflineHidden));
 
   const onRequestDelete = useCallback(() => {
     const filesToDelete = [...selectedIndices].sort((a, b) => a - b)
@@ -852,6 +864,16 @@ export default function App() {
             setShowModelInfo(false);
             setVisionPicker({ rootPath: null, resolve: null });
           }}
+        />
+      )}
+      {backlog.shareOffline && !mediaOfflineHidden && (
+        <MediaOfflineModal
+          rootName={backlog.shareOffline.rootName}
+          onPause={() => {
+            setMediaOfflineHidden(true);
+            void backlog.onCancelBacklog();
+          }}
+          onHide={() => setMediaOfflineHidden(true)}
         />
       )}
       {startupPrompt && (
