@@ -213,7 +213,7 @@ export default function Sidebar<TRoot extends RootInfo = RootInfo>({
                       album={album}
                       isSelected={activeAlbumName?.toLowerCase() === album.name.toLowerCase()}
                       onSelect={() => onSelectAlbum(album)}
-                      onDelete={() => onDeleteAlbum(album)}
+                      onDelete={readOnly ? undefined : () => onDeleteAlbum(album)}
                     />
                   </div>
                 );
@@ -234,7 +234,7 @@ export default function Sidebar<TRoot extends RootInfo = RootInfo>({
                       folder={folder}
                       isSelected={activeSmartFolderId === folder.id}
                       onSelect={() => onSelectSmartFolder(folder)}
-                      onDelete={() => onDeleteSmartFolder(folder)}
+                      onDelete={readOnly ? undefined : () => onDeleteSmartFolder(folder)}
                     />
                   </div>
                 );
@@ -407,38 +407,44 @@ export default function Sidebar<TRoot extends RootInfo = RootInfo>({
         </div>
       )}
 
-      <div className="sidebar-info-fixed">
-        <div className="sidebar-section"><span>Info</span></div>
-        <div className="sidebar-item">Files: <span>{dbStats?.files ?? "..."}</span></div>
-        <div className="sidebar-item">DB size: <span>{dbStats ? formatBytes(dbStats.dbSizeBytes) : "..."}</span></div>
-        {dbStats?.dbLogicalBytes != null && dbStats.dbLogicalBytes !== dbStats.dbSizeBytes && (
-          <div className="sidebar-item sidebar-item-muted">
-            In use: <span>{formatBytes(dbStats.dbLogicalBytes)}</span>
-          </div>
-        )}
-        <div className="sidebar-item">Thumbs: <span>{dbStats ? formatBytes(dbStats.thumbsSizeBytes) : "..."}</span></div>
-        {!readOnly && onCompactDatabase && (dbStats?.dbFreeBytes ?? 0) > 0 && (
-          <button
-            type="button"
-            className="sidebar-compact-btn"
-            onClick={onCompactDatabase}
-            disabled={compacting}
-            title="Reclaim free space in the database with VACUUM"
-          >
-            {compacting ? "Compacting…" : `Compact DB (${formatBytes(dbStats?.dbFreeBytes ?? 0)} free)`}
-          </button>
-        )}
-        {onOpenSettings && (
-          <button
-            type="button"
-            className="sidebar-compact-btn"
-            onClick={onOpenSettings}
-            title="Model, resize filter, OCR engine, duplicate distance, startup and backlog chaining"
-          >
-            Settings
-          </button>
-        )}
-      </div>
+      {/*
+        The info block describes this machine's cache (DB size, thumbnail bytes), which
+        the web deployment cannot know: without `dbStats` the whole section is absent.
+      */}
+      {dbStats && (
+        <div className="sidebar-info-fixed">
+          <div className="sidebar-section"><span>Info</span></div>
+          <div className="sidebar-item">Files: <span>{dbStats.files.toLocaleString()}</span></div>
+          <div className="sidebar-item">DB size: <span>{formatBytes(dbStats.dbSizeBytes)}</span></div>
+          {dbStats.dbLogicalBytes != null && dbStats.dbLogicalBytes !== dbStats.dbSizeBytes && (
+            <div className="sidebar-item sidebar-item-muted">
+              In use: <span>{formatBytes(dbStats.dbLogicalBytes)}</span>
+            </div>
+          )}
+          <div className="sidebar-item">Thumbs: <span>{formatBytes(dbStats.thumbsSizeBytes)}</span></div>
+          {!readOnly && onCompactDatabase && (dbStats.dbFreeBytes ?? 0) > 0 && (
+            <button
+              type="button"
+              className="sidebar-compact-btn"
+              onClick={onCompactDatabase}
+              disabled={compacting}
+              title="Reclaim free space in the database with VACUUM"
+            >
+              {compacting ? "Compacting…" : `Compact DB (${formatBytes(dbStats.dbFreeBytes ?? 0)} free)`}
+            </button>
+          )}
+          {onOpenSettings && (
+            <button
+              type="button"
+              className="sidebar-compact-btn"
+              onClick={onOpenSettings}
+              title="Model, resize filter, OCR engine, duplicate distance, startup and backlog chaining"
+            >
+              Settings
+            </button>
+          )}
+        </div>
+      )}
     </aside>
   );
 }

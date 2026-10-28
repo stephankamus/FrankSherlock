@@ -24,6 +24,12 @@ type Props<TGroup extends DuplicateGroup = DuplicateGroup> = {
   onBack: () => void;
   onSelectGroupDuplicates: (group: TGroup) => void;
   onPreviewGroup: (group: TGroup) => void;
+  /**
+   * Show the "Near-duplicates" controls. Defaults to true (desktop, where the
+   * backend can compute the distances); the web sets it to false because the
+   * published snapshot only serves exact groups.
+   */
+  showNearDuplicates?: boolean;
 };
 
 function formatDate(mtimeNs: number): string {
@@ -42,7 +48,7 @@ export default function DuplicatesView<TGroup extends DuplicateGroup = Duplicate
   data, loading, selected,
   nearEnabled, nearThreshold, onNearEnabledChange, onNearThresholdChange,
   onToggleFile, onSelectAllDuplicates, onDeselectAll, onDeleteSelected,
-  onBack, onSelectGroupDuplicates, onPreviewGroup,
+  onBack, onSelectGroupDuplicates, onPreviewGroup, showNearDuplicates = true,
 }: Props<TGroup>) {
   const canWrite = useLibrary().capabilities.write;
 
@@ -54,15 +60,17 @@ export default function DuplicatesView<TGroup extends DuplicateGroup = Duplicate
           {" "}<strong>{data.totalDuplicateFiles}</strong> duplicate{data.totalDuplicateFiles !== 1 ? "s" : ""},
           {" "}<strong>{formatBytes(data.totalWastedBytes)}</strong> wasted
         </div>
-        <label className="near-toggle" title="Include visually similar files (not just exact copies)">
-          <input
-            type="checkbox"
-            checked={nearEnabled}
-            onChange={(e) => onNearEnabledChange(e.target.checked)}
-          />
-          Near-duplicates
-        </label>
-        {nearEnabled && (
+        {showNearDuplicates && (
+          <label className="near-toggle" title="Include visually similar files (not just exact copies)">
+            <input
+              type="checkbox"
+              checked={nearEnabled}
+              onChange={(e) => onNearEnabledChange(e.target.checked)}
+            />
+            Near-duplicates
+          </label>
+        )}
+        {showNearDuplicates && nearEnabled && (
           <div className="near-threshold-control">
             <input
               type="range"

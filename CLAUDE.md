@@ -22,7 +22,9 @@ sherlock/               <- THE MAIN APP (Tauri v2 desktop)
   desktop/
     src-tauri/          <- Rust backend (scan, classify, thumbnail, publish, config)
     src/                <- React frontend (VSCode-inspired UI)
-  web/                  <- Docker-served read-only client (see plans/web-client.md)
+  web/
+    server/             <- axum read-only API over the published snapshot
+    ui/                 <- Vite + React web client (PWA)
 _classification/        <- PoC: Python classification pipeline (informed classify.rs)
 _research_ab_test/      <- A/B benchmark research (scripts, docs, test files)
   scripts/              <- Benchmark scripts for model selection
@@ -55,7 +57,9 @@ npm run test                             # shared + desktop frontend tests
 npm run test --workspace @frank-sherlock/shared
 npm run test --workspace sherlock-desktop
 npm run build --workspace sherlock-desktop
-cd sherlock/desktop && npm run tauri:dev   # launch dev mode
+npm run dev:web                          # Vite dev server for the web client
+npm run build:web                        # SPA bundle the container serves
+cd sherlock/desktop && npm run tauri:dev # launch dev mode
 cd sherlock/desktop && cargo test          # rust backend tests (src-tauri/)
 cd sherlock/desktop && npm run tauri:build # AppImage/DMG/MSI
 ```

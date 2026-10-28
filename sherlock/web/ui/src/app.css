@@ -1,0 +1,200 @@
+/* ── Web shell ─────────────────────────────────────────────── */
+/* Theme variables come from `@frank-sherlock/shared/theme.css`, imported in main. */
+
+body {
+  margin: 0;
+  overscroll-behavior-y: none;
+}
+
+#root {
+  height: 100vh;
+  height: 100dvh;
+}
+
+.web-app {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-base);
+  color: var(--text-primary);
+}
+
+.web-banner {
+  padding: 8px 14px;
+  font-size: var(--font-size-sm);
+  border-bottom: 1px solid var(--border-primary);
+}
+
+.web-banner-warn {
+  background: rgba(226, 160, 50, 0.15);
+  color: var(--warning, #e2a032);
+}
+
+.web-banner-error {
+  background: rgba(244, 71, 71, 0.12);
+  color: var(--danger);
+}
+
+.web-topbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: var(--bg-titlebar);
+  border-bottom: 1px solid var(--border-primary);
+  flex-shrink: 0;
+}
+
+.web-title {
+  font-size: var(--font-size-sm);
+}
+
+.web-revision {
+  margin-left: auto;
+  color: var(--text-secondary);
+  font-size: 0.7rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.web-menu {
+  display: none;
+  width: 32px;
+  height: 32px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: 1rem;
+  cursor: pointer;
+}
+
+.web-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+.web-sidebar {
+  width: 270px;
+  flex-shrink: 0;
+  display: flex;
+  min-height: 0;
+  border-right: 1px solid var(--border-primary);
+}
+
+.web-sidebar .sidebar {
+  flex: 1;
+  border-right: none;
+}
+
+.web-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* The shared toolbar is a single row; on a phone it has to wrap. */
+.web-main .toolbar {
+  flex-wrap: wrap;
+}
+
+.web-main .toolbar select {
+  width: 118px;
+}
+
+.web-grid-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px 12px;
+  padding-bottom: calc(10px + env(safe-area-inset-bottom));
+}
+
+.web-empty,
+.web-end {
+  text-align: center;
+  padding: 28px 12px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.web-sentinel {
+  display: flex;
+  justify-content: center;
+  padding: 16px 0;
+}
+
+.web-sentinel button {
+  padding: 6px 16px;
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+}
+
+.web-sentinel button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.web-status {
+  display: flex;
+  gap: 16px;
+  padding: 4px 12px;
+  border-top: 1px solid var(--border-primary);
+  background: var(--bg-titlebar);
+  color: var(--text-secondary);
+  font-size: 0.7rem;
+  flex-shrink: 0;
+}
+
+.web-backdrop {
+  display: none;
+}
+
+@media (max-width: 860px) {
+  .web-menu {
+    display: flex;
+  }
+
+  .web-sidebar {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 950;
+    width: min(84vw, 320px);
+    background: var(--bg-sidebar);
+    border-right: 1px solid var(--border-primary);
+    transform: translateX(-100%);
+    transition: transform 0.2s ease;
+  }
+
+  .web-sidebar-open {
+    transform: translateX(0);
+  }
+
+  .web-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 940;
+    border: none;
+    padding: 0;
+    background: rgba(0, 0, 0, 0.5);
+  }
+
+  .web-topbar {
+    padding-top: calc(8px + env(safe-area-inset-top));
+  }
+
+  .web-status {
+    display: none;
+  }
+}

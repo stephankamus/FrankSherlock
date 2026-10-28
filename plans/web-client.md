@@ -473,19 +473,29 @@ Branch `feat/web-client`, 2026-10-28 (terceira sessão).
   exercitar decode, resize, cache e `Range`. São 6 testes de integração e 6 unitários novos
   em `preview.rs`.
 
+- `sherlock/web/ui` criado: Vite + React, `LibraryProvider` com
+  `createHttpLibraryClient` (token de `?token=` ou localStorage, removido da URL depois),
+  busca com debounce e scroll infinito (IntersectionObserver + botão de fallback), sidebar
+  compartilhada em modo leitura (com drawer abaixo de 860 px), grid/toolbar/results, faces,
+  duplicados exatos, preview (PDF via iframe) e o banner de `unmappedRoots` vindo de
+  `/api/health`. PWA com manifest, ícones e service worker só do app shell; `/api` é sempre
+  network-only.
+- O `theme.css` passou para o `shared` e é exportado como
+  `@frank-sherlock/shared/theme.css`.
+- Cuidados que o web exigiu: `Sidebar` esconde o bloco de Info quando não há `dbStats` e os
+  cards de álbum/smart folder não renderizam exclusão em modo leitura; `DuplicatesView` ganhou
+  `showNearDuplicates` (o snapshot publicado só serve grupos exatos).
+
 **Números no momento do handoff**: 241 no `core`, 294 no desktop (Rust), 43 no servidor web
-(25 unitários + 18 de integração), 428 no frontend do desktop, 21 no `shared`;
-`cargo fmt --check` e `cargo clippy -- -D warnings` limpos nos três crates; `tsc --noEmit`
-limpo em `shared` e `desktop`. O item 5 está **completo**: todo componente que o web usa mora
-em `sherlock/shared`.
+(25 unitários + 18 de integração), 428 no frontend do desktop, 21 no `shared`, 5 no
+`sherlock/web/ui`; `cargo fmt --check` e `cargo clippy -- -D warnings` limpos nos três
+crates; `tsc --noEmit` limpo em `shared`, `desktop` e `web/ui`. Os itens 5 e 6 estão
+completos.
 
 **Próximo, em ordem**
 
-1. `sherlock/web/ui`: Vite + React, layout responsivo, PWA e manifest (entra também na lista
-   `workspaces` do `package.json` da raiz). Montar `LibraryProvider` com
-   `createHttpLibraryClient({ baseUrl, token })`, usar `Health` para o banner de roots não
-   mapeados e as views já compartilhadas para grid, sidebar, pessoas, duplicados e preview.
-   `utils/rawEstimate` continua no desktop (depende de `RawScanReport`).
+1. Embarcar o `web/ui/dist` no binário axum (rota `/` servindo o SPA e fallback para
+   `index.html`) — hoje a rota `/` ainda é o placeholder.
 2. Dockerfile multi-stage, compose, job de CI da imagem e `docs/web-deploy.md` (incluir
    `CACHE_DIR` no tmpfs e `LIBRARY_DIR` read-only).
 3. Validação ponta a ponta no celular.

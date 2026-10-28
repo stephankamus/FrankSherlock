@@ -66,6 +66,15 @@ jobs:
       - name: Typecheck shared package
         run: npm run typecheck --workspace @frank-sherlock/shared
 
+      - name: Typecheck web UI
+        run: npm run typecheck --workspace @frank-sherlock/web
+
+      - name: Run web UI tests
+        run: npm run test --workspace @frank-sherlock/web
+
+      - name: Build web UI
+        run: npm run build --workspace @frank-sherlock/web
+
       - name: Download PDFium
         working-directory: sherlock/desktop/src-tauri
         shell: bash
