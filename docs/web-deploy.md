@@ -167,8 +167,9 @@ offline library.
 | Symptom | Check |
 |---|---|
 | 503 on every request | `current.json` missing: has the desktop published at least once? |
+| 503 with `No such file or directory`, or `/library` empty inside the container, right after a successful publish | The container was created before the host share was mounted: bind sources are resolved at create time. Run `docker compose up -d --force-recreate` after the `mount -t cifs` (Docker Desktop keeps an empty placeholder until then) |
 | Banner lists a root | Add it to `media.map.json` and mount it in compose |
-| 401 | `AUTH_TOKEN` differs from the one the client stored; reopen with `?token=` |
+| 401 | `AUTH_TOKEN` differs from the one the client stored, or the client has none yet; reopen with `?token=`, which also replaces a stale value |
 | Videos do not seek | The share must allow byte ranges end to end (SMB/NFS both do) |
 | Stale thumbnails | Publish again; the derivative cache is namespaced by revision |
 | `--health` fails | The container cannot read `LIBRARY_DIR` or its pointer |
