@@ -2377,7 +2377,15 @@ pub fn migrate_thumbnail_layout(
             let mut moved = false;
             if let Some(ref old) = old_thumb {
                 let old_path = Path::new(old);
-                if old_path.exists() && old_path != target.as_path() {
+                // Only files that live in *this* cache are ours to move. A row can point
+                // outside it — a database copied to another data dir, a cache that was
+                // relocated — and following that pointer is destructive: opening a copy
+                // of a library moved 32 000 thumbnails out of the real cache and left it
+                // full of broken images while the copied database kept the new paths.
+                if old_path.starts_with(thumbnails_dir)
+                    && old_path.exists()
+                    && old_path != target.as_path()
+                {
                     if let Some(parent) = target.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
@@ -6304,6 +6312,43 @@ mod tests {
         let again = migrate_thumbnail_layout(&db_path, thumbs.path()).expect("again");
         assert!(again.already_done);
         assert_eq!(again.moved, 0);
+    }
+
+    /// A pointer into another cache must never be followed.
+    ///
+    /// This is the destructive case: opening a *copy* of a library (another data dir, a
+    /// backup, a test run) used to move the files the pointer named — 32 000 thumbnails
+    /// lifted out of the real cache, which then served nothing but "file does not exist"
+    /// while the copied database recorded the new paths.
+    #[test]
+    fn migrate_thumbnail_layout_never_touches_files_outside_the_cache() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let thumbs = tempfile::tempdir().expect("thumbs");
+        let other_cache = tempfile::tempdir().expect("other cache");
+        let root_dir = tempfile::tempdir().expect("root");
+        let root_path = root_dir.path().to_str().expect("path").to_string();
+        let root_id = upsert_root(&db_path, &root_path).expect("root");
+
+        upsert_file_record(&db_path, &sample_record(root_id, "a.jpg", "fp-a")).expect("a");
+        let foreign = other_cache.path().join("a.jpg");
+        std::fs::write(&foreign, b"thumb").expect("write");
+        update_file_thumb_path(&db_path, root_id, "a.jpg", &foreign.display().to_string())
+            .expect("thumb a");
+
+        let outcome = migrate_thumbnail_layout(&db_path, thumbs.path()).expect("migrate");
+
+        assert_eq!(outcome.moved, 0);
+        assert_eq!(outcome.nulled, 1);
+        assert!(
+            foreign.exists(),
+            "a file that belongs to another cache must be left where it is"
+        );
+        let rows = list_thumb_repair_rows(&db_path, Some(root_id)).expect("rows");
+        assert!(
+            rows[0].thumb_path.is_none(),
+            "this cache cannot serve a pointer from another one"
+        );
     }
 
     /// Rows written while the prompt still asked for a `confidence` carry 0.0. The repair
