@@ -1,6 +1,6 @@
 services:
   sherlock-web:
-    image: ghcr.io/OWNER/frank-sherlock-web:latest
+    #image: ghcr.io/OWNER/frank-sherlock-web:latest
     build:
       context: ../..
       dockerfile: sherlock/web/Dockerfile
@@ -8,6 +8,11 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+    # The image runs as uid 10001. A GVFS/SMB mount lives under /run/user/<uid>/gvfs,
+    # which is mode 0700 and owned by your user, so the container has to run as that
+    # uid to read it. Set SHERLOCK_UID/SHERLOCK_GID=1000 in .env for that case; drop
+    # both when the shares are kernel `mount -t cifs` mounts (uid 10001 is tighter).
+    user: "${SHERLOCK_UID:-10001}:${SHERLOCK_GID:-10001}"
     environment:
       LIBRARY_DIR: /library
       MEDIA_MAP: /config/media.map.json
@@ -16,10 +21,22 @@ services:
       RUST_LOG: info
     volumes:
       # PUBLISH_DIR is the folder chosen in Settings -> Publicação.
-      - ${PUBLISH_DIR:-/mnt/publish}:/library:ro
+      # Long syntax on purpose: a SMB path such as
+      # /run/user/1000/gvfs/smb-share:server=nas,share=x/FrankSherlock carries colons,
+      # and the short `src:dst:ro` form parses it as "too many colons".
+      - type: bind
+        source: ${PUBLISH_DIR:-/mnt/publish}
+        target: /library
+        read_only: true
       # One bind mount per root in media.map.json. Add more as needed.
-      - ${PHOTOS_DIR:-/mnt/fotos}:/mnt/fotos:ro
-      - ./config:/config:ro
+      - type: bind
+        source: ${PHOTOS_DIR:-/mnt/fotos}
+        target: /mnt/fotos
+        read_only: true
+      - type: bind
+        source: ./config
+        target: /config
+        read_only: true
     ports:
       - "8080:8080"
     healthcheck:

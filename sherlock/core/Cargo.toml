@@ -5,7 +5,9 @@ description = "Read core of the Frank Sherlock index, shared by the desktop app 
 authors = ["AkitaOnRails"]
 license = "GPL-3.0-only"
 edition = "2021"
-rust-version = "1.77.2"
+# 1.85 is the real floor: the locked AVIF stack (image -> rav1e -> aligned) uses
+# `edition = "2024"`, which cargo cannot even parse before that release.
+rust-version = "1.85"
 
 # Standalone crate on purpose, consumed by path from `desktop/src-tauri` and from
 # `web/server`, instead of a Cargo workspace. A workspace would move the

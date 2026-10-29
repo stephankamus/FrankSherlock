@@ -1,0 +1,7 @@
+# Real environment for `docker compose` (holds AUTH_TOKEN and host paths).
+# `.env.example` is the committed template.
+.env
+
+# Real media map (absolute paths of the machine that ran the scan).
+# `config/media.map.example.json` is the committed template.
+config/media.map.json

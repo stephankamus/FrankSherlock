@@ -5,7 +5,9 @@ description = "Read-only web server for a library published by the Frank Sherloc
 authors = ["AkitaOnRails"]
 license = "GPL-3.0-only"
 edition = "2021"
-rust-version = "1.77.2"
+# Same floor as `sherlock_core`: the locked dependencies include crates written for
+# `edition = "2024"`, so 1.85 is the oldest toolchain that can build this crate.
+rust-version = "1.85"
 
 [lib]
 name = "sherlock_web"

@@ -1,5 +1,16 @@
 # syntax=docker/dockerfile:1
 
+# `aligned 0.4.3` (pulled in by image -> rav1e -> av-scenechange) declares
+# `edition = "2024"`, which only exists from Rust 1.85 on. On 1.82 the build dies while
+# parsing that manifest:
+#
+#   feature `edition2024` is required
+#   The package requires the Cargo feature called `edition2024` ...
+#
+# This must stay at or above the MSRV of the locked dependencies; CI uses `stable`.
+# Declared before the first FROM so the `build` stage below can expand it.
+ARG RUST_VERSION=1.99
+
 # ── Frontend bundle ─────────────────────────────────────────────────────
 FROM node:24-bookworm-slim AS ui
 WORKDIR /src
@@ -17,7 +28,7 @@ COPY sherlock/web/ui sherlock/web/ui
 RUN npm run build --workspace @frank-sherlock/web
 
 # ── Server, with the bundle compiled in ─────────────────────────────────
-FROM rust:1.82-bookworm AS build
+FROM rust:${RUST_VERSION}-bookworm AS build
 WORKDIR /src
 
 COPY sherlock/core sherlock/core
@@ -25,7 +36,9 @@ COPY sherlock/web/server sherlock/web/server
 # `assets.rs` embeds this folder at compile time.
 COPY --from=ui /src/sherlock/web/ui/dist sherlock/web/ui/dist
 
-RUN cargo build --release --features embed-ui \
+# `--locked`: the committed Cargo.lock is the contract. Without it cargo re-resolves
+# when the lock drifts and silently pulls crates newer than this toolchain supports.
+RUN cargo build --release --locked --features embed-ui \
     --manifest-path sherlock/web/server/Cargo.toml
 
 # ── Runtime ─────────────────────────────────────────────────────────────
