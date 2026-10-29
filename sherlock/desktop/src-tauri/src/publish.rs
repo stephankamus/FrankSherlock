@@ -383,7 +383,7 @@ fn sync_tree(
     }
 
     if !cancel.load(Ordering::Relaxed) {
-        outcome.removed = remove_orphans(dst, &seen)?;
+        outcome.removed = sweep_tree(dst, &seen, total, on_progress)?;
     }
     Ok(outcome)
 }
@@ -504,21 +504,55 @@ fn is_up_to_date(source: &fs::Metadata, target: &Path) -> bool {
     seconds(source.modified()) == seconds(target_meta.modified())
 }
 
-/// Delete files under `dst` that are not in `keep` (relative paths seen in the source).
-fn remove_orphans(dst: &Path, keep: &std::collections::HashSet<PathBuf>) -> AppResult<u64> {
+/// Delete files under `dst` that are not in `keep` (relative paths seen in the source),
+/// then drop the directories the sweep left empty.
+///
+/// This walks the entire destination — 34 000 files on a real library — immediately after
+/// the copy reported `done == total`. It used to run inside the `thumbs`/`faces` phase
+/// with no progress at all, so the screen sat at 100 % while the share answered one
+/// `readdir`/`unlink` at a time, which is indistinguishable from a hang and got the app
+/// closed mid-publish. It now reports a `sweep` phase, and collects the directories during
+/// the same walk instead of walking the tree a second time.
+fn sweep_tree(
+    dst: &Path,
+    keep: &std::collections::HashSet<PathBuf>,
+    expected: u64,
+    on_progress: &mut dyn FnMut(PublishProgress),
+) -> AppResult<u64> {
     if !dst.is_dir() {
         return Ok(0);
     }
+    // Announced even when the tree is small, so the UI leaves "thumbs 34196/34196"
+    // behind the moment the sweep starts instead of showing a frozen 100 %.
+    on_progress(PublishProgress {
+        phase: "sweep".to_string(),
+        done: 0,
+        total: expected,
+        current: String::new(),
+    });
     let mut removed = 0u64;
-    for entry in WalkDir::new(dst)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_file())
-    {
+    let mut visited = 0u64;
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for entry in WalkDir::new(dst).into_iter().filter_map(|entry| entry.ok()) {
+        if entry.file_type().is_dir() {
+            if entry.path() != dst {
+                dirs.push(entry.path().to_path_buf());
+            }
+            continue;
+        }
         let path = entry.into_path();
         let Ok(rel) = path.strip_prefix(dst) else {
             continue;
         };
+        visited += 1;
+        if visited % 200 == 0 {
+            on_progress(PublishProgress {
+                phase: "sweep".to_string(),
+                done: visited,
+                total: expected,
+                current: rel.to_string_lossy().to_string(),
+            });
+        }
         if keep.contains(rel) {
             continue;
         }
@@ -529,37 +563,29 @@ fn remove_orphans(dst: &Path, keep: &std::collections::HashSet<PathBuf>) -> AppR
             Err(e) => log::warn!("publish: could not remove orphan {}: {e}", path.display()),
         }
     }
-    remove_empty_dirs(dst)?;
+    remove_empty_dirs(&mut dirs);
     Ok(removed)
 }
 
 fn remove_tree_contents(dst: &Path) -> AppResult<()> {
     if dst.is_dir() {
-        remove_orphans(dst, &std::collections::HashSet::new())?;
+        sweep_tree(dst, &std::collections::HashSet::new(), 0, &mut |_| {})?;
     }
     Ok(())
 }
 
-/// Drop directories left empty after an orphan sweep, `dst` itself excluded.
-fn remove_empty_dirs(dst: &Path) -> AppResult<()> {
-    let mut dirs: Vec<PathBuf> = WalkDir::new(dst)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_dir())
-        .map(|entry| entry.into_path())
-        .filter(|path| path != dst)
-        .collect();
+/// Drop directories left empty after an orphan sweep, deepest first.
+fn remove_empty_dirs(dirs: &mut Vec<PathBuf>) {
     // Deepest first: a parent only becomes empty after its children are gone.
     dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-    for dir in dirs {
-        let is_empty = fs::read_dir(&dir)
+    for dir in dirs.iter() {
+        let is_empty = fs::read_dir(dir)
             .map(|mut entries| entries.next().is_none())
             .unwrap_or(false);
         if is_empty {
-            let _ = fs::remove_dir(&dir);
+            let _ = fs::remove_dir(dir);
         }
     }
-    Ok(())
 }
 
 /// Everything the web needs to know about this revision without opening the database.
@@ -950,6 +976,42 @@ mod tests {
             .join(&root_key)
             .join("a.jpg")
             .exists());
+    }
+
+    #[test]
+    /// The sweep walks the whole destination after the copy says 100 %, so it has to say
+    /// what it is doing — that phase is what keeps the screen from looking hung.
+    #[test]
+    fn the_orphan_sweep_reports_its_own_phase() {
+        let temp = tempfile::tempdir().expect("temp");
+        let paths = test_paths(temp.path());
+        seed(&paths, &["a.jpg", "b.jpg"]);
+        let publish_dir = temp.path().join("share");
+        publish_library(
+            &paths,
+            &options(&publish_dir),
+            &AtomicBool::new(false),
+            &mut |_| {},
+        )
+        .expect("first");
+
+        let mut phases: Vec<String> = Vec::new();
+        publish_library(
+            &paths,
+            &options(&publish_dir),
+            &AtomicBool::new(false),
+            &mut |update| {
+                if !phases.contains(&update.phase) {
+                    phases.push(update.phase);
+                }
+            },
+        )
+        .expect("second");
+
+        assert!(
+            phases.iter().any(|phase| phase == "sweep"),
+            "the sweep must announce itself: {phases:?}"
+        );
     }
 
     #[test]
