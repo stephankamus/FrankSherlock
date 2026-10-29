@@ -1,0 +1,21 @@
+{
+  "name": "frank-sherlock",
+  "private": true,
+  "version": "0.0.0",
+  "license": "GPL-3.0-only",
+  "workspaces": [
+    "sherlock/shared",
+    "sherlock/desktop",
+    "sherlock/web/ui"
+  ],
+  "scripts": {
+    "test": "npm run test --workspaces --if-present",
+    "test:shared": "npm run test --workspace @frank-sherlock/shared",
+    "test:desktop": "npm run test --workspace sherlock-desktop",
+    "test:web": "npm run test --workspace @frank-sherlock/web",
+    "typecheck:shared": "npm run typecheck --workspace @frank-sherlock/shared",
+    "dev:web": "npm run dev --workspace @frank-sherlock/web",
+    "build:desktop": "npm run build --workspace sherlock-desktop",
+    "build:web": "npm run build --workspace @frank-sherlock/web"
+  }
+}

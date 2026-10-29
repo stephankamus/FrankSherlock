@@ -1,0 +1,431 @@
+/// Perceptual similarity scoring and near-duplicate grouping.
+///
+/// Uses dHash (difference hash) for visual similarity and Jaccard word
+/// overlap for description similarity, combined with configurable weights.
+/// Hamming distance between two 64-bit hashes (number of differing bits).
+pub fn hamming_distance(a: u64, b: u64) -> u32 {
+    (a ^ b).count_ones()
+}
+
+/// Visual similarity from two dHash values: `1.0 - dist/64.0`.
+pub fn dhash_similarity(a: u64, b: u64) -> f32 {
+    1.0 - hamming_distance(a, b) as f32 / 64.0
+}
+
+/// Bands used by [`DhashIndex`] to find near-duplicates without a full scan.
+///
+/// Seven bands of nine bits (covering bits 0..=62): with a threshold of at most 6
+/// differing bits, at least one band must be identical (pigeonhole), so the
+/// candidate lookup never misses a pair that the exact distance check accepts.
+const DEDUPE_BANDS: usize = 7;
+const DEDUPE_BAND_BITS: u32 = 9;
+
+/// Incremental index of dHash values used to fold near-duplicate photos.
+///
+/// Insertion and lookup are O(1) in the number of indexed files, which matters
+/// because classification runs over tens of thousands of rows.
+#[derive(Default)]
+pub struct DhashIndex {
+    bands: [std::collections::HashMap<u16, Vec<(u64, i64)>>; DEDUPE_BANDS],
+}
+
+impl DhashIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn band_key(dhash: u64, band: usize) -> u16 {
+        let shift = band as u32 * DEDUPE_BAND_BITS;
+        ((dhash >> shift) & ((1 << DEDUPE_BAND_BITS) - 1)) as u16
+    }
+
+    pub fn insert(&mut self, dhash: u64, file_id: i64) {
+        for band in 0..DEDUPE_BANDS {
+            self.bands[band]
+                .entry(Self::band_key(dhash, band))
+                .or_default()
+                .push((dhash, file_id));
+        }
+    }
+
+    /// Closest indexed file within `threshold` bits, if any.
+    pub fn find_near(&self, dhash: u64, threshold: u32) -> Option<i64> {
+        self.find_near_with_distance(dhash, threshold)
+            .map(|(file_id, _)| file_id)
+    }
+
+    /// Closest indexed file within `threshold` bits, with the distance that matched.
+    ///
+    /// The distance is what separates a real duplicate (0-2 bits: the same picture
+    /// stored twice) from a marginal neighbour sitting at the edge of the threshold,
+    /// so a reuse can be audited from the log instead of from the database.
+    pub fn find_near_with_distance(&self, dhash: u64, threshold: u32) -> Option<(i64, u32)> {
+        let mut best: Option<(u32, i64)> = None;
+        for band in 0..DEDUPE_BANDS {
+            let Some(candidates) = self.bands[band].get(&Self::band_key(dhash, band)) else {
+                continue;
+            };
+            for &(candidate_hash, file_id) in candidates {
+                let dist = hamming_distance(dhash, candidate_hash);
+                if dist <= threshold && best.map(|(b, _)| dist < b).unwrap_or(true) {
+                    best = Some((dist, file_id));
+                }
+            }
+        }
+        best.map(|(dist, file_id)| (file_id, dist))
+    }
+
+    /// Number of indexed hashes.
+    pub fn len(&self) -> usize {
+        self.bands[0].values().map(Vec::len).sum()
+    }
+
+    /// Whether nothing has been indexed yet.
+    ///
+    /// Every insert lands in all bands, so band 0 is enough to answer, and the pair
+    /// with [`Self::len`] is what makes this a proper collection type for callers.
+    pub fn is_empty(&self) -> bool {
+        self.bands[0].is_empty()
+    }
+}
+
+/// Jaccard word overlap between two descriptions.
+///
+/// Words are lowercased and filtered to length > 1.
+pub fn description_similarity(a: &str, b: &str) -> f32 {
+    use std::collections::HashSet;
+    let words = |s: &str| -> HashSet<String> {
+        s.split_whitespace()
+            .map(|w| w.to_lowercase())
+            .filter(|w| w.len() > 1)
+            .collect()
+    };
+    let set_a = words(a);
+    let set_b = words(b);
+    if set_a.is_empty() && set_b.is_empty() {
+        return 1.0;
+    }
+    let intersection = set_a.intersection(&set_b).count();
+    let union = set_a.union(&set_b).count();
+    if union == 0 {
+        return 0.0;
+    }
+    intersection as f32 / union as f32
+}
+
+/// Combined similarity: 85% visual (dHash) + 15% textual (description).
+pub fn combined_similarity(dhash_a: u64, dhash_b: u64, desc_a: &str, desc_b: &str) -> f32 {
+    let visual = dhash_similarity(dhash_a, dhash_b);
+    let textual = description_similarity(desc_a, desc_b);
+    0.85 * visual + 0.15 * textual
+}
+
+/// Candidate file for near-duplicate grouping.
+pub struct NearDupCandidate {
+    pub dhash: u64,
+    pub description: String,
+    pub fingerprint: String,
+}
+
+/// Group near-duplicate candidates using Union-Find.
+///
+/// Returns groups of indices into the `candidates` slice where each pair
+/// exceeds `threshold`. Skips pairs that share the same fingerprint (those
+/// are already handled by exact-duplicate detection). Groups with only one
+/// member are excluded from the output.
+pub fn group_near_duplicates(candidates: &[NearDupCandidate], threshold: f32) -> Vec<Vec<usize>> {
+    let n = candidates.len();
+    if n < 2 {
+        return Vec::new();
+    }
+
+    // Max Hamming distance to even consider a pair (early exit optimization).
+    // If visual alone can't reach the threshold, skip the pair entirely.
+    // visual_min = (threshold - 0.15) / 0.85  (worst case: textual = 1.0)
+    // hamming_max = (1.0 - visual_min) * 64
+    let visual_min = ((threshold - 0.15) / 0.85).max(0.0);
+    let max_hamming = ((1.0 - visual_min) * 64.0).floor() as u32;
+
+    let mut parent: Vec<usize> = (0..n).collect();
+    let mut rank: Vec<usize> = vec![0; n];
+
+    fn find(parent: &mut [usize], i: usize) -> usize {
+        let mut root = i;
+        while parent[root] != root {
+            root = parent[root];
+        }
+        // Path compression
+        let mut current = i;
+        while parent[current] != root {
+            let next = parent[current];
+            parent[current] = root;
+            current = next;
+        }
+        root
+    }
+
+    fn union(parent: &mut [usize], rank: &mut [usize], a: usize, b: usize) {
+        let ra = find(parent, a);
+        let rb = find(parent, b);
+        if ra == rb {
+            return;
+        }
+        if rank[ra] < rank[rb] {
+            parent[ra] = rb;
+        } else if rank[ra] > rank[rb] {
+            parent[rb] = ra;
+        } else {
+            parent[rb] = ra;
+            rank[ra] += 1;
+        }
+    }
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            // Skip pairs with identical fingerprint (exact duplicates)
+            if candidates[i].fingerprint == candidates[j].fingerprint {
+                continue;
+            }
+            // Early exit: if Hamming distance is too large, skip
+            let dist = hamming_distance(candidates[i].dhash, candidates[j].dhash);
+            if dist > max_hamming {
+                continue;
+            }
+            let sim = combined_similarity(
+                candidates[i].dhash,
+                candidates[j].dhash,
+                &candidates[i].description,
+                &candidates[j].description,
+            );
+            if sim >= threshold {
+                union(&mut parent, &mut rank, i, j);
+            }
+        }
+    }
+
+    // Collect groups
+    let mut groups: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for i in 0..n {
+        let root = find(&mut parent, i);
+        groups.entry(root).or_default().push(i);
+    }
+
+    groups.into_values().filter(|g| g.len() > 1).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hamming_identical() {
+        assert_eq!(hamming_distance(0, 0), 0);
+        assert_eq!(hamming_distance(u64::MAX, u64::MAX), 0);
+    }
+
+    #[test]
+    fn hamming_one_bit() {
+        assert_eq!(hamming_distance(0, 1), 1);
+        assert_eq!(hamming_distance(0b1010, 0b1000), 1);
+    }
+
+    #[test]
+    fn hamming_all_different() {
+        assert_eq!(hamming_distance(0, u64::MAX), 64);
+    }
+
+    #[test]
+    fn dhash_index_finds_pairs_within_threshold() {
+        let mut index = DhashIndex::new();
+        index.insert(0, 7);
+        index.insert(u64::MAX, 8);
+        assert_eq!(index.len(), 2);
+
+        assert_eq!(index.find_near(0b111, 6), Some(7));
+        assert_eq!(index.find_near(u64::MAX, 6), Some(8));
+    }
+
+    #[test]
+    fn dhash_index_rejects_beyond_threshold() {
+        let mut index = DhashIndex::new();
+        index.insert(0, 7);
+        // 7 bits away from 0 → above the default threshold of 6.
+        assert_eq!(index.find_near(0b111_1111, 6), None);
+        assert_eq!(index.find_near(0b111_1111, 7), Some(7));
+    }
+
+    #[test]
+    fn dhash_index_prefers_the_closest_hash() {
+        let mut index = DhashIndex::new();
+        index.insert(0b111, 1);
+        index.insert(0b111_1000, 2);
+        // 0b11 is 2 bits from the first entry and 3 from the second.
+        assert_eq!(index.find_near(0b11, 6), Some(1));
+    }
+
+    #[test]
+    fn dhash_sim_identical() {
+        let sim = dhash_similarity(0xABCD, 0xABCD);
+        assert!((sim - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn dhash_sim_opposite() {
+        let sim = dhash_similarity(0, u64::MAX);
+        assert!(sim.abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn dhash_sim_close() {
+        // 4 bits differ out of 64 → similarity = 1.0 - 4/64 = 0.9375
+        let a: u64 = 0;
+        let b: u64 = 0b1111;
+        let sim = dhash_similarity(a, b);
+        assert!((sim - 0.9375).abs() < 0.001);
+    }
+
+    #[test]
+    fn desc_sim_identical() {
+        let sim = description_similarity("a sunny beach photo", "a sunny beach photo");
+        assert!((sim - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn desc_sim_no_overlap() {
+        let sim = description_similarity("cat sleeping indoor", "mountain river outdoor");
+        assert!(sim < 0.01);
+    }
+
+    #[test]
+    fn desc_sim_partial_overlap() {
+        let sim = description_similarity("sunny beach photo", "sunny mountain photo");
+        // words: {sunny, beach, photo} vs {sunny, mountain, photo}
+        // intersection: {sunny, photo} = 2, union: {sunny, beach, photo, mountain} = 4
+        // Jaccard = 2/4 = 0.5
+        assert!((sim - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn desc_sim_both_empty() {
+        assert!((description_similarity("", "") - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn desc_sim_filters_short_words() {
+        // "a" has length 1, filtered out
+        let sim = description_similarity("a cat", "a dog");
+        // Only "cat" vs "dog" → 0 intersection, 2 union → 0.0
+        assert!(sim.abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn combined_sim_identical() {
+        let sim = combined_similarity(0xABCD, 0xABCD, "beach photo", "beach photo");
+        assert!((sim - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn combined_sim_weights() {
+        // visual = 1.0 (same hash), text = 0.0 (no overlap)
+        let sim = combined_similarity(0, 0, "cat", "dog");
+        // 0.85 * 1.0 + 0.15 * 0.0 = 0.85
+        assert!((sim - 0.85).abs() < 0.01);
+    }
+
+    #[test]
+    fn group_empty_input() {
+        let groups = group_near_duplicates(&[], 0.85);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn group_single_input() {
+        let candidates = vec![NearDupCandidate {
+            dhash: 0,
+            description: "test".into(),
+            fingerprint: "fp1".into(),
+        }];
+        let groups = group_near_duplicates(&candidates, 0.85);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn group_similar_pair() {
+        let candidates = vec![
+            NearDupCandidate {
+                dhash: 0,
+                description: "sunny beach".into(),
+                fingerprint: "fp1".into(),
+            },
+            NearDupCandidate {
+                dhash: 0b11, // 2 bits differ → visual sim = 1 - 2/64 ≈ 0.97
+                description: "sunny beach".into(),
+                fingerprint: "fp2".into(),
+            },
+        ];
+        let groups = group_near_duplicates(&candidates, 0.85);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn group_skips_same_fingerprint() {
+        let candidates = vec![
+            NearDupCandidate {
+                dhash: 0,
+                description: "test".into(),
+                fingerprint: "fp-same".into(),
+            },
+            NearDupCandidate {
+                dhash: 0, // identical hash but same fingerprint
+                description: "test".into(),
+                fingerprint: "fp-same".into(),
+            },
+        ];
+        let groups = group_near_duplicates(&candidates, 0.85);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn group_dissimilar_not_grouped() {
+        let candidates = vec![
+            NearDupCandidate {
+                dhash: 0,
+                description: "cat".into(),
+                fingerprint: "fp1".into(),
+            },
+            NearDupCandidate {
+                dhash: u64::MAX, // max distance
+                description: "dog".into(),
+                fingerprint: "fp2".into(),
+            },
+        ];
+        let groups = group_near_duplicates(&candidates, 0.85);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn group_transitive_chaining() {
+        // A ~ B and B ~ C should put A, B, C in the same group
+        let candidates = vec![
+            NearDupCandidate {
+                dhash: 0,
+                description: "beach sunset".into(),
+                fingerprint: "fp1".into(),
+            },
+            NearDupCandidate {
+                dhash: 0b11, // close to A
+                description: "beach sunset".into(),
+                fingerprint: "fp2".into(),
+            },
+            NearDupCandidate {
+                dhash: 0b1100, // close to B (4 bits from A, 4 from B but combined still above threshold)
+                description: "beach sunset".into(),
+                fingerprint: "fp3".into(),
+            },
+        ];
+        let groups = group_near_duplicates(&candidates, 0.85);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 3);
+    }
+}

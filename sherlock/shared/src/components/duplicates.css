@@ -1,0 +1,258 @@
+/* ── DuplicatesView — component-specific styles ─────────── */
+/* Base layout (.tool-view, .tool-toolbar, .tool-body, etc.)
+   is in tools.css */
+
+.tool-toolbar .danger-btn {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+
+.tool-toolbar .danger-btn:hover {
+  opacity: 0.9;
+}
+
+.tool-toolbar .danger-btn:disabled {
+  opacity: 0.4;
+}
+
+/* ── Group card ──────────────────────────────────────────── */
+.dup-group {
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-md);
+  margin-bottom: 10px;
+  background: var(--bg-surface);
+  overflow: hidden;
+}
+
+.dup-group-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--bg-input);
+  border-bottom: 1px solid var(--border-primary);
+  font-size: var(--font-size-sm);
+}
+
+.dup-group-header .dup-group-info {
+  flex: 1;
+  color: var(--text-secondary);
+}
+
+.dup-group-header .dup-group-info strong {
+  color: var(--text-primary);
+}
+
+.dup-group-header button {
+  padding: 2px 8px;
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--font-size-sm);
+}
+
+.dup-group-header button:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-focus);
+}
+
+/* ── File row ────────────────────────────────────────────── */
+.dup-file-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border-primary);
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.dup-file-row:last-child {
+  border-bottom: none;
+}
+
+.dup-file-row:hover {
+  background: var(--bg-hover);
+}
+
+.dup-file-row-selected {
+  background: rgba(0, 122, 204, 0.1);
+}
+
+.dup-file-checkbox {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+
+.dup-file-thumb {
+  flex-shrink: 0;
+  width: 48px;
+  height: 48px;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--bg-base);
+  display: grid;
+  place-items: center;
+}
+
+.dup-file-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.dup-file-thumb-placeholder {
+  font-size: 0.65rem;
+  color: var(--text-secondary);
+}
+
+.dup-file-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.dup-file-path {
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dup-file-meta {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  display: flex;
+  gap: 10px;
+  margin-top: 2px;
+}
+
+/* ── Near-duplicate controls ─────────────────────────────── */
+.near-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.near-toggle input[type="checkbox"] {
+  accent-color: var(--accent);
+}
+
+.near-threshold-control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.near-threshold-control input[type="range"] {
+  width: 80px;
+  accent-color: var(--accent);
+}
+
+.near-threshold-label {
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+  min-width: 30px;
+}
+
+/* ── Confidence tier badges ─────────────────────────────── */
+.dup-type-badge {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  font-size: 0.65rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+/* Green — exact match, safe to delete */
+.dup-type-badge-safe {
+  background: rgba(56, 161, 105, 0.2);
+  color: #38a169;
+}
+
+/* Yellow — high-confidence near-duplicate */
+.dup-type-badge-likely {
+  background: rgba(214, 158, 46, 0.2);
+  color: #d69e2e;
+}
+
+/* Red — low-confidence near-duplicate, needs visual check */
+.dup-type-badge-uncertain {
+  background: rgba(229, 62, 62, 0.2);
+  color: #e53e3e;
+}
+
+/* ── Confidence tier group backgrounds ─────────────────── */
+.dup-group-safe {
+  border-color: rgba(56, 161, 105, 0.35);
+  background: rgba(56, 161, 105, 0.05);
+}
+
+.dup-group-safe > .dup-group-header {
+  background: rgba(56, 161, 105, 0.08);
+}
+
+.dup-group-likely {
+  border-color: rgba(214, 158, 46, 0.35);
+  background: rgba(214, 158, 46, 0.05);
+}
+
+.dup-group-likely > .dup-group-header {
+  background: rgba(214, 158, 46, 0.08);
+}
+
+.dup-group-uncertain {
+  border-color: rgba(229, 62, 62, 0.35);
+  background: rgba(229, 62, 62, 0.05);
+}
+
+.dup-group-uncertain > .dup-group-header {
+  background: rgba(229, 62, 62, 0.08);
+}
+
+.dup-similarity-label {
+  font-weight: 500;
+}
+
+.dup-group-likely .dup-similarity-label {
+  color: #d69e2e;
+}
+
+.dup-group-uncertain .dup-similarity-label {
+  color: #e53e3e;
+}
+
+.dup-file-similarity {
+  font-weight: 500;
+}
+
+.dup-group-likely .dup-file-similarity {
+  color: #d69e2e;
+}
+
+.dup-group-uncertain .dup-file-similarity {
+  color: #e53e3e;
+}
+
+/* ── Keeper badge ────────────────────────────────────────── */
+.dup-keeper-badge {
+  flex-shrink: 0;
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  background: rgba(0, 122, 204, 0.2);
+  color: var(--accent);
+  font-size: 0.7rem;
+  font-weight: 600;
+}

@@ -3,9 +3,16 @@ import { loadUserConfig, saveUserConfig } from "../api";
 
 export function useUserConfig() {
   const [zoom, setZoom] = useState(1.25);
+  /**
+   * "Show hidden" filter, persisted with the rest of the UI config.
+   *
+   * Default off: hidden photos must stay hidden after a restart, not only until the
+   * window is reopened.
+   */
+  const [showHidden, setShowHiddenState] = useState(false);
   const configRef = useRef<Record<string, unknown>>({});
 
-  // Load user config (zoom) on mount
+  // Load user config (zoom + visibility filter) on mount
   useEffect(() => {
     let mounted = true;
     loadUserConfig()
@@ -14,6 +21,7 @@ export function useUserConfig() {
         configRef.current = cfg;
         const savedZoom = typeof cfg.zoom === "number" ? cfg.zoom : 1.25;
         setZoom(Math.max(0.5, Math.min(3.0, savedZoom)));
+        setShowHiddenState(cfg.showHidden === true);
       })
       .catch(() => {});
     return () => { mounted = false; };
@@ -54,5 +62,12 @@ export function useUserConfig() {
     saveUserConfig(cfg).catch(() => {});
   }
 
-  return { zoom };
+  const setShowHidden = (value: boolean) => {
+    setShowHiddenState(value);
+    const cfg = { ...configRef.current, showHidden: value };
+    configRef.current = cfg;
+    saveUserConfig(cfg).catch(() => {});
+  };
+
+  return { zoom, showHidden, setShowHidden };
 }

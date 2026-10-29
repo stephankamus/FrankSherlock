@@ -265,11 +265,7 @@ async fn provision_venv(
         let mut s = state.lock().expect("venv provision mutex poisoned");
         s.step = "installing_packages".to_string();
         s.progress_pct = 10.0;
-        s.message = format!(
-            "Installing {} ({})...",
-            packages.join(", "),
-            label
-        );
+        s.message = format!("Installing {} ({})...", packages.join(", "), label);
     }
 
     let pip = pip_venv_binary(&venv_dir);

@@ -2,11 +2,18 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
+  DuplicatesView,
+  HelpModal,
+  PreviewModal,
+  ToastContainer,
+  type SearchItem as SharedSearchItem,
+} from "@frank-sherlock/shared";
+import {
   cancelScan, compactDatabase, copyFilesToClipboard, deleteFiles, ensureDatabase,
   getCliFolderPath, getFailedClassifications, getFileMetadata, getFileProperties,
-  getVisionSettings, listRoots,
+  getHiddenFileCount, getVisionSettings, listRoots,
   pendingScanSummary, relinkRoot, removeRoot, renameFile, reorderRoots,
-  resetRootClassifications, startScan, updateFileMetadata, updateSettings,
+  resetRootClassifications, setFilesHidden, startScan, updateFileMetadata, updateSettings,
 } from "./api";
 import type {
   DbStats,
@@ -27,24 +34,21 @@ import { fileName, formatBytes } from "./utils/format";
 import Titlebar from "./components/Titlebar/Titlebar";
 import Sidebar from "./components/Sidebar/Sidebar";
 import Content from "./components/Content/Content";
-import DuplicatesView from "./components/Content/DuplicatesView";
 import FacesView from "./components/Content/FacesView";
+import PdfViewer from "./components/Content/PdfViewer";
 import PdfPasswordsView from "./components/Content/PdfPasswordsView";
 import ContextMenu from "./components/Content/ContextMenu";
 import StatusBar from "./components/StatusBar/StatusBar";
-import ToastContainer from "./components/Toasts/ToastContainer";
 import SetupModal from "./components/modals/SetupModal";
 import ResumeModal from "./components/modals/ResumeModal";
 import MediaOfflineModal from "./components/modals/MediaOfflineModal";
 import StartupScanModal from "./components/modals/StartupScanModal";
 import ScanSummaryModal from "./components/modals/ScanSummaryModal";
-import PreviewModal from "./components/modals/PreviewModal";
 import ConfirmDeleteModal from "./components/modals/ConfirmDeleteModal";
 import ConfirmReclassifyModal from "./components/modals/ConfirmReclassifyModal";
 import RawConversionModal from "./components/modals/RawConversionModal";
 import ConfirmFileDeleteModal from "./components/modals/ConfirmFileDeleteModal";
 import RenameModal from "./components/modals/RenameModal";
-import HelpModal from "./components/modals/HelpModal";
 import EditMetadataModal from "./components/modals/EditMetadataModal";
 import PropertiesModal from "./components/modals/PropertiesModal";
 import ModelInfoModal from "./components/modals/ModelInfoModal";
@@ -74,6 +78,16 @@ import "./app.css";
 
 const POLL_MS = 1200;
 
+/**
+ * PDF pane of the shared preview.
+ *
+ * The desktop keeps `PdfViewer` (pdf.js + saved passwords + reclassify on unlock);
+ * the shared component only knows how to ask for this slot.
+ */
+function renderPdfItem(item: SharedSearchItem) {
+  return <PdfViewer filePath={item.absPath ?? ""} fileId={item.id} />;
+}
+
 export default function App() {
   /* ── Core UI state ── */
   const [query, setQuery] = useState("");
@@ -87,6 +101,8 @@ export default function App() {
   const [compacting, setCompacting] = useState(false);
   const [selectedRootId, setSelectedRootId] = useState<number | null>(null);
   const [readOnly, setReadOnly] = useState(false);
+  /** How many rows of the current scope are hidden, for the toolbar toggle. */
+  const [hiddenCount, setHiddenCount] = useState(0);
   const [showResumeModal, setShowResumeModal] = useState(false);
   const [confirmDeleteRoot, setConfirmDeleteRoot] = useState<RootInfo | null>(null);
   const [confirmReclassifyRoot, setConfirmReclassifyRoot] = useState<RootInfo | null>(null);
@@ -146,8 +162,8 @@ export default function App() {
   const gridRef = useRef<HTMLDivElement>(null);
 
   /* ── Toast ── */
-  const { notice, error, setNotice, setError } = useToast();
-  useUserConfig();
+  const { notice, noticeAction, error, setNotice, setError } = useToast();
+  const { showHidden, setShowHidden } = useUserConfig();
   const columnsRef = useGridColumns(gridRef);
 
   /* ── Feature hooks ── */
@@ -285,10 +301,29 @@ export default function App() {
     selectedRootId,
     sortBy,
     sortOrder,
+    includeHidden: showHidden,
     isReady: !setup || setup.isReady,
     onClearSelection: clearSelection,
     onReconcileSelection,
   });
+
+  /* ── Hidden photos ── */
+  const hiddenScope = useMemo(
+    () => (selectedRootId != null ? [selectedRootId] : []),
+    [selectedRootId],
+  );
+
+  const refreshHiddenCount = useCallback(async () => {
+    try {
+      setHiddenCount(await getHiddenFileCount(hiddenScope));
+    } catch {
+      // A count is not worth an error toast: the toggle simply stays hidden.
+    }
+  }, [hiddenScope]);
+
+  useEffect(() => {
+    void refreshHiddenCount();
+  }, [refreshHiddenCount, total, showHidden]);
 
   /* ── Scan manager ── */
   const scanManager = useScanManager({
@@ -714,6 +749,64 @@ export default function App() {
     }
   }
 
+  /**
+   * Hide or unhide a set of rows and offer the opposite action on the toast.
+   *
+   * `wereVisible` is captured before the call because the undo must restore only the
+   * rows this action actually hid: unhiding something that was already hidden when
+   * the user clicked would be a different edit than the one being undone.
+   */
+  async function applyHidden(targets: SearchItem[], hide: boolean) {
+    if (targets.length === 0) return;
+    const ids = targets.map((item) => item.id);
+    const wereVisible = targets.filter((item) => item.hiddenAt == null).map((item) => item.id);
+    try {
+      const changed = await setFilesHidden(ids, hide);
+      await runSearch(0, false, undefined, true);
+      await refreshHiddenCount();
+      if (changed === 0) return;
+      if (hide) {
+        setNotice(changed === 1 ? "Photo hidden" : `${changed} photos hidden`, {
+          label: "Undo",
+          run: () => {
+            void (async () => {
+              try {
+                await setFilesHidden(wereVisible, false);
+                setNotice(null);
+                await runSearch(0, false, undefined, true);
+                await refreshHiddenCount();
+              } catch (err) {
+                setError(errorMessage(err));
+              }
+            })();
+          },
+        });
+      } else {
+        setNotice(
+          changed === 1 ? "Photo visible again" : `${changed} photos visible again`,
+        );
+      }
+    } catch (err) {
+      setError(errorMessage(err));
+    }
+  }
+
+  function handleTileToggleHidden(index: number) {
+    const item = items[index];
+    if (!item) return;
+    void applyHidden([item], item.hiddenAt == null);
+  }
+
+  function handleContextToggleHidden() {
+    setContextMenu(null);
+    const targets = [...selectedIndices]
+      .map((index) => items[index])
+      .filter((item): item is SearchItem => Boolean(item));
+    if (targets.length === 0) return;
+    const allHidden = targets.every((item) => item.hiddenAt != null);
+    void applyHidden(targets, !allHidden);
+  }
+
   async function handleRenameFile(newName: string) {
     if (!renameItem) return;
     const item = renameItem;
@@ -832,6 +925,7 @@ export default function App() {
           totalItems={items.length}
           onClose={() => setPreviewOpen(false)}
           onNavigate={(idx) => { selectOnly(idx); }}
+          renderPdf={renderPdfItem}
         />
       )}
       {duplicates.dupPreviewItems.length > 0 && (
@@ -842,6 +936,7 @@ export default function App() {
           totalItems={duplicates.dupPreviewItems.length}
           onClose={() => duplicates.setDupPreviewItems([])}
           onNavigate={() => {}}
+          renderPdf={renderPdfItem}
         />
       )}
       {facePreviewItems.length > 0 && (
@@ -852,6 +947,7 @@ export default function App() {
           totalItems={1}
           onClose={() => setFacePreviewItems([])}
           onNavigate={() => {}}
+          renderPdf={renderPdfItem}
         />
       )}
       {showHelp && <HelpModal onClose={() => setShowHelp(false)} />}
@@ -991,6 +1087,11 @@ export default function App() {
           onDelete={handleContextDelete}
           onAddToAlbum={handleAddToAlbum}
           onCreateAlbumFromSelection={handleCreateAlbumFromSelection}
+          onToggleHidden={handleContextToggleHidden}
+          selectionAllHidden={
+            selectedIndices.size > 0 &&
+            [...selectedIndices].every((index) => items[index]?.hiddenAt != null)
+          }
           onClose={() => setContextMenu(null)}
         />
       )}
@@ -1204,6 +1305,10 @@ export default function App() {
             onSortOrderChange={setSortOrder}
             hasTextQuery={query.trim().length > 0}
             onSaveSmartFolder={smartFolderManager.openCreateModal}
+            includeHidden={showHidden}
+            onIncludeHiddenChange={setShowHidden}
+            hiddenCount={hiddenCount}
+            onTileToggleHidden={handleTileToggleHidden}
             items={items}
             total={total}
             loading={loading}
@@ -1235,7 +1340,7 @@ export default function App() {
       />
 
       {/* ── Toasts ── */}
-      <ToastContainer notice={notice} error={error} />
+      <ToastContainer notice={notice} error={error} noticeAction={noticeAction} />
     </div>
   );
 }

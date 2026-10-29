@@ -465,7 +465,10 @@ pub fn support(python: &Path, script: &Path) -> RawSupport {
             message: format!("conversion script not found: {}", script.display()),
         };
     }
-    let output = silent_command(python).arg(script).arg("--self-check").output();
+    let output = silent_command(python)
+        .arg(script)
+        .arg("--self-check")
+        .output();
     let Ok(output) = output else {
         return RawSupport {
             ready: false,
@@ -639,7 +642,6 @@ where
     Ok(())
 }
 
-
 // ---------------------------------------------------------------------------
 // Job
 // ---------------------------------------------------------------------------
@@ -688,9 +690,10 @@ where
     // A cancel during the walk must end the job here: converting a partial list silently
     // would be worse than reporting the cancellation.
     if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-        let mut report = RawJobReport::default();
-        report.cancelled = true;
-        return Ok(report);
+        return Ok(RawJobReport {
+            cancelled: true,
+            ..Default::default()
+        });
     }
     let existing = crate::db::list_raw_conversions(db_path, root_id)?;
     let by_source: std::collections::HashMap<String, RawConversion> = existing
@@ -778,9 +781,7 @@ where
             if !line.ok {
                 report.failed += 1;
                 if report.failures.len() < 20 {
-                    let reason = line
-                        .error
-                        .unwrap_or_else(|| "unknown error".to_string());
+                    let reason = line.error.unwrap_or_else(|| "unknown error".to_string());
                     report
                         .failures
                         .push(format!("{}: {}", short_path(&source), reason.trim()));
@@ -876,7 +877,11 @@ fn file_mtime_ns(path: &str) -> i64 {
 /// can never delete a single converted copy.
 #[allow(dead_code)]
 pub fn prune_empty_output_dir(dir: &Path) {
-    if dir.file_name().map(|name| name == OUTPUT_DIR_NAME).unwrap_or(false) {
+    if dir
+        .file_name()
+        .map(|name| name == OUTPUT_DIR_NAME)
+        .unwrap_or(false)
+    {
         let _ = std::fs::remove_dir(dir);
     }
 }
@@ -1105,11 +1110,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
         std::fs::create_dir_all(root.join("a/FrankSherlock-JPG")).expect("dirs");
-        std::fs::write(root.join("a/photo.HEIC"), vec![0_u8; MIN_RAW_BYTES as usize])
-            .expect("write");
+        std::fs::write(
+            root.join("a/photo.HEIC"),
+            vec![0_u8; MIN_RAW_BYTES as usize],
+        )
+        .expect("write");
         std::fs::write(root.join("a/tiny.nef"), b"tiny").expect("write");
-        std::fs::write(root.join("a/FrankSherlock-JPG/photo__heic.jpg"), b"copy")
-            .expect("write");
+        std::fs::write(root.join("a/FrankSherlock-JPG/photo__heic.jpg"), b"copy").expect("write");
         std::fs::write(root.join("a/notes.jpg"), vec![0_u8; 4096]).expect("write");
 
         let found = list_candidates(root, None);

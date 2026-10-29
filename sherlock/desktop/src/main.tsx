@@ -1,10 +1,14 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
+import { LibraryProvider } from "@frank-sherlock/shared";
 import App from "./App";
-import "./theme.css";
+import { tauriLibraryClient } from "./tauriLibraryClient";
+import "@frank-sherlock/shared/theme.css";
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <App />
+    <LibraryProvider client={tauriLibraryClient}>
+      <App />
+    </LibraryProvider>
   </React.StrictMode>
 );

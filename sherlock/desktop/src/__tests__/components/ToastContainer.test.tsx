@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { render, screen } from "@testing-library/react";
-import ToastContainer from "../../components/Toasts/ToastContainer";
+import { ToastContainer } from "@frank-sherlock/shared";
 
 describe("ToastContainer", () => {
   it("renders nothing when both are null", () => {

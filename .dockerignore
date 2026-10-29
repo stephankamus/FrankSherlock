@@ -1,0 +1,21 @@
+# The image copies the manifests and then only the sources it builds.
+.git
+.github
+docs
+plans
+releases
+scripts
+_bench_vision
+_classification
+_face_ab_test
+_research_ab_test
+posts
+
+**/node_modules
+**/target
+**/dist
+**/*.log
+
+# The desktop app only contributes its package.json to the npm workspace resolution.
+sherlock/desktop/*
+!sherlock/desktop/package.json

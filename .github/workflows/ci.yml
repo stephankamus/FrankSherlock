@@ -55,9 +55,25 @@ jobs:
         with:
           node-version: 24
 
+      # The frontend is an npm workspace rooted at the repository: `shared` and the
+      # desktop app are installed together, and the lockfile lives at the root.
       - name: Install frontend dependencies
-        working-directory: sherlock/desktop
         run: npm ci
+
+      - name: Run shared package tests
+        run: npm run test --workspace @frank-sherlock/shared
+
+      - name: Typecheck shared package
+        run: npm run typecheck --workspace @frank-sherlock/shared
+
+      - name: Typecheck web UI
+        run: npm run typecheck --workspace @frank-sherlock/web
+
+      - name: Run web UI tests
+        run: npm run test --workspace @frank-sherlock/web
+
+      - name: Build web UI
+        run: npm run build --workspace @frank-sherlock/web
 
       - name: Download PDFium
         working-directory: sherlock/desktop/src-tauri
@@ -68,6 +84,34 @@ jobs:
         working-directory: sherlock/desktop/src-tauri
         shell: bash
         run: bash scripts/download-onnxruntime.sh
+
+      # The shared read core is a standalone crate (path dependency), so it is built
+      # and tested on its own before the app that consumes it.
+      - name: Run core tests
+        working-directory: sherlock/core
+        run: cargo test
+
+      - name: Check core formatting
+        working-directory: sherlock/core
+        run: cargo fmt --check
+
+      - name: Clippy (core)
+        working-directory: sherlock/core
+        run: cargo clippy -- -D warnings
+
+      # The web server is a third standalone crate: it links `core` and must never link
+      # the desktop (Tauri, ort, pdfium), which is exactly what this build proves.
+      - name: Run web server tests
+        working-directory: sherlock/web/server
+        run: cargo test
+
+      - name: Check web server formatting
+        working-directory: sherlock/web/server
+        run: cargo fmt --check
+
+      - name: Clippy (web server)
+        working-directory: sherlock/web/server
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Run Rust tests
         working-directory: sherlock/desktop/src-tauri
@@ -95,3 +139,24 @@ jobs:
         run: |
           cargo install cargo-audit --locked
           cargo audit
+
+  # Proves the deployable artifact: the SPA is built, embedded in the axum binary and
+  # the runtime image satisfies its (read-only, non-root, healthcheck) contract.
+  web-image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build the web image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: sherlock/web/Dockerfile
+          push: false
+          tags: frank-sherlock-web:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import HelpModal from "../../components/modals/HelpModal";
+import { HelpModal } from "@frank-sherlock/shared";
 
 describe("HelpModal", () => {
   it("renders the heading", () => {

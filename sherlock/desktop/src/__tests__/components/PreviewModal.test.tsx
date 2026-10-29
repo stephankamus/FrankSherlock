@@ -1,8 +1,10 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import PreviewModal from "../../components/modals/PreviewModal";
+import { LibraryProvider, PreviewModal } from "@frank-sherlock/shared";
+import type { ComponentProps, ReactElement } from "react";
 import { mockSearchItem } from "../fixtures";
+import { tauriLibraryClient } from "../../tauriLibraryClient";
 
 // Mock react-pdf to avoid needing pdf.js worker in tests
 vi.mock("react-pdf", () => ({
@@ -48,10 +50,24 @@ const pdfItem2 = {
   absPath: "/home/user/docs/invoice.PDF",
 };
 
+function renderPreview(ui: ReactElement) {
+  return render(<LibraryProvider client={tauriLibraryClient}>{ui}</LibraryProvider>);
+}
+
+/** The desktop supplies the pdf.js viewer; tests do not need the real one. */
+function TestPreview(props: ComponentProps<typeof PreviewModal>) {
+  return (
+    <PreviewModal
+      {...props}
+      renderPdf={() => <div data-testid="pdf-document" />}
+    />
+  );
+}
+
 describe("PreviewModal", () => {
   it("renders single image with details", () => {
-    render(
-      <PreviewModal
+    renderPreview(
+      <TestPreview
         previewItems={[item]}
         selectedCount={1}
         singlePreviewIndex={0}
@@ -68,8 +84,8 @@ describe("PreviewModal", () => {
   it("calls onClose when close button clicked", async () => {
     const user = userEvent.setup();
     const onClose = vi.fn();
-    render(
-      <PreviewModal
+    renderPreview(
+      <TestPreview
         previewItems={[item]}
         selectedCount={1}
         singlePreviewIndex={0}
@@ -83,8 +99,8 @@ describe("PreviewModal", () => {
   });
 
   it("shows nav buttons for single image not at edges", () => {
-    render(
-      <PreviewModal
+    renderPreview(
+      <TestPreview
         previewItems={[item]}
         selectedCount={1}
         singlePreviewIndex={5}
@@ -98,8 +114,8 @@ describe("PreviewModal", () => {
   });
 
   it("hides prev button at first item", () => {
-    render(
-      <PreviewModal
+    renderPreview(
+      <TestPreview
         previewItems={[item]}
         selectedCount={1}
         singlePreviewIndex={0}
@@ -122,8 +138,8 @@ describe("PreviewModal", () => {
         absPath: "/home/user/photos/beach.jpg",
       },
     ];
-    const { container } = render(
-      <PreviewModal
+    const { container } = renderPreview(
+      <TestPreview
         previewItems={items}
         selectedCount={2}
         singlePreviewIndex={null}
@@ -140,8 +156,8 @@ describe("PreviewModal", () => {
   });
 
   it("renders single PDF with PdfViewer", () => {
-    render(
-      <PreviewModal
+    renderPreview(
+      <TestPreview
         previewItems={[pdfItem]}
         selectedCount={1}
         singlePreviewIndex={0}
@@ -150,8 +166,8 @@ describe("PreviewModal", () => {
         onNavigate={() => {}}
       />,
     );
-    const { container } = render(
-      <PreviewModal
+    const { container } = renderPreview(
+      <TestPreview
         previewItems={[pdfItem]}
         selectedCount={1}
         singlePreviewIndex={0}
@@ -167,8 +183,8 @@ describe("PreviewModal", () => {
   });
 
   it("renders 2 PDFs side-by-side", () => {
-    const { container } = render(
-      <PreviewModal
+    const { container } = renderPreview(
+      <TestPreview
         previewItems={[pdfItem, pdfItem2]}
         selectedCount={2}
         singlePreviewIndex={null}
@@ -184,8 +200,8 @@ describe("PreviewModal", () => {
   });
 
   it("renders PDF + image in split layout", () => {
-    const { container } = render(
-      <PreviewModal
+    const { container } = renderPreview(
+      <TestPreview
         previewItems={[pdfItem, item]}
         selectedCount={2}
         singlePreviewIndex={null}
@@ -204,8 +220,8 @@ describe("PreviewModal", () => {
 
   it("caps PDFs at 2 when 3+ selected", () => {
     const pdfItem3 = { ...pdfItem, id: 12, relPath: "docs/third.pdf" };
-    const { container } = render(
-      <PreviewModal
+    const { container } = renderPreview(
+      <TestPreview
         previewItems={[pdfItem, pdfItem2, pdfItem3]}
         selectedCount={3}
         singlePreviewIndex={null}
@@ -223,8 +239,8 @@ describe("PreviewModal", () => {
 
   it("detects PDF with uppercase extension", () => {
     const upperPdf = { ...pdfItem, relPath: "docs/REPORT.PDF" };
-    const { container } = render(
-      <PreviewModal
+    const { container } = renderPreview(
+      <TestPreview
         previewItems={[upperPdf]}
         selectedCount={1}
         singlePreviewIndex={0}
@@ -238,8 +254,8 @@ describe("PreviewModal", () => {
 
   it("Space key closes preview", () => {
     const onClose = vi.fn();
-    render(
-      <PreviewModal
+    renderPreview(
+      <TestPreview
         previewItems={[item]}
         selectedCount={1}
         singlePreviewIndex={5}
@@ -254,8 +270,8 @@ describe("PreviewModal", () => {
 
   it("ArrowRight navigates to next item", () => {
     const onNavigate = vi.fn();
-    render(
-      <PreviewModal
+    renderPreview(
+      <TestPreview
         previewItems={[item]}
         selectedCount={1}
         singlePreviewIndex={5}
@@ -270,8 +286,8 @@ describe("PreviewModal", () => {
 
   it("ArrowLeft navigates to previous item", () => {
     const onNavigate = vi.fn();
-    render(
-      <PreviewModal
+    renderPreview(
+      <TestPreview
         previewItems={[item]}
         selectedCount={1}
         singlePreviewIndex={5}
@@ -290,8 +306,8 @@ describe("PreviewModal", () => {
       item,
       { ...item, id: 2, relPath: "photos/beach.jpg", absPath: "/home/user/photos/beach.jpg" },
     ];
-    render(
-      <PreviewModal
+    renderPreview(
+      <TestPreview
         previewItems={items}
         selectedCount={2}
         singlePreviewIndex={null}

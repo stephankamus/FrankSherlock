@@ -1,0 +1,281 @@
+/* ── Preview modal ────────────────────────────────────────── */
+.preview-overlay {
+  cursor: pointer;
+  z-index: 1100;
+  background: rgba(0, 0, 0, 0.88);
+}
+
+.preview-modal {
+  cursor: default;
+  width: 90vw;
+  height: 90vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  position: relative;
+}
+
+.preview-close {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 10;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.5);
+  border: 1px solid var(--border-primary);
+  color: var(--text-primary);
+  font-size: 1.1rem;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  cursor: pointer;
+}
+
+.preview-close:hover {
+  background: var(--bg-hover);
+}
+
+/* Preview navigation buttons */
+.preview-nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 10;
+  width: 36px;
+  height: 64px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: rgba(0,0,0,0.5);
+  color: #fff;
+  font-size: 2rem;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  transition: background 0.15s;
+}
+
+.preview-nav:hover {
+  background: rgba(0,0,0,0.75);
+}
+
+.preview-nav-left {
+  left: 8px;
+}
+
+.preview-nav-right {
+  right: 8px;
+}
+
+.preview-image-wrap {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  min-height: 0;
+  background: #000;
+}
+
+.preview-image-wrap img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+/* ── Video preview ─────────────────────────────────────────── */
+.preview-video-wrap {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  min-height: 0;
+  background: #000;
+}
+
+.preview-video-wrap video {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.preview-video-fallback {
+  flex-direction: column;
+  padding: 24px;
+  text-align: center;
+}
+
+/* ── Collage preview ───────────────────────────────────────── */
+.preview-collage {
+  display: grid;
+  gap: 2px;
+  background: #000;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+/* 2 images: 2 columns */
+.preview-collage[data-count="2"] { grid-template-columns: 1fr 1fr; }
+/* 3 images: 2x2 grid, last spans full width */
+.preview-collage[data-count="3"] { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }
+.preview-collage[data-count="3"] .preview-collage-cell:last-child { grid-column: 1 / -1; }
+/* 4 images: 2x2 grid */
+.preview-collage[data-count="4"] { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }
+/* 5–6 images: 3 columns */
+.preview-collage[data-count="5"],
+.preview-collage[data-count="6"] { grid-template-columns: 1fr 1fr 1fr; }
+/* 5 images: last row has 2, center the row */
+.preview-collage[data-count="5"] .preview-collage-cell:nth-child(4) { grid-column: 1 / 2; }
+/* 7–9 images: 3 columns */
+.preview-collage[data-count="7"],
+.preview-collage[data-count="8"],
+.preview-collage[data-count="9"] { grid-template-columns: 1fr 1fr 1fr; }
+/* 7 images: last item centered */
+.preview-collage[data-count="7"] .preview-collage-cell:last-child { grid-column: 2 / 3; }
+/* 8 images: last 2 items centered — first of the pair starts at col 1 */
+.preview-collage[data-count="8"] .preview-collage-cell:nth-child(7) { grid-column: 1 / 2; }
+/* 10 images: 5 columns x 2 rows */
+.preview-collage[data-count="10"] { grid-template-columns: repeat(5, 1fr); grid-template-rows: 1fr 1fr; }
+
+.preview-collage-cell {
+  position: relative;
+  overflow: hidden;
+  min-height: 0;
+}
+.preview-collage-cell img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+/* Numbered label overlay on collage cells */
+.preview-collage-label {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.7);
+  color: #fff;
+  font-size: 0.7rem;
+  font-weight: 700;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+}
+
+/* ── PDF preview ──────────────────────────────────────────── */
+.preview-pdf-wrap {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+  background: #1e1e1e;
+}
+
+/* The web has no pdf.js: a same-origin iframe plus a download link is the v1. */
+.preview-pdf-frame {
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+
+.preview-pdf-download {
+  display: inline-block;
+  margin: 8px 12px;
+  color: var(--accent);
+  font-size: var(--font-size-sm);
+}
+
+/* ── Split layout (dual-pdf, pdf-plus-image) ─────────────── */
+.preview-split {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2px;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  background: #000;
+}
+
+.preview-split-pane {
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.preview-info {
+  padding: 10px 14px;
+  border-top: 1px solid var(--border-primary);
+}
+
+.preview-info h3 {
+  margin: 0 0 4px;
+  font-size: var(--font-size-sm);
+  word-break: break-all;
+}
+
+.preview-desc {
+  margin: 0 0 6px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.preview-meta {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+}
+
+/* ── Comparison list (multi-file preview) ────────────────── */
+.preview-compare-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.preview-compare-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--font-size-sm);
+  padding: 2px 0;
+}
+
+.preview-compare-num {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: 0.7rem;
+  font-weight: 700;
+  display: grid;
+  place-items: center;
+}
+
+.preview-compare-name {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-primary);
+}
+
+.preview-compare-meta {
+  flex-shrink: 0;
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+}

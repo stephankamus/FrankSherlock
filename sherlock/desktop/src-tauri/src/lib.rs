@@ -1,25 +1,27 @@
 mod classify;
 mod config;
-mod db;
 mod descriptions;
-mod error;
-mod exif;
 mod face;
 mod llm;
 mod logs;
 mod models;
 mod pdf;
 mod platform;
-mod query_parser;
+mod publish;
 mod raw;
 mod runtime;
 mod scan;
-mod similarity;
 mod thumbnail;
 mod video;
 mod video_server;
 mod vision_estimate;
 mod vision_prep;
+
+// Shared with the web server (`sherlock/core`): one parser, one set of row shapes, one
+// EXIF reader, one set of path rules and — the point of the exercise — one `db` module,
+// so both sides run the same SQL. Re-exported under the old paths so no call site had to
+// change.
+pub use sherlock_core::{db, error, exif, query_parser, similarity};
 
 #[cfg(test)]
 mod bench_cost;
@@ -119,6 +121,12 @@ struct AppState {
     /// Live counters of the producer/consumer pipeline (backlog, retry and the
     /// pipeline half of a `full`), polled by the sidebar.
     backlog_progress: Arc<Mutex<Option<models::BacklogProgress>>>,
+    /// Progress of the network publish, polled by the settings screen.
+    publish_progress: Arc<Mutex<Option<publish::PublishProgress>>>,
+    /// Result of the last completed publish, so the screen can show what happened
+    /// after the modal was closed.
+    publish_report: Arc<Mutex<Option<publish::PublishReport>>>,
+    publish_cancel: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -753,10 +761,11 @@ async fn raw_support_status(
 /// A job report that carries one preparation failure, so the modal shows it like any
 /// other conversion error instead of a promise that never resolves.
 fn failed_raw_report(error: String) -> raw::RawJobReport {
-    let mut report = raw::RawJobReport::default();
-    report.failed = 1;
-    report.failures.push(error);
-    report
+    raw::RawJobReport {
+        failed: 1,
+        failures: vec![error],
+        ..Default::default()
+    }
 }
 
 /// Install the conversion venv on demand (`Setup conversion support`).
@@ -1368,6 +1377,202 @@ fn list_subdirectories(
 ) -> Result<Vec<SubdirEntry>, String> {
     db::list_subdirectories(&state.paths.db_file, root_id, &parent_prefix)
         .map_err(|e| e.to_string())
+}
+
+/// Publish the index and the caches to the folder chosen in Settings → Publishing.
+///
+/// Runs off the UI thread: a first publish copies every thumbnail and a large library
+/// is tens of thousands of small writes over SMB. The report is kept in the state as
+/// well, so closing the screen does not lose the outcome.
+#[tauri::command]
+async fn publish_library(state: State<'_, AppState>) -> Result<publish::PublishReport, String> {
+    require_writable(state.inner())?;
+
+    let config = config::load_user_config().map_err(|e| e.to_string())?;
+    let options = publish_options_from_config(&config)?;
+
+    let paths = state.paths.clone();
+    let progress = state.publish_progress.clone();
+    let report = state.publish_report.clone();
+    let cancel = state.publish_cancel.clone();
+    cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut slot) = progress.lock() {
+        *slot = None;
+    }
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = publish::publish_library(&paths, &options, &cancel, &mut |update| {
+            if let Ok(mut slot) = progress.lock() {
+                *slot = Some(update);
+            }
+        });
+        if let Ok(mut slot) = progress.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = report.lock() {
+            *slot = result.as_ref().ok().cloned();
+        }
+        result
+    })
+    .await
+    .map_err(|e| AppError::Join(e.to_string()).to_string())?
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn publish_status(state: State<'_, AppState>) -> Result<Option<publish::PublishProgress>, String> {
+    state
+        .publish_progress
+        .lock()
+        .map(|slot| slot.clone())
+        .map_err(|_| "publish progress mutex poisoned".to_string())
+}
+
+#[tauri::command]
+fn publish_last_report(
+    state: State<'_, AppState>,
+) -> Result<Option<publish::PublishReport>, String> {
+    state
+        .publish_report
+        .lock()
+        .map(|slot| slot.clone())
+        .map_err(|_| "publish report mutex poisoned".to_string())
+}
+
+#[tauri::command]
+fn cancel_publish(state: State<'_, AppState>) -> bool {
+    state
+        .publish_cancel
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// Publish settings live in `config.json` (`publish.dir`, `publish.includeFaceCrops`,
+/// `publish.keepRevisions`), not in `settings.toml`: they describe this machine's
+/// deployment, not how the pipeline classifies images.
+fn publish_options_from_config(
+    config: &serde_json::Value,
+) -> Result<publish::PublishOptions, String> {
+    let publish = config.get("publish");
+    let dir = publish
+        .and_then(|value| value.get("dir"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if dir.is_empty() {
+        return Err(
+            "no publish folder configured; choose one in Settings → Publishing".to_string(),
+        );
+    }
+    Ok(publish::PublishOptions {
+        dir: std::path::PathBuf::from(dir),
+        include_face_crops: publish
+            .and_then(|value| value.get("includeFaceCrops"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true),
+        keep_revisions: publish
+            .and_then(|value| value.get("keepRevisions"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or(2) as u32,
+    })
+}
+
+/// Publish after a scan, when the user asked for it in Settings → Publishing.
+///
+/// Failures here are logged, never surfaced as a scan failure: the index is correct and
+/// complete either way, and a share that went away must not turn a good scan red. The
+/// report is stored so the settings screen can show it on the next open.
+async fn maybe_publish_after_scan(app_state: &AppState) {
+    let config = match config::load_user_config() {
+        Ok(config) => config,
+        Err(e) => {
+            log::warn!("auto publish skipped: could not read config.json: {e}");
+            return;
+        }
+    };
+
+    // Defaults to on: a configured folder means the user wants it kept current, and
+    // with no folder configured `publish_options_from_config` bails out below anyway.
+    let auto = config
+        .get("publish")
+        .and_then(|value| value.get("auto"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
+    if !auto {
+        return;
+    }
+
+    let options = match publish_options_from_config(&config) {
+        Ok(options) => options,
+        Err(message) => {
+            log::info!("auto publish skipped: {message}");
+            return;
+        }
+    };
+
+    let paths = app_state.paths.clone();
+    let progress = app_state.publish_progress.clone();
+    let cancel = app_state.publish_cancel.clone();
+    cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+    log::info!("auto publish: starting for {}", options.dir.display());
+
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        publish::publish_library(&paths, &options, &cancel, &mut |update| {
+            if let Ok(mut slot) = progress.lock() {
+                *slot = Some(update);
+            }
+        })
+    })
+    .await;
+
+    if let Ok(mut slot) = app_state.publish_progress.lock() {
+        *slot = None;
+    }
+
+    match result {
+        Ok(Ok(report)) => {
+            log::info!(
+                "auto publish: revision {} — {} bytes, {} thumbnail(s) copied, {} unchanged, \
+                 {} old snapshot(s) pruned in {} ms",
+                report.revision,
+                report.database_bytes,
+                report.thumbnails_copied,
+                report.thumbnails_unchanged,
+                report.revisions_pruned,
+                report.elapsed_ms
+            );
+            if let Ok(mut slot) = app_state.publish_report.lock() {
+                *slot = Some(report);
+            }
+        }
+        Ok(Err(e)) => log::warn!("auto publish failed: {e}"),
+        Err(e) => log::warn!("auto publish task failed: {e}"),
+    }
+}
+
+/// Hide or unhide a batch of rows.
+///
+/// Takes ids, not paths: the caller already has them from the grid, and a path would
+/// let a stale selection hide a row that a scan moved in the meantime. One command
+/// covers both directions so the undo toast replays exactly what it undid.
+#[tauri::command]
+fn set_files_hidden(
+    file_ids: Vec<i64>,
+    hidden: bool,
+    state: State<'_, AppState>,
+) -> Result<u64, String> {
+    require_writable(state.inner())?;
+    db::set_files_hidden(&state.paths.db_file, &file_ids, hidden).map_err(|e| e.to_string())
+}
+
+/// How many rows are hidden in the given scope, for the "show hidden" toggle.
+///
+/// Deliberately not part of `SearchResponse`: this is counted once per filter change
+/// and stays correct while paging, which a per-page count would not.
+#[tauri::command]
+fn hidden_file_count(root_scope: Vec<i64>, state: State<'_, AppState>) -> Result<u64, String> {
+    db::hidden_count(&state.paths.db_file, &root_scope).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -3055,6 +3260,14 @@ fn spawn_scan_worker_if_needed(
             if let Err(e) = llm::cleanup_loaded_models() {
                 log::warn!("Auto-cleanup after all scans finished: {e}");
             }
+            // Publishing waits for the whole chain: a `full` scan hands over to the
+            // backlog pipeline, and shipping the index between the two would give the
+            // web app a library that is still being written.
+            let succeeded = result.is_ok();
+            let was_cancelled = cancel_watch.load(Ordering::Relaxed);
+            if succeeded && !was_cancelled && !app_state_for_task.read_only {
+                maybe_publish_after_scan(&app_state_for_task).await;
+            }
         }
     });
 }
@@ -3193,6 +3406,9 @@ pub fn run() {
         raw_jobs: Arc::new(Mutex::new(HashMap::new())),
         raw_scan_cache: Arc::new(Mutex::new(None)),
         backlog_progress: Arc::new(Mutex::new(None)),
+        publish_progress: Arc::new(Mutex::new(None)),
+        publish_report: Arc::new(Mutex::new(None)),
+        publish_cancel: Arc::new(AtomicBool::new(false)),
     };
 
     tauri::Builder::default()
@@ -3266,6 +3482,12 @@ pub fn run() {
             retry_failed,
             failed_classifications,
             list_subdirectories,
+            set_files_hidden,
+            hidden_file_count,
+            publish_library,
+            publish_status,
+            publish_last_report,
+            cancel_publish,
             load_user_config,
             save_user_config,
             copy_files_to_clipboard,

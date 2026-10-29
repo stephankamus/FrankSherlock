@@ -1,9 +1,7 @@
-/** Extract the last segment of a path (file or folder name). */
-export function basename(path: string): string {
-  return path.split("/").pop() || path;
-}
-
-/** Extract a human-readable message from an unknown error value. */
-export function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
+/**
+ * Pure helpers shared with the web client.
+ *
+ * The implementations live in `@frank-sherlock/shared`; these re-exports keep the
+ * desktop's import paths (`../utils`) stable while the code moves.
+ */
+export { basename, errorMessage } from "@frank-sherlock/shared";

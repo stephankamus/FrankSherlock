@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import Toolbar from "../../components/Content/Toolbar";
+import { Toolbar } from "@frank-sherlock/shared";
 
 const defaultSortProps = {
   sortBy: "dateModified" as const,
@@ -110,5 +110,32 @@ describe("Toolbar", () => {
       <Toolbar query="" onQueryChange={() => {}} selectedMediaType="" onMediaTypeChange={() => {}} mediaTypeOptions={mediaTypes} {...defaultSortProps} sortBy="relevance" hasTextQuery={true} />
     );
     expect(screen.queryByLabelText("Sort direction")).not.toBeInTheDocument();
+  });
+
+  it("shows no hidden toggle when nothing is hidden", () => {
+    render(
+      <Toolbar query="" onQueryChange={() => {}} selectedMediaType="" onMediaTypeChange={() => {}} mediaTypeOptions={mediaTypes} {...defaultSortProps} hiddenCount={0} onIncludeHiddenChange={() => {}} />
+    );
+    expect(screen.queryByTitle(/hidden photo/)).not.toBeInTheDocument();
+  });
+
+  it("shows how many photos are hidden and turns the filter on", async () => {
+    const user = userEvent.setup();
+    const onIncludeHiddenChange = vi.fn();
+    render(
+      <Toolbar query="" onQueryChange={() => {}} selectedMediaType="" onMediaTypeChange={() => {}} mediaTypeOptions={mediaTypes} {...defaultSortProps} hiddenCount={3} onIncludeHiddenChange={onIncludeHiddenChange} />
+    );
+    await user.click(screen.getByTitle("3 hidden photos — show them"));
+    expect(onIncludeHiddenChange).toHaveBeenCalledWith(true);
+  });
+
+  it("offers to hide them again while the filter is on, even at zero", async () => {
+    const user = userEvent.setup();
+    const onIncludeHiddenChange = vi.fn();
+    render(
+      <Toolbar query="" onQueryChange={() => {}} selectedMediaType="" onMediaTypeChange={() => {}} mediaTypeOptions={mediaTypes} {...defaultSortProps} includeHidden={true} hiddenCount={0} onIncludeHiddenChange={onIncludeHiddenChange} />
+    );
+    await user.click(screen.getByTitle("Hide these photos again"));
+    expect(onIncludeHiddenChange).toHaveBeenCalledWith(false);
   });
 });

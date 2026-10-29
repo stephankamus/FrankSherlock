@@ -10,12 +10,17 @@ type UseSearchParams = {
   selectedRootId: number | null;
   sortBy: SortField;
   sortOrder: SortOrder;
+  /**
+   * Desktop-only filter; the web client never sends it. Defaults to `false`, which
+   * is the safe direction: forgetting it hides photos rather than exposing them.
+   */
+  includeHidden?: boolean;
   isReady: boolean;
   onClearSelection: () => void;
   onReconcileSelection: (oldItems: SearchItem[], newItems: SearchItem[]) => void;
 };
 
-export function useSearch({ query, selectedMediaType, selectedRootId, sortBy, sortOrder, isReady, onClearSelection, onReconcileSelection }: UseSearchParams) {
+export function useSearch({ query, selectedMediaType, selectedRootId, sortBy, sortOrder, includeHidden = false, isReady, onClearSelection, onReconcileSelection }: UseSearchParams) {
   const [items, setItems] = useState<SearchItem[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
@@ -56,6 +61,7 @@ export function useSearch({ query, selectedMediaType, selectedRootId, sortBy, so
         rootScope: selectedRootId ? [selectedRootId] : undefined,
         sortBy,
         sortOrder,
+        includeHidden,
       });
       if (reqId !== requestIdRef.current) return;
       applySearchResponse(response, append, preserveSelection ?? false);
@@ -66,7 +72,7 @@ export function useSearch({ query, selectedMediaType, selectedRootId, sortBy, so
       setLoading(false);
       setLoadingMore(false);
     }
-  }, [query, selectedMediaType, selectedRootId, sortBy, sortOrder, onClearSelection, onReconcileSelection]);
+  }, [query, selectedMediaType, selectedRootId, sortBy, sortOrder, includeHidden, onClearSelection, onReconcileSelection]);
 
   const onLoadMore = useCallback(async () => {
     if (!canLoadMore || loadingMore) return;
@@ -80,7 +86,7 @@ export function useSearch({ query, selectedMediaType, selectedRootId, sortBy, so
       void runSearch(0, false);
     }, 260);
     return () => clearTimeout(timer);
-  }, [query, selectedMediaType, selectedRootId, sortBy, sortOrder, isReady]);
+  }, [query, selectedMediaType, selectedRootId, sortBy, sortOrder, includeHidden, isReady]);
 
   return { items, total, loading, loadingMore, canLoadMore, runSearch, onLoadMore };
 }

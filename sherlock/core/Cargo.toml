@@ -1,0 +1,37 @@
+[package]
+name = "sherlock_core"
+version = "0.1.0"
+description = "Read core of the Frank Sherlock index, shared by the desktop app and the web server"
+authors = ["AkitaOnRails"]
+license = "GPL-3.0-only"
+edition = "2021"
+# 1.85 is the real floor: the locked AVIF stack (image -> rav1e -> aligned) uses
+# `edition = "2024"`, which cargo cannot even parse before that release.
+rust-version = "1.85"
+
+# Standalone crate on purpose, consumed by path from `desktop/src-tauri` and from
+# `web/server`, instead of a Cargo workspace. A workspace would move the
+# `[profile.dev]` tuning and the lockfile out of `src-tauri` (silently losing the
+# `opt-level` that keeps the image pipeline usable in dev) and would change the
+# `target/` the CI caches. The price is compiling this crate twice; the sources and
+# the tests are still written once.
+[dependencies]
+chrono = { version = "0.4", features = ["clock"] }
+# `exif` needs both: `image` to apply the orientation to a decoded picture, and
+# `reverse_geocoder` to turn GPS coordinates into a place name.
+hex = "0.4"
+image = "0.25"
+kamadak-exif = "0.6"
+log = "0.4"
+regex = "1"
+reverse_geocoder = "4"
+rusqlite = { version = "0.34", features = ["bundled", "modern_sqlite", "backup"] }
+rusqlite_migration = "2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2"
+
+[dev-dependencies]
+# The EXIF tests build real (tiny) files to read back.
+tempfile = "3"

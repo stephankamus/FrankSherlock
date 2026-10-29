@@ -1,0 +1,450 @@
+import type { Album, BacklogProgress, DbStats, FaceDetectProgress, RootInfo, ScanJobStatus, SmartFolder, ThumbRepairProgress, UpdateInfo } from "../types";
+import { formatBytes } from "../utils/format";
+import { useDragReorder } from "../hooks/useDragReorder";
+import { formatEta } from "../utils/scanEta";
+import AlbumCard from "./AlbumCard";
+import DirectoryTree from "./DirectoryTree";
+import RootCard from "./RootCard";
+import SmartFolderCard from "./SmartFolderCard";
+import "./sidebar.css";
+
+type SidebarProps<TRoot extends RootInfo = RootInfo> = {
+  roots: TRoot[];
+  selectedRootId: number | null;
+  activeScans: ScanJobStatus[];
+  dbStats: DbStats | null;
+  readOnly: boolean;
+  setupReady: boolean;
+  albums: Album[];
+  smartFolders: SmartFolder[];
+  activeAlbumName: string | null;
+  activeSmartFolderId: number | null;
+  selectedSubdir: string | null;
+  faceProgress: FaceDetectProgress | null;
+  onSelectSubdir: (subdir: string | null) => void;
+  onSelectRoot: (rootId: number | null) => void;
+  onDeleteRoot: (root: TRoot) => void;
+  onPickAndScan: () => void;
+  onRescanRoot: (root: TRoot) => void;
+  onRefreshRoot: (root: TRoot) => void;
+  onCopyRootPath: (root: TRoot) => void;
+  onRelinkRoot?: (root: TRoot) => void;
+  /** Drop the classification of a root so its files can be classified again. */
+  onReclassifyRoot?: (root: TRoot) => void;
+  /** Convert the HEIC/NEF files of a root into JPEG copies. */
+  onConvertRawRoot?: (root: TRoot) => void;
+  onCompactDatabase?: () => void;
+  compacting?: boolean;
+  /** Live progress of the "Repair Thumbnails" tool. */
+  thumbRepair?: ThumbRepairProgress | null;
+  onRepairThumbnails?: (rootId?: number | null) => void;
+  onCancelThumbRepair?: () => void;
+  /** Classify pending files and fill missing thumbnails in one pipeline pass. */
+  onProcessBacklog?: (rootId?: number | null) => void;
+  /** Live counters of that pass: thumbnails and classifications are separate. */
+  backlog?: BacklogProgress | null;
+  onCancelBacklog?: () => void;
+  /**
+   * Rows of the selected root the last attempts gave up on.
+   *
+   * The default pass skips them (otherwise they would go to the GPU on every pass
+   * forever), so the count is what tells the user there is something left to retry.
+   */
+  failedCount?: number;
+  onRetryFailed?: (rootId?: number | null) => void;
+  onDetectFaces: (root: TRoot) => void;
+  onCancelFaceDetect: () => void;
+  /** Read faces inside the next scan (the same field the Settings modal edits). */
+  faceDetection?: boolean;
+  onToggleFaceDetection?: () => void;
+  onCancelScan: (scan: ScanJobStatus) => void;
+  onResumeScan: (scan: ScanJobStatus) => void;
+  /** Opens the settings modal (model, resize, OCR, dedupe, startup, chaining). */
+  onOpenSettings?: () => void;
+  onSelectAlbum: (album: Album) => void;
+  onDeleteAlbum: (album: Album) => void;
+  onSelectSmartFolder: (folder: SmartFolder) => void;
+  onDeleteSmartFolder: (folder: SmartFolder) => void;
+  onReorderRoots?: (ids: number[]) => void;
+  onReorderAlbums?: (ids: number[]) => void;
+  onReorderSmartFolders?: (ids: number[]) => void;
+  onFindDuplicates?: () => void;
+  onOpenPdfPasswords?: () => void;
+  onOpenFaces?: () => void;
+  updateInfo?: UpdateInfo | null;
+  updateChecking?: boolean;
+  updateDownloading?: boolean;
+  updateProgress?: { downloaded: number; total: number | null } | null;
+  onCheckUpdates?: () => void;
+  onInstallUpdate?: () => void;
+};
+
+export default function Sidebar<TRoot extends RootInfo = RootInfo>({
+  roots, selectedRootId, activeScans, dbStats, readOnly,
+  setupReady, albums, smartFolders, activeAlbumName, activeSmartFolderId,
+  selectedSubdir, faceProgress, onSelectSubdir,
+  onSelectRoot, onDeleteRoot, onRescanRoot, onRefreshRoot, onCopyRootPath, onPickAndScan,
+  onRelinkRoot, onReclassifyRoot, onConvertRawRoot, onCompactDatabase, compacting,
+  thumbRepair, onRepairThumbnails, onCancelThumbRepair, onProcessBacklog,
+  backlog, onCancelBacklog, failedCount, onRetryFailed,
+  onDetectFaces, onCancelFaceDetect,
+  faceDetection, onToggleFaceDetection,
+  onCancelScan, onResumeScan, onOpenSettings,
+  onSelectAlbum, onDeleteAlbum, onSelectSmartFolder, onDeleteSmartFolder,
+  onReorderRoots, onReorderAlbums, onReorderSmartFolders, onFindDuplicates,
+  onOpenPdfPasswords, onOpenFaces,
+  updateInfo, updateChecking, updateDownloading, updateProgress,
+  onCheckUpdates, onInstallUpdate,
+}: SidebarProps<TRoot>) {
+  const rootsDrag = useDragReorder({ items: roots, onReorder: onReorderRoots ?? (() => {}), readOnly });
+  const albumsDrag = useDragReorder({ items: albums, onReorder: onReorderAlbums ?? (() => {}), readOnly });
+  const smartFoldersDrag = useDragReorder({ items: smartFolders, onReorder: onReorderSmartFolders ?? (() => {}), readOnly });
+
+  function scanForRoot(rootId: number): ScanJobStatus | undefined {
+    return activeScans.find((s) => s.rootId === rootId && (s.status === "running" || s.status === "interrupted"));
+  }
+
+  const repairing =
+    thumbRepair != null && (thumbRepair.phase === "scanning" || thumbRepair.phase === "repairing");
+
+  const backlogRunning =
+    backlog != null && (backlog.phase === "counting" || backlog.phase === "running");
+  /**
+   * `(12%)` against the rows that actually need that stage.
+   *
+   * Dividing by the whole backlog made the thumbnail share look stuck near 0%
+   * whenever the cache was already healthy and only classification was pending.
+   */
+  const backlogPct = (value: number, total: number) =>
+    total > 0 ? ` (${Math.min(100, Math.floor((value / total) * 100))}%)` : "";
+
+  // Throughput matters here: repairing a whole library over SMB runs for hours, and
+  // a bare counter makes the wait look infinite.
+  const repairProgress = (() => {
+    if (!thumbRepair || thumbRepair.phase !== "repairing" || thumbRepair.total <= 0) {
+      return "";
+    }
+    const elapsed = Math.max(1, Math.floor(Date.now() / 1000) - thumbRepair.startedAt);
+    const rate = thumbRepair.processed / elapsed;
+    if (!Number.isFinite(rate) || rate <= 0) return "";
+    const remaining = Math.max(0, thumbRepair.total - thumbRepair.processed);
+    return ` (${Math.round(rate * 60)}/min, ${formatEta(remaining / rate)})`;
+  })();
+
+  return (
+    <aside className="sidebar">
+      <div className="sidebar-scroll">
+        <div className="sidebar-section">
+          <span>Folders</span>
+          {!readOnly && (
+            <button
+              type="button"
+              className="sidebar-add-btn"
+              onClick={onPickAndScan}
+              disabled={!setupReady}
+              title="Add folder to scan"
+            >+</button>
+          )}
+        </div>
+
+        {roots.length === 0 && (
+          <div className="sidebar-empty">No folders scanned yet</div>
+        )}
+
+        <div className="root-list">
+          {roots.map((root, i) => {
+            const scan = scanForRoot(root.id);
+            const dragProps = rootsDrag.getDragProps(i);
+            return (
+              <div key={root.id} {...dragProps} className={dragProps.className}>
+                <RootCard
+                  root={root}
+                  isSelected={selectedRootId === root.id}
+                  scan={scan}
+                  readOnly={readOnly}
+                  faceProgress={faceProgress?.rootId === root.id ? faceProgress : undefined}
+                  // Only while it is actually running: a finished record kept the
+                  // panel (and its Stop button) on the card forever.
+                  backlogProgress={
+                    backlog?.rootId === root.id && backlogRunning ? backlog : undefined
+                  }
+                  onSelect={() => onSelectRoot(selectedRootId === root.id ? null : root.id)}
+                  onDelete={() => onDeleteRoot(root)}
+                  onRescan={() => onRescanRoot(root)}
+                  onRefresh={() => onRefreshRoot(root)}
+                  onCopyPath={() => onCopyRootPath(root)}
+                  onRelink={!readOnly && onRelinkRoot ? () => onRelinkRoot(root) : undefined}
+                  onDetectFaces={!readOnly ? () => onDetectFaces(root) : undefined}
+                  faceDetection={faceDetection}
+                  onToggleFaceDetection={
+                    !readOnly && onToggleFaceDetection ? onToggleFaceDetection : undefined
+                  }
+                  onReclassify={
+                    !readOnly && onReclassifyRoot ? () => onReclassifyRoot(root) : undefined
+                  }
+                  onConvertRaw={
+                    !readOnly && onConvertRawRoot ? () => onConvertRawRoot(root) : undefined
+                  }
+                  onCancelScan={scan?.status === "running" ? () => onCancelScan(scan) : undefined}
+                  onResumeScan={scan?.status === "interrupted" ? () => onResumeScan(scan) : undefined}
+                  onCancelFaceDetect={faceProgress?.rootId === root.id ? onCancelFaceDetect : undefined}
+                />
+                {selectedRootId === root.id && (
+                  <DirectoryTree
+                    rootId={root.id}
+                    selectedSubdir={selectedSubdir}
+                    onSelectSubdir={onSelectSubdir}
+                  />
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        {albums.length > 0 && (
+          <>
+            <div className="sidebar-section"><span>Albums</span></div>
+            <div className="root-list">
+              {albums.map((album, i) => {
+                const dragProps = albumsDrag.getDragProps(i);
+                return (
+                  <div key={album.id} {...dragProps} className={dragProps.className}>
+                    <AlbumCard
+                      album={album}
+                      isSelected={activeAlbumName?.toLowerCase() === album.name.toLowerCase()}
+                      onSelect={() => onSelectAlbum(album)}
+                      onDelete={readOnly ? undefined : () => onDeleteAlbum(album)}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        )}
+
+        {smartFolders.length > 0 && (
+          <>
+            <div className="sidebar-section"><span>Smart Folders</span></div>
+            <div className="root-list">
+              {smartFolders.map((folder, i) => {
+                const dragProps = smartFoldersDrag.getDragProps(i);
+                return (
+                  <div key={folder.id} {...dragProps} className={dragProps.className}>
+                    <SmartFolderCard
+                      folder={folder}
+                      isSelected={activeSmartFolderId === folder.id}
+                      onSelect={() => onSelectSmartFolder(folder)}
+                      onDelete={readOnly ? undefined : () => onDeleteSmartFolder(folder)}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        )}
+      </div>
+
+      {(onFindDuplicates || onOpenPdfPasswords || onOpenFaces || onCheckUpdates || onRepairThumbnails || onProcessBacklog) && (
+        <div className="sidebar-tools-fixed">
+          <div className="sidebar-section"><span>Tools</span></div>
+          <div className="sidebar-tool-list">
+            {onFindDuplicates && (
+              <button
+                type="button"
+                className="sidebar-tool-btn"
+                onClick={onFindDuplicates}
+                title="Find duplicate files across all folders"
+              >
+                Find Duplicates
+              </button>
+            )}
+            {onOpenPdfPasswords && (
+              <button
+                type="button"
+                className="sidebar-tool-btn"
+                onClick={onOpenPdfPasswords}
+                title="Manage passwords for protected PDFs"
+              >
+                PDF Passwords
+              </button>
+            )}
+            {onOpenFaces && (
+              <button
+                type="button"
+                className="sidebar-tool-btn"
+                onClick={onOpenFaces}
+                title="Browse images with detected faces"
+              >
+                Faces
+              </button>
+            )}
+            {onRepairThumbnails && (
+              <button
+                type="button"
+                className="sidebar-tool-btn"
+                onClick={() => onRepairThumbnails(selectedRootId)}
+                disabled={repairing}
+                title="Regenerate thumbnails whose cache file is missing (no rescan needed)"
+              >
+                {repairing && thumbRepair
+                  ? thumbRepair.phase === "scanning"
+                    ? "Checking thumbnails…"
+                    : `Repairing ${thumbRepair.processed}/${thumbRepair.total}${repairProgress}…`
+                  : "Repair Thumbnails"}
+              </button>
+            )}
+            {onProcessBacklog && (
+              <button
+                type="button"
+                className="sidebar-tool-btn"
+                onClick={() => onProcessBacklog(selectedRootId)}
+                disabled={!setupReady || backlogRunning}
+                title="Classify pending files and fill missing thumbnails in one pass"
+              >
+                {backlogRunning
+                  ? backlog?.mode === "full"
+                    // A `full` scan runs the same pipeline; the button must not look
+                    // like the backlog pass was the thing that started.
+                    ? "Scanning…"
+                    : backlog?.phase === "counting"
+                      ? "Counting backlog…"
+                      : "Processing backlog…"
+                  : "Process Backlog"}
+              </button>
+            )}
+            {onRetryFailed && !backlogRunning && (failedCount ?? 0) > 0 && (
+              <button
+                type="button"
+                className="sidebar-tool-btn"
+                onClick={() => onRetryFailed(selectedRootId)}
+                disabled={!setupReady}
+                title="Try the files that failed again, with the current model settings"
+              >
+                Retry {failedCount?.toLocaleString()} Failed
+              </button>
+            )}
+            {backlogRunning && backlog && (
+              <div className="sidebar-backlog">
+                <div className="sidebar-item">
+                  Thumbnails:
+                  <span>
+                    {backlog.thumbsTotal === 0 && backlog.thumbnailed === 0
+                      ? "none missing"
+                      : `${backlog.thumbnailed.toLocaleString()} / ${backlog.thumbsTotal.toLocaleString()}${backlogPct(backlog.thumbnailed, backlog.thumbsTotal)}`}
+                  </span>
+                </div>
+                <div className="sidebar-item">
+                  Classified:
+                  <span>
+                    {backlog.classified.toLocaleString()} /{" "}
+                    {backlog.classifyTotal.toLocaleString()}
+                    {backlogPct(backlog.classified, backlog.classifyTotal)}
+                  </span>
+                </div>
+                {(backlog.facesTotal ?? 0) > 0 && (
+                  <div className="sidebar-item">
+                    Faces:
+                    <span>
+                      {(backlog.faces ?? 0).toLocaleString()} /{" "}
+                      {backlog.facesTotal.toLocaleString()}
+                      {backlogPct(backlog.faces ?? 0, backlog.facesTotal)}
+                    </span>
+                  </div>
+                )}
+                <div className="sidebar-item sidebar-item-muted">
+                  {backlog.phase === "counting"
+                    ? "Reading the index…"
+                    : `${backlog.mode === "full" ? "Scan" : "Backlog"} ${backlog.processed.toLocaleString()} / ${backlog.total.toLocaleString()} files`}
+                </div>
+                {backlog.failed > 0 && (
+                  <div className="sidebar-item sidebar-item-muted">
+                    Failed:
+                    <span>{backlog.failed.toLocaleString()}</span>
+                  </div>
+                )}
+              </div>
+            )}
+            {/* A `full` scan has its own Pause on the root card; a second stop button
+                here would cancel the same job under a name that no longer applies. */}
+            {backlogRunning && backlog?.mode !== "full" && onCancelBacklog && (
+              <button
+                type="button"
+                className="sidebar-tool-btn"
+                onClick={onCancelBacklog}
+                title="Stop the backlog pass"
+              >
+                Stop Backlog
+              </button>
+            )}
+            {repairing && onCancelThumbRepair && (
+              <button
+                type="button"
+                className="sidebar-tool-btn"
+                onClick={onCancelThumbRepair}
+                title="Stop repairing thumbnails"
+              >
+                Cancel Repair
+              </button>
+            )}
+            {onCheckUpdates && (
+              <button
+                type="button"
+                className={`sidebar-tool-btn${updateInfo ? " update-available" : ""}`}
+                onClick={updateInfo ? onInstallUpdate : onCheckUpdates}
+                disabled={updateChecking || updateDownloading}
+                title={updateInfo ? `Update to v${updateInfo.version}` : "Check for updates"}
+              >
+                {updateDownloading
+                  ? `Updating... ${updateProgress?.total ? Math.round((updateProgress.downloaded / updateProgress.total) * 100) : 0}%`
+                  : updateChecking
+                    ? "Checking..."
+                    : updateInfo
+                      ? `Update to v${updateInfo.version}`
+                      : "Check for Updates"}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/*
+        The info block describes this machine's cache (DB size, thumbnail bytes), which
+        the web deployment cannot know: without `dbStats` the whole section is absent.
+      */}
+      {dbStats && (
+        <div className="sidebar-info-fixed">
+          <div className="sidebar-section"><span>Info</span></div>
+          <div className="sidebar-item">Files: <span>{dbStats.files.toLocaleString()}</span></div>
+          <div className="sidebar-item">DB size: <span>{formatBytes(dbStats.dbSizeBytes)}</span></div>
+          {dbStats.dbLogicalBytes != null && dbStats.dbLogicalBytes !== dbStats.dbSizeBytes && (
+            <div className="sidebar-item sidebar-item-muted">
+              In use: <span>{formatBytes(dbStats.dbLogicalBytes)}</span>
+            </div>
+          )}
+          <div className="sidebar-item">Thumbs: <span>{formatBytes(dbStats.thumbsSizeBytes)}</span></div>
+          {!readOnly && onCompactDatabase && (dbStats.dbFreeBytes ?? 0) > 0 && (
+            <button
+              type="button"
+              className="sidebar-compact-btn"
+              onClick={onCompactDatabase}
+              disabled={compacting}
+              title="Reclaim free space in the database with VACUUM"
+            >
+              {compacting ? "Compacting…" : `Compact DB (${formatBytes(dbStats.dbFreeBytes ?? 0)} free)`}
+            </button>
+          )}
+          {onOpenSettings && (
+            <button
+              type="button"
+              className="sidebar-compact-btn"
+              onClick={onOpenSettings}
+              title="Model, resize filter, OCR engine, duplicate distance, startup and backlog chaining"
+            >
+              Settings
+            </button>
+          )}
+        </div>
+      )}
+    </aside>
+  );
+}

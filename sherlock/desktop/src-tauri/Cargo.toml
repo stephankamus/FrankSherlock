@@ -6,7 +6,9 @@ authors = ["AkitaOnRails"]
 license = "GPL-3.0-only"
 repository = "https://github.com/akitaonrails/FrankSherlock"
 edition = "2021"
-rust-version = "1.77.2"
+# 1.85 is the real floor: `image` pulls in crates written for `edition = "2024"`.
+# The web image (sherlock/web/Dockerfile) uses the same floor via RUST_VERSION.
+rust-version = "1.85"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -39,6 +41,9 @@ rusqlite_migration = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
+# Read core shared with the web server: query parser, row shapes and (soon) the
+# search queries themselves.
+sherlock_core = { path = "../../core" }
 tauri = { version = "2.10", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-log = "2"

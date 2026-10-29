@@ -1,0 +1,234 @@
+import type { DuplicatesResponse, DuplicateFile, DuplicateGroup } from "../types";
+import { useLibrary } from "../useLibrary";
+import { fileName, formatBytes } from "../utils/format";
+import "./tools.css";
+import "./duplicates.css";
+
+/**
+ * The group type is a parameter so the desktop can keep its `absPath`/`rootPath`
+ * required: the handlers it passes (preview, delete) need those fields, and the web
+ * version simply uses the base shape.
+ */
+type Props<TGroup extends DuplicateGroup = DuplicateGroup> = {
+  data: Omit<DuplicatesResponse, "groups"> & { groups: TGroup[] };
+  loading: boolean;
+  selected: Set<number>;
+  nearEnabled: boolean;
+  nearThreshold: number;
+  onNearEnabledChange: (enabled: boolean) => void;
+  onNearThresholdChange: (value: number) => void;
+  onToggleFile: (fileId: number) => void;
+  onSelectAllDuplicates: () => void;
+  onDeselectAll: () => void;
+  onDeleteSelected: () => void;
+  onBack: () => void;
+  onSelectGroupDuplicates: (group: TGroup) => void;
+  onPreviewGroup: (group: TGroup) => void;
+  /**
+   * Show the "Near-duplicates" controls. Defaults to true (desktop, where the
+   * backend can compute the distances); the web sets it to false because the
+   * published snapshot only serves exact groups.
+   */
+  showNearDuplicates?: boolean;
+};
+
+function formatDate(mtimeNs: number): string {
+  const ms = mtimeNs / 1_000_000;
+  return new Date(ms).toLocaleDateString();
+}
+
+/**
+ * Duplicate groups, read-only on the web.
+ *
+ * The view is informative there: it shows the group and opens a preview, but the
+ * selection checkboxes and the delete button only exist when the deployment can
+ * write, which is what keeps the web from offering an action the server would refuse.
+ */
+export default function DuplicatesView<TGroup extends DuplicateGroup = DuplicateGroup>({
+  data, loading, selected,
+  nearEnabled, nearThreshold, onNearEnabledChange, onNearThresholdChange,
+  onToggleFile, onSelectAllDuplicates, onDeselectAll, onDeleteSelected,
+  onBack, onSelectGroupDuplicates, onPreviewGroup, showNearDuplicates = true,
+}: Props<TGroup>) {
+  const canWrite = useLibrary().capabilities.write;
+
+  return (
+    <div className="tool-view">
+      <div className="tool-toolbar">
+        <div className="tool-toolbar-stats">
+          <strong>{data.totalGroups}</strong> group{data.totalGroups !== 1 ? "s" : ""},
+          {" "}<strong>{data.totalDuplicateFiles}</strong> duplicate{data.totalDuplicateFiles !== 1 ? "s" : ""},
+          {" "}<strong>{formatBytes(data.totalWastedBytes)}</strong> wasted
+        </div>
+        {showNearDuplicates && (
+          <label className="near-toggle" title="Include visually similar files (not just exact copies)">
+            <input
+              type="checkbox"
+              checked={nearEnabled}
+              onChange={(e) => onNearEnabledChange(e.target.checked)}
+            />
+            Near-duplicates
+          </label>
+        )}
+        {showNearDuplicates && nearEnabled && (
+          <div className="near-threshold-control">
+            <input
+              type="range"
+              min={70}
+              max={99}
+              value={Math.round(nearThreshold * 100)}
+              onChange={(e) => onNearThresholdChange(Number(e.target.value) / 100)}
+            />
+            <span className="near-threshold-label">{Math.round(nearThreshold * 100)}%</span>
+          </div>
+        )}
+        {canWrite && (
+          selected.size > 0 ? (
+            <button type="button" onClick={onDeselectAll}>Deselect all</button>
+          ) : (
+            <button type="button" onClick={onSelectAllDuplicates} disabled={data.totalDuplicateFiles === 0}>
+              Select all duplicates
+            </button>
+          )
+        )}
+        {canWrite && (
+          <button
+            type="button"
+            className="danger-btn"
+            disabled={selected.size === 0}
+            onClick={onDeleteSelected}
+          >
+            Delete selected ({selected.size})
+          </button>
+        )}
+        <button type="button" onClick={onBack}>Back</button>
+      </div>
+
+      <div className="tool-body">
+        {loading && <div className="tool-loading">Searching for duplicates...</div>}
+        {!loading && data.totalGroups === 0 && (
+          <div className="tool-empty">No duplicate files found.</div>
+        )}
+        {data.groups.map((group) => (
+          <GroupCard
+            key={group.fingerprint}
+            group={group}
+            selected={selected}
+            canWrite={canWrite}
+            onToggleFile={onToggleFile}
+            onSelectGroupDuplicates={onSelectGroupDuplicates}
+            onPreviewGroup={onPreviewGroup}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function confidenceTier(group: DuplicateGroup): "safe" | "likely" | "uncertain" {
+  if (group.groupType === "exact") return "safe";
+  if (group.avgSimilarity != null && group.avgSimilarity >= 0.85) return "likely";
+  return "uncertain";
+}
+
+const tierLabel = { safe: "EXACT", likely: "NEAR", uncertain: "NEAR" } as const;
+
+function GroupCard<TGroup extends DuplicateGroup>({
+  group, selected, canWrite, onToggleFile, onSelectGroupDuplicates, onPreviewGroup,
+}: {
+  group: TGroup;
+  selected: Set<number>;
+  canWrite: boolean;
+  onToggleFile: (fileId: number) => void;
+  onSelectGroupDuplicates: (group: TGroup) => void;
+  onPreviewGroup: (group: TGroup) => void;
+}) {
+  const tier = confidenceTier(group);
+  return (
+    <div className={`dup-group dup-group-${tier}`} data-group-type={group.groupType}>
+      <div className="dup-group-header">
+        <span className={`dup-type-badge dup-type-badge-${tier}`}>
+          {tierLabel[tier]}
+        </span>
+        <div className="dup-group-info">
+          <strong>{group.fileCount}</strong> copies &middot; {formatBytes(group.wastedBytes)} wasted
+          {group.groupType === "near" && group.avgSimilarity != null && (
+            <span className="dup-similarity-label">
+              {" "}&middot; {Math.round(group.avgSimilarity * 100)}% similar
+            </span>
+          )}
+        </div>
+        <button type="button" onClick={() => onPreviewGroup(group)}>
+          Compare
+        </button>
+        {canWrite && (
+          <button type="button" onClick={() => onSelectGroupDuplicates(group)}>
+            Select duplicates
+          </button>
+        )}
+      </div>
+      {group.files.map((file) => (
+        <FileRow
+          key={file.id}
+          file={file}
+          isSelected={selected.has(file.id)}
+          canWrite={canWrite}
+          onToggle={() => onToggleFile(file.id)}
+          onPreview={() => onPreviewGroup(group)}
+        />
+      ))}
+    </div>
+  );
+}
+
+function FileRow({
+  file, isSelected, canWrite, onToggle, onPreview,
+}: {
+  file: DuplicateFile;
+  isSelected: boolean;
+  canWrite: boolean;
+  onToggle: () => void;
+  onPreview: () => void;
+}) {
+  const library = useLibrary();
+  const thumb = library.thumbUrl(file);
+  // The web path has no stored root path, only the published root name/count.
+  const rootLabel = file.rootName ?? file.rootPath ?? "";
+
+  return (
+    <div
+      className={`dup-file-row${isSelected ? " dup-file-row-selected" : ""}`}
+      onClick={onPreview}
+    >
+      {canWrite && (
+        <input
+          type="checkbox"
+          className="dup-file-checkbox"
+          checked={isSelected}
+          onChange={onToggle}
+          onClick={(e) => e.stopPropagation()}
+          aria-label={`Select ${fileName(file.relPath)}`}
+        />
+      )}
+      <div className="dup-file-thumb">
+        {thumb ? (
+          <img src={thumb} alt={fileName(file.relPath)} loading="lazy" />
+        ) : (
+          <span className="dup-file-thumb-placeholder">{file.mediaType}</span>
+        )}
+      </div>
+      <div className="dup-file-info">
+        <div className="dup-file-path" title={file.relPath}>{file.relPath}</div>
+        <div className="dup-file-meta">
+          {rootLabel && <span>{rootLabel}</span>}
+          <span>{formatBytes(file.sizeBytes)}</span>
+          <span>{formatDate(file.mtimeNs)}</span>
+          {file.groupType === "near" && file.similarityScore != null && !file.isKeeper && (
+            <span className="dup-file-similarity">{Math.round(file.similarityScore * 100)}%</span>
+          )}
+        </div>
+      </div>
+      {file.isKeeper && <span className="dup-keeper-badge">KEEP</span>}
+    </div>
+  );
+}

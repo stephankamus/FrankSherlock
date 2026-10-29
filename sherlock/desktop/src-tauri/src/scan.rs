@@ -1633,7 +1633,10 @@ fn share_wait(ctx: &ScanContext, root_id: i64, cancel: Option<&AtomicBool>) -> b
         // the full backoff.
         for _ in 0..delay {
             if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-                log::info!("Backlog: stopped waiting for {} (cancelled)", root_path.display());
+                log::info!(
+                    "Backlog: stopped waiting for {} (cancelled)",
+                    root_path.display()
+                );
                 return false;
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
@@ -2448,9 +2451,13 @@ fn mark_failed(ctx: &ScanContext, file_id: i64, kind: &str, detail: &str) {
         return;
     }
     let detail: String = detail.chars().take(400).collect();
-    if let Err(e) =
-        db::record_classification_failure(&ctx.db_path, file_id, kind, &detail, MAX_CLASSIFY_ATTEMPTS)
-    {
+    if let Err(e) = db::record_classification_failure(
+        &ctx.db_path,
+        file_id,
+        kind,
+        &detail,
+        MAX_CLASSIFY_ATTEMPTS,
+    ) {
         log::error!("Could not record the failure for file {file_id}: {e}");
     }
 }
@@ -3997,7 +4004,9 @@ mod tests {
         assert!(!is_supported_file(Path::new("photo.HEIC")));
         assert!(!is_supported_file(Path::new("photo.nef")));
         assert!(!is_supported_file(Path::new("photo.NEF")));
-        assert!(is_supported_file(Path::new("FrankSherlock-JPG/photo__heic.jpg")));
+        assert!(is_supported_file(Path::new(
+            "FrankSherlock-JPG/photo__heic.jpg"
+        )));
         assert!(is_supported_file(Path::new(
             "Trip/FrankSherlock-JPG/photo__nef.jpg"
         )));
