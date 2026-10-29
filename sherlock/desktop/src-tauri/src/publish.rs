@@ -363,12 +363,11 @@ fn sync_tree(
                 fs::create_dir_all(parent)
                     .map_err(|error| io_error("creating", parent, error))?;
             }
-            copy_file(source, &target)?;
-            // The copy brings contents only, **not** the modification time. Without
-            // this the destination carries the copy's own timestamp, so the very next
-            // publish sees a difference and copies the file again — the incremental
-            // sync would rewrite the whole cache every time.
-            preserve_mtime(source_meta.modified().ok(), &target);
+            // The copy brings contents only, **not** the modification time. Without the
+            // stamp the destination carries the copy's own timestamp, so the very next
+            // publish sees a difference and copies the file again — the incremental sync
+            // would rewrite the whole cache every time.
+            copy_file(source, &target, source_meta.modified().ok())?;
             outcome.copied += 1;
             outcome.bytes += source_meta.len();
         }
@@ -398,18 +397,21 @@ fn sync_tree(
 /// supported": the snapshot uses its own read/write loop, so that copy worked and the
 /// failure looked like a broken share. Streaming works on every filesystem, and these
 /// files are small enough that the syscall count does not matter.
-fn copy_file(source: &Path, target: &Path) -> AppResult<()> {
+fn copy_file(source: &Path, target: &Path, modified: Option<SystemTime>) -> AppResult<()> {
     match fs::copy(source, target) {
-        Ok(_) => Ok(()),
+        Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
             log::debug!(
                 "publish: {} refused the kernel copy ({error}), streaming it instead",
                 target.display()
             );
-            stream_copy(source, target)
+            stream_copy(source, target)?;
         }
-        Err(error) => Err(copy_error(source, target, error)),
+        Err(error) => return Err(copy_error(source, target, error)),
     }
+    // Only once the destination is closed: see `preserve_mtime`.
+    preserve_mtime(modified, target);
+    Ok(())
 }
 
 fn stream_copy(source: &Path, target: &Path) -> AppResult<()> {
@@ -444,21 +446,45 @@ fn io_error(action: &str, path: &Path, error: std::io::Error) -> AppError {
 ///
 /// A failure only means the next publish copies that file again; it must never fail
 /// the publish itself.
+///
+/// Two details are load-bearing on a network share, and both were measured against a
+/// gvfs/SMB mount:
+///
+/// * the stamp has to happen **after the writer is closed**. Doing it on the handle that
+///   wrote the file returns `Ok` and reads back correctly, and then the gvfs writeback
+///   replaces it with the copy time — the incremental sync silently degrades to a full
+///   copy of 34 000 thumbnails on every publish;
+/// * that reopen cannot be write-only, which gvfs refuses with `EOPNOTSUPP`. A read
+///   handle is enough for `futimens` (ownership, not write access, is what it needs), so
+///   read-only and then append are the fallbacks.
 fn preserve_mtime(modified: Option<SystemTime>, target: &Path) {
     let Some(modified) = modified else {
         return;
     };
-    match fs::File::options().write(true).open(target) {
-        Ok(file) => {
-            if let Err(e) = file.set_times(fs::FileTimes::new().set_modified(modified)) {
-                log::debug!("publish: could not set mtime on {}: {e}", target.display());
-            }
+    let stamp = |file: &fs::File| file.set_times(fs::FileTimes::new().set_modified(modified));
+
+    // Lazily, one at a time: opening all three up front would cost 68 000 extra syscalls
+    // on a first publish.
+    let openers: [(&str, fn(&Path) -> std::io::Result<fs::File>); 3] = [
+        ("write", |path| fs::File::options().write(true).open(path)),
+        ("read", |path| fs::File::open(path)),
+        ("append", |path| fs::File::options().append(true).open(path)),
+    ];
+    let mut error = None;
+    for (mode, open) in openers {
+        match open(target) {
+            Ok(file) => match stamp(&file) {
+                Ok(()) => return,
+                Err(e) => error = Some(format!("setting the mtime through a {mode} handle: {e}")),
+            },
+            Err(e) => error = Some(format!("reopening it {mode}-only: {e}")),
         }
-        Err(e) => log::debug!(
-            "publish: could not reopen {} to set its mtime: {e}",
-            target.display()
-        ),
     }
+    log::debug!(
+        "publish: could not stamp {}: {}",
+        target.display(),
+        error.unwrap_or_else(|| "no reopen mode worked".to_string())
+    );
 }
 
 fn is_up_to_date(source: &fs::Metadata, target: &Path) -> bool {
@@ -801,11 +827,12 @@ mod tests {
             .set_times(fs::FileTimes::new().set_modified(old))
             .expect("set mtime");
 
-        fs::copy(&source, &target).expect("copy");
-        preserve_mtime(
-            fs::metadata(&source).expect("meta").modified().ok(),
+        copy_file(
+            &source,
             &target,
-        );
+            fs::metadata(&source).expect("meta").modified().ok(),
+        )
+        .expect("copy");
 
         let source_secs = fs::metadata(&source)
             .expect("meta")
@@ -845,11 +872,11 @@ mod tests {
         let source = temp.path().join("a.jpg");
         let target = temp.path().join("b.jpg");
         fs::write(&source, b"bytes").expect("write");
-        copy_file(&source, &target).expect("copy");
+        copy_file(&source, &target, None).expect("copy");
         assert_eq!(fs::read(&target).expect("read"), b"bytes");
 
         let missing = temp.path().join("gone.jpg");
-        let error = copy_file(&missing, &target).expect_err("missing source must fail");
+        let error = copy_file(&missing, &target, None).expect_err("missing source must fail");
         assert!(
             error.to_string().contains("gone.jpg"),
             "the message has to name the file: {error}"
