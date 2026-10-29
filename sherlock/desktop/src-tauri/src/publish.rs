@@ -360,13 +360,14 @@ fn sync_tree(
             outcome.unchanged += 1;
         } else {
             if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
+                fs::create_dir_all(parent)
+                    .map_err(|error| io_error("creating", parent, error))?;
             }
-            fs::copy(source, &target)?;
-            // `fs::copy` copies contents and permissions, **not** the modification
-            // time. Without this the destination carries the copy's own timestamp, so
-            // the very next publish sees a difference and copies the file again — the
-            // incremental sync would rewrite the whole cache every time.
+            copy_file(source, &target)?;
+            // The copy brings contents only, **not** the modification time. Without
+            // this the destination carries the copy's own timestamp, so the very next
+            // publish sees a difference and copies the file again — the incremental
+            // sync would rewrite the whole cache every time.
             preserve_mtime(source_meta.modified().ok(), &target);
             outcome.copied += 1;
             outcome.bytes += source_meta.len();
@@ -386,6 +387,57 @@ fn sync_tree(
         outcome.removed = remove_orphans(dst, &seen)?;
     }
     Ok(outcome)
+}
+
+/// Copy `source` over `target`, keeping the kernel's fast path when the filesystem has
+/// one and falling back to a read/write loop when it does not.
+///
+/// `fs::copy` starts with `copy_file_range`/`sendfile`, and a GVFS mount over SMB — the
+/// usual home of the publish folder — refuses it with `EOPNOTSUPP` (os error 95). The
+/// publish died on its very first thumbnail with nothing but "io error: Operation not
+/// supported": the snapshot uses its own read/write loop, so that copy worked and the
+/// failure looked like a broken share. Streaming works on every filesystem, and these
+/// files are small enough that the syscall count does not matter.
+fn copy_file(source: &Path, target: &Path) -> AppResult<()> {
+    match fs::copy(source, target) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+            log::debug!(
+                "publish: {} refused the kernel copy ({error}), streaming it instead",
+                target.display()
+            );
+            stream_copy(source, target)
+        }
+        Err(error) => Err(copy_error(source, target, error)),
+    }
+}
+
+fn stream_copy(source: &Path, target: &Path) -> AppResult<()> {
+    let mut reader =
+        BufReader::new(fs::File::open(source).map_err(|e| copy_error(source, target, e))?);
+    let mut writer = fs::File::create(target).map_err(|e| copy_error(source, target, e))?;
+    std::io::copy(&mut reader, &mut writer).map_err(|e| copy_error(source, target, e))?;
+    Ok(())
+}
+
+/// Name both ends of a failed copy: the bare `io::Error` used to reach the UI as
+/// "Operation not supported", with no hint of which of 34 000 thumbnails caused it.
+fn copy_error(source: &Path, target: &Path, error: std::io::Error) -> AppError {
+    AppError::Io(std::io::Error::new(
+        error.kind(),
+        format!(
+            "copying {} to {}: {error}",
+            source.display(),
+            target.display()
+        ),
+    ))
+}
+
+fn io_error(action: &str, path: &Path, error: std::io::Error) -> AppError {
+    AppError::Io(std::io::Error::new(
+        error.kind(),
+        format!("{action} {}: {error}", path.display()),
+    ))
 }
 
 /// Stamp `target` with the source's modification time, best effort.
@@ -770,6 +822,38 @@ mod tests {
             .expect("epoch")
             .as_secs();
         assert_eq!(source_secs, target_secs);
+    }
+
+    /// The fallback taken on a share that refuses `copy_file_range`: exact bytes, and a
+    /// pre-existing longer file is truncated, not left with a tail of the old copy.
+    #[test]
+    fn stream_copy_replaces_a_longer_target() {
+        let temp = tempfile::tempdir().expect("temp");
+        let source = temp.path().join("a.jpg");
+        let target = temp.path().join("b.jpg");
+        fs::write(&source, b"new").expect("write source");
+        fs::write(&target, b"a much longer previous copy").expect("write target");
+
+        stream_copy(&source, &target).expect("stream copy");
+
+        assert_eq!(fs::read(&target).expect("read"), b"new");
+    }
+
+    #[test]
+    fn copy_file_reports_the_path_it_could_not_copy() {
+        let temp = tempfile::tempdir().expect("temp");
+        let source = temp.path().join("a.jpg");
+        let target = temp.path().join("b.jpg");
+        fs::write(&source, b"bytes").expect("write");
+        copy_file(&source, &target).expect("copy");
+        assert_eq!(fs::read(&target).expect("read"), b"bytes");
+
+        let missing = temp.path().join("gone.jpg");
+        let error = copy_file(&missing, &target).expect_err("missing source must fail");
+        assert!(
+            error.to_string().contains("gone.jpg"),
+            "the message has to name the file: {error}"
+        );
     }
 
     #[test]
