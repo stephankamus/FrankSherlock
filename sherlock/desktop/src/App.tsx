@@ -79,6 +79,13 @@ import "./app.css";
 const POLL_MS = 1200;
 
 /**
+ * The updater points at the upstream fork's releases, which would overwrite the local
+ * changes. Keep the plugin wired (the hook still runs) but hide the sidebar control
+ * until this fork publishes its own update feed.
+ */
+const SHOW_UPDATE_CONTROLS = false;
+
+/**
  * PDF pane of the shared preview.
  *
  * The desktop keeps `PdfViewer` (pdf.js + saved passwords + reclassify on unlock);
@@ -1228,12 +1235,14 @@ export default function App() {
           onFindDuplicates={enterDuplicatesMode}
           onOpenPdfPasswords={enterPdfPasswordsMode}
           onOpenFaces={enterFacesMode}
-          updateInfo={autoUpdate.updateInfo}
-          updateChecking={autoUpdate.updateChecking}
-          updateDownloading={autoUpdate.updateDownloading}
-          updateProgress={autoUpdate.updateProgress}
-          onCheckUpdates={() => autoUpdate.checkForUpdates(false)}
-          onInstallUpdate={autoUpdate.installUpdate}
+          updateInfo={SHOW_UPDATE_CONTROLS ? autoUpdate.updateInfo : null}
+          updateChecking={SHOW_UPDATE_CONTROLS ? autoUpdate.updateChecking : false}
+          updateDownloading={SHOW_UPDATE_CONTROLS ? autoUpdate.updateDownloading : false}
+          updateProgress={SHOW_UPDATE_CONTROLS ? autoUpdate.updateProgress : null}
+          onCheckUpdates={
+            SHOW_UPDATE_CONTROLS ? () => autoUpdate.checkForUpdates(false) : undefined
+          }
+          onInstallUpdate={SHOW_UPDATE_CONTROLS ? autoUpdate.installUpdate : undefined}
         />
 
         {faces.facesMode ? (

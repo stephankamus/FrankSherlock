@@ -165,6 +165,9 @@
   position: absolute;
   top: 4px;
   right: 4px;
+  /* Above `.tile-hover-overlay`: the description panel covers the whole tile on
+     hover, and without a stacking hint its black background swallowed the click. */
+  z-index: 3;
   width: 24px;
   height: 24px;
   padding: 0;
@@ -194,6 +197,7 @@
   position: absolute;
   bottom: 4px;
   left: 4px;
+  z-index: 2;
   padding: 1px 6px;
   background: rgba(0, 0, 0, 0.75);
   border-radius: var(--radius-sm);
@@ -316,6 +320,7 @@ button.scanning-indicator:focus-visible {
   position: absolute;
   top: 6px;
   right: 6px;
+  z-index: 2;
   background: rgba(0, 0, 0, 0.6);
   color: #fff;
   font-size: 0.7rem;
@@ -330,6 +335,7 @@ button.scanning-indicator:focus-visible {
   position: absolute;
   top: 6px;
   left: 6px;
+  z-index: 2;
   background: rgba(160, 110, 20, 0.85);
   color: #fff;
   font-size: 0.6rem;
@@ -346,12 +352,15 @@ button.scanning-indicator:focus-visible {
   position: absolute;
   bottom: 26px;
   right: 6px;
+  z-index: 2;
   background: rgba(60, 120, 200, 0.8);
   color: #fff;
   font-size: 0.65rem;
   padding: 1px 5px;
   border-radius: 8px;
-  pointer-events: none;
+  /* Hoverable so the title explains the number. A click still bubbles to the tile,
+     which is the same gesture as clicking the photo. */
+  pointer-events: auto;
   line-height: 1.2;
   font-weight: 600;
 }
@@ -394,7 +403,9 @@ button.scanning-indicator:focus-visible {
 .tile:hover .tile-hover-overlay {
   opacity: 1;
   transform: translateY(0);
-  pointer-events: auto;
+  /* The panel is purely informative; letting it capture the pointer is what kept
+     the hide button from ever receiving a click. */
+  pointer-events: none;
 }
 
 .tile:hover .tile-filename {

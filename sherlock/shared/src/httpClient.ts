@@ -40,6 +40,13 @@ export type HttpLibraryClientOptions = {
   token?: string;
   /** Injected by tests. Defaults to the global `fetch`. */
   fetchImpl?: typeof fetch;
+  /**
+   * Called when an API call answers `401`.
+   *
+   * The web login screen uses this to forget a token the server no longer accepts and
+   * show the form again, instead of leaving the shell with an "unauthorized" banner.
+   */
+  onUnauthorized?: () => void;
 };
 
 /** Query string of `GET /api/search`, without `includeHidden` by construction. */
@@ -69,6 +76,7 @@ export function createHttpLibraryClient(options: HttpLibraryClientOptions = {}):
   const token = options.token ?? "";
   const doFetch: typeof fetch =
     options.fetchImpl ?? ((input, init) => globalThis.fetch(input, init));
+  const onUnauthorized = options.onUnauthorized;
 
   function absolute(path: string): string {
     if (/^[a-z][a-z0-9+.-]*:\/\//i.test(path)) return path;
@@ -87,6 +95,7 @@ export function createHttpLibraryClient(options: HttpLibraryClientOptions = {}):
     if (token) headers.Authorization = `Bearer ${token}`;
     const response = await doFetch(absolute(`/api${path}`), { headers });
     if (!response.ok) {
+      if (response.status === 401) onUnauthorized?.();
       let body: unknown;
       try {
         body = await response.json();

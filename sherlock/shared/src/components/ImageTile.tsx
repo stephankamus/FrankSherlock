@@ -120,7 +120,13 @@ export default function ImageTile({
           </span>
         )}
         {item.faceCount != null && item.faceCount > 0 && (
-          <span className="tile-face-badge" aria-label={`${item.faceCount} face${item.faceCount > 1 ? "s" : ""}`}>
+          // Informative only: clicking the tile already opens this photo. The title
+          // is what explains the blue number, which the hover overlay used to hide.
+          <span
+            className="tile-face-badge"
+            title={`${item.faceCount} face${item.faceCount > 1 ? "s" : ""} detected in this photo`}
+            aria-label={`${item.faceCount} face${item.faceCount > 1 ? "s" : ""} detected`}
+          >
             {item.faceCount}
           </span>
         )}

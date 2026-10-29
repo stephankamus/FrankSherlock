@@ -14,11 +14,7 @@ export function resolveToken(
 ): string {
   const fromUrl = new URLSearchParams(search).get("token");
   if (fromUrl) {
-    try {
-      storage.setItem(TOKEN_KEY, fromUrl);
-    } catch {
-      /* private mode: the URL value still works for this session */
-    }
+    saveToken(fromUrl, storage);
     return fromUrl;
   }
   try {
@@ -28,9 +24,30 @@ export function resolveToken(
   }
 }
 
+/** Remember a token the server accepted, so the login form is not needed again. */
+export function saveToken(token: string, storage: Storage = window.localStorage): void {
+  try {
+    storage.setItem(TOKEN_KEY, token);
+  } catch {
+    /* private mode: the token still works for this session */
+  }
+}
+
+/** Forget the stored token (it was rejected, or the user wants a different one). */
+export function clearToken(storage: Storage = window.localStorage): void {
+  try {
+    storage.removeItem(TOKEN_KEY);
+  } catch {
+    /* nothing to clear when storage is unavailable */
+  }
+}
+
 /** Same-origin client: the binary that served this bundle also serves `/api`. */
-export function createWebClient(): ReturnType<typeof createHttpLibraryClient> {
-  return createHttpLibraryClient({ token: resolveToken() });
+export function createWebClient(
+  token: string = resolveToken(),
+  onUnauthorized?: () => void,
+): ReturnType<typeof createHttpLibraryClient> {
+  return createHttpLibraryClient({ token, onUnauthorized });
 }
 
 /** Drop `?token=` from the address bar once it was stored. */

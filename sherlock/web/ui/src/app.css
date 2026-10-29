@@ -19,6 +19,82 @@ body {
   color: var(--text-primary);
 }
 
+/* ── Token sign-in ─────────────────────────────────────────── */
+.auth-screen {
+  height: 100%;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: var(--bg-base);
+  color: var(--text-primary);
+}
+
+.auth-card {
+  width: min(100%, 380px);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 24px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-md);
+}
+
+.auth-card h1 {
+  margin: 0;
+  font-size: 1.15rem;
+}
+
+.auth-card p {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.auth-card label {
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+}
+
+.auth-card input {
+  padding: 8px 10px;
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font: inherit;
+}
+
+.auth-card input:focus {
+  outline: 1px solid var(--border-focus);
+  outline-offset: 1px;
+}
+
+.auth-card button {
+  margin-top: 4px;
+  padding: 8px 14px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+}
+
+.auth-card button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.auth-error {
+  color: var(--danger) !important;
+}
+
+.auth-hint {
+  font-size: 0.75rem !important;
+}
+
 .web-banner {
   padding: 8px 14px;
   font-size: var(--font-size-sm);

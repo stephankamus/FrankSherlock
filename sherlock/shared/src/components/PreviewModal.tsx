@@ -95,8 +95,18 @@ export default function PreviewModal({
   renderPdf,
 }: Props) {
   const library = useLibrary();
-  const { mode, pdfs, images } = detectLayout(previewItems);
-  const videoItem = mode === "single-video" ? previewItems[0] : undefined;
+  // A caller may hand over the whole result page plus the index the user clicked (the
+  // web grid does). When a single item is being previewed, the index — not the array
+  // length — decides the layout; otherwise every click opened a collage of the page.
+  const singleItem =
+    singlePreviewIndex != null
+      ? previewItems[
+          Math.min(Math.max(singlePreviewIndex, 0), Math.max(previewItems.length - 1, 0))
+        ]
+      : undefined;
+  const layoutItems = singleItem ? [singleItem] : previewItems;
+  const { mode, pdfs, images } = detectLayout(layoutItems);
+  const videoItem = mode === "single-video" ? layoutItems[0] : undefined;
   const videoUrl = useVideoStreamUrl(videoItem);
   const [videoError, setVideoError] = useState(false);
 
@@ -157,7 +167,7 @@ export default function PreviewModal({
           &times;
         </button>
         {/* Nav buttons only for single-select preview (image or PDF) */}
-        {previewItems.length === 1 &&
+        {singleItem != null &&
           singlePreviewIndex != null &&
           singlePreviewIndex > 0 && (
             <button
@@ -169,7 +179,7 @@ export default function PreviewModal({
               &#8249;
             </button>
           )}
-        {previewItems.length === 1 &&
+        {singleItem != null &&
           singlePreviewIndex != null &&
           singlePreviewIndex < totalItems - 1 && (
             <button
@@ -183,11 +193,11 @@ export default function PreviewModal({
           )}
 
         {/* Single image preview */}
-        {mode === "single-image" && (
+        {mode === "single-image" && layoutItems[0] && (
           <div className="preview-image-wrap">
             <img
-              src={library.previewUrl(previewItems[0], 1600)}
-              alt={previewItems[0].relPath}
+              src={library.previewUrl(layoutItems[0], 1600)}
+              alt={layoutItems[0].relPath}
             />
           </div>
         )}
@@ -214,12 +224,12 @@ export default function PreviewModal({
         )}
 
         {/* Video error fallback: show thumbnail + message */}
-        {mode === "single-video" && videoError && (
+        {mode === "single-video" && videoError && layoutItems[0] && (
           <div className="preview-video-wrap preview-video-fallback">
-            {library.thumbUrl(previewItems[0]) && (
+            {library.thumbUrl(layoutItems[0]) && (
               <img
-                src={library.thumbUrl(previewItems[0]) ?? undefined}
-                alt={previewItems[0].relPath}
+                src={library.thumbUrl(layoutItems[0]) ?? undefined}
+                alt={layoutItems[0].relPath}
                 style={{ maxHeight: "50vh", objectFit: "contain" }}
               />
             )}
@@ -282,21 +292,21 @@ export default function PreviewModal({
         )}
 
         <div className="preview-info">
-          {previewItems.length === 1 ? (
+          {singleItem ? (
             <>
-              <h3 title={previewItems[0].relPath}>
-                {previewItems[0].relPath}
+              <h3 title={singleItem.relPath}>
+                {singleItem.relPath}
               </h3>
               <p className="preview-desc">
-                {previewItems[0].description || "No description"}
+                {singleItem.description || "No description"}
               </p>
               <div className="preview-meta">
-                <span className="badge">{previewItems[0].mediaType}</span>
+                <span className="badge">{singleItem.mediaType}</span>
                 <span>
-                  Confidence: {previewItems[0].confidence.toFixed(2)}
+                  Confidence: {singleItem.confidence.toFixed(2)}
                 </span>
                 <span>
-                  {formatBytes(previewItems[0].sizeBytes)}
+                  {formatBytes(singleItem.sizeBytes)}
                 </span>
               </div>
             </>

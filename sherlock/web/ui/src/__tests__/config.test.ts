@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { resolveToken } from "../config";
+import { clearToken, resolveToken, saveToken } from "../config";
 
 function memoryStorage(): Storage {
   const values = new Map<string, string>();
@@ -24,5 +24,13 @@ describe("resolveToken", () => {
 
   it("returns an empty string when nothing was provided", () => {
     expect(resolveToken("", memoryStorage())).toBe("");
+  });
+
+  it("stores and clears a token accepted by the server", () => {
+    const storage = memoryStorage();
+    saveToken("accepted", storage);
+    expect(resolveToken("", storage)).toBe("accepted");
+    clearToken(storage);
+    expect(resolveToken("", storage)).toBe("");
   });
 });

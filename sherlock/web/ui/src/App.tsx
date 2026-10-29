@@ -32,7 +32,11 @@ const EMPTY_DUPLICATES: DuplicatesResponse = {
 };
 
 type ViewMode = "library" | "faces" | "duplicates";
-type PreviewState = { items: SearchItem[]; index: number };
+/**
+ * `index === null` means a comparison view: the whole array is a set to browse (the
+ * duplicates "Compare" and a person's photos), not a single item with navigation.
+ */
+type PreviewState = { items: SearchItem[]; index: number | null };
 
 /**
  * The read-only client.
@@ -165,7 +169,7 @@ export default function App() {
     setDrawerOpen(false);
   }
 
-  function openPreview(items: SearchItem[], index: number) {
+  function openPreview(items: SearchItem[], index: number | null) {
     setPreview({ items, index });
   }
 
@@ -186,7 +190,7 @@ export default function App() {
         mtimeNs: 0,
         sizeBytes: 0,
       }));
-      if (items.length > 0) openPreview(items, 0);
+      if (items.length > 0) openPreview(items, null);
     } catch (error) {
       setNotice(errorMessage(error));
     }
@@ -365,7 +369,7 @@ export default function App() {
                     thumbUrl: file.thumbUrl,
                     mediaUrl: file.mediaUrl,
                   })),
-                  0,
+                  null,
                 )
               }
               showNearDuplicates={false}

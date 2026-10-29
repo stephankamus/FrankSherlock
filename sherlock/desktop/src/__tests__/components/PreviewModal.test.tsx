@@ -81,6 +81,31 @@ describe("PreviewModal", () => {
     expect(screen.getByText("2.0 KB")).toBeInTheDocument();
   });
 
+  it("shows only the clicked item when the caller passes the whole result page", () => {
+    const second = {
+      ...item,
+      id: 12,
+      relPath: "photos/lake.jpg",
+      absPath: "/home/user/photos/lake.jpg",
+      description: "A quiet lake",
+    };
+    const { container } = renderPreview(
+      <TestPreview
+        previewItems={[item, second]}
+        selectedCount={2}
+        singlePreviewIndex={1}
+        totalItems={2}
+        onClose={() => {}}
+        onNavigate={() => {}}
+      />,
+    );
+
+    expect(screen.getByText("photos/lake.jpg")).toBeInTheDocument();
+    expect(screen.getByText("A quiet lake")).toBeInTheDocument();
+    expect(screen.queryByText("photos/sunset.jpg")).not.toBeInTheDocument();
+    expect(container.querySelector(".preview-collage")).toBeNull();
+  });
+
   it("calls onClose when close button clicked", async () => {
     const user = userEvent.setup();
     const onClose = vi.fn();

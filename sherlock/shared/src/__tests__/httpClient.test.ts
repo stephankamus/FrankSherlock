@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { createHttpLibraryClient, searchQueryString } from "../httpClient";
 import { LibraryHttpError } from "../utils/errors";
@@ -132,5 +132,18 @@ describe("createHttpLibraryClient", () => {
   it("keeps the read-only capabilities of the deployment", () => {
     const { client } = clientWith();
     expect(client.capabilities).toEqual({ write: false, scan: false, pdfUnlock: false });
+  });
+
+  it("notifies the host when a request is unauthorized", async () => {
+    const onUnauthorized = vi.fn();
+    const client = createHttpLibraryClient({
+      baseUrl: "https://lib.example",
+      token: "bad",
+      onUnauthorized,
+      fetchImpl: (async () => fakeJson({ error: "unauthorized" }, 401)) as typeof fetch,
+    });
+
+    await expect(client.health?.()).rejects.toBeInstanceOf(LibraryHttpError);
+    expect(onUnauthorized).toHaveBeenCalledOnce();
   });
 });

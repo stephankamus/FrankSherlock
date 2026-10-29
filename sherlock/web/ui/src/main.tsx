@@ -1,19 +1,12 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
-import { LibraryProvider } from "@frank-sherlock/shared";
 import "@frank-sherlock/shared/theme.css";
 import "./app.css";
-import App from "./App";
-import { createWebClient, stripTokenFromUrl } from "./config";
-
-const client = createWebClient();
-stripTokenFromUrl();
+import TokenGate from "./TokenGate";
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <LibraryProvider client={client}>
-      <App />
-    </LibraryProvider>
+    <TokenGate />
   </React.StrictMode>,
 );
 
