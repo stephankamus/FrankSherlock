@@ -3063,8 +3063,18 @@ fn spawn_scan_worker_if_needed(
 pub fn run() {
     let (paths, read_only) = resolve_paths()
         .and_then(|paths| {
-            let dirs_ok = prepare_dirs(&paths).is_ok();
-            let init_ok = dirs_ok && db::init_database(&paths.db_file).is_ok();
+            // Keep the errors rather than only whether they happened: everything below
+            // degrades to `read_only`, and the user sees "Database is read-only", which
+            // reads like a permission problem. Opening a library that a newer build has
+            // already migrated (schema above what this binary knows) lands here too, and
+            // without the reason in the log that takes an hour to diagnose.
+            let dirs_error = prepare_dirs(&paths).err();
+            let init_error = if dirs_error.is_none() {
+                db::init_database(&paths.db_file).err()
+            } else {
+                None
+            };
+            let init_ok = dirs_error.is_none() && init_error.is_none();
 
             if init_ok {
                 // Full read-write mode
@@ -3120,8 +3130,21 @@ pub fn run() {
 
                 Ok((paths, false))
             } else if paths.db_file.exists() {
-                // DB exists but filesystem is not writable — read-only mode
-                log::warn!("Running in read-only mode (filesystem not writable)");
+                // DB exists but cannot be opened read-write — read-only mode. Say why:
+                // the UI only repeats "Database is read-only", which reads like a
+                // permission problem even when the cause is a schema from a newer build.
+                // `log` is not wired up yet at this point (the Tauri log plugin is
+                // registered further down), so this goes to stderr as well.
+                let reason = dirs_error
+                    .map(|error| error.to_string())
+                    .or_else(|| init_error.map(|error| error.to_string()))
+                    .unwrap_or_else(|| "unknown reason".to_string());
+                let message = format!(
+                    "Running in read-only mode: {} could not be opened read-write: {reason}",
+                    paths.db_file.display()
+                );
+                log::error!("{message}");
+                eprintln!("{message}");
                 Ok((paths, true))
             } else {
                 Err(AppError::Config(

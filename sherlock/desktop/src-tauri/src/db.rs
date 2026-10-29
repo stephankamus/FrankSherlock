@@ -7786,6 +7786,28 @@ mod tests {
         assert_eq!(version, 20);
     }
 
+    /// A database written by a *newer* build is refused, never adopted silently.
+    ///
+    /// `run()` turns a failed `init_database` into read-only mode, and the user sees
+    /// "Database is read-only" — which reads like a permissions problem. Opening a
+    /// library indexed by a branch that had migrated one step further is the other way
+    /// to get there, so the failure has to be loud and must name the migration.
+    #[test]
+    fn test_a_newer_schema_is_refused() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        {
+            let conn = Connection::open(&db_path).expect("open");
+            conn.pragma_update(None, "user_version", 21).expect("bump");
+        }
+
+        let error = init_database(&db_path).expect_err("a newer schema must not be adopted");
+        assert!(
+            error.to_string().to_lowercase().contains("migration"),
+            "the error must say it is a migration problem, got: {error}"
+        );
+    }
+
     #[test]
     fn raw_conversion_roundtrip_is_idempotent_per_source() {
         let (_dir, db_path) = test_db_path();

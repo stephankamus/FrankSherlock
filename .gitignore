@@ -45,3 +45,11 @@ posts/
 # Local experiment artifacts
 _face_ab_test/*.pt
 *.url
+
+# Crates and workspaces built inside the repo
+node_modules/
+sherlock/core/target/
+sherlock/web/server/target/
+
+# Local deployment secrets (sherlock/web/.gitignore covers the web-specific files)
+.env
