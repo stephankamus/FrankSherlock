@@ -446,6 +446,8 @@ pub struct RootInfo {
     pub last_seen_at: Option<i64>,
     /// Human readable reason for the last failed probe.
     pub last_error: Option<String>,
+    /// The root folder itself is covered by a hidden-folder rule.
+    pub hidden: bool,
 }
 
 /// What a "Reclassify" pass actually cleared.

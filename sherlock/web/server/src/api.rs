@@ -244,6 +244,8 @@ async fn roots(State(state): State<Arc<AppState>>) -> Result<Json<Vec<WebRoot>>,
         .pointer
         .roots
         .iter()
+        // A root whose files are all hidden has nothing to show; it disappears from the web.
+        .filter(|root| root.files > 0)
         .map(|root| WebRoot {
             id: root.id,
             name: root.name.clone(),

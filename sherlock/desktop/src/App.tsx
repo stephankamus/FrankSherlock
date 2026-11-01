@@ -848,9 +848,12 @@ export default function App() {
   async function handleSetFolderHidden(rootId: number, relPath: string, hide: boolean) {
     try {
       const changed = await setFolderHidden(rootId, relPath, hide);
+      await scanManager.refreshRoots();
       await runSearch(0, false, undefined, true);
       await refreshHiddenCount();
-      const name = relPath.split("/").pop() ?? relPath;
+      const name = relPath
+        ? relPath.split("/").pop() ?? relPath
+        : roots.find((r) => r.id === rootId)?.rootName ?? "Root";
       setNotice(
         hide
           ? `Folder "${name}" hidden (${changed} files now, and new ones as they are indexed)`

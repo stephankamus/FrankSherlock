@@ -180,4 +180,21 @@ describe("RootCard", () => {
     await userEvent.click(screen.getByRole("menuitem", { name: "Refresh Metadata" }));
     expect(onRefresh).toHaveBeenCalled();
   });
+  it("hides and unhides the whole root from the context menu", async () => {
+    const onSetHidden = vi.fn();
+    const { rerender } = render(
+      <RootCard root={sampleRoot} isSelected={false} scan={undefined} readOnly={false} onSelect={vi.fn()} onDelete={vi.fn()} onRescan={vi.fn()} onRefresh={vi.fn()} onCopyPath={vi.fn()} onSetHidden={onSetHidden} />
+    );
+    await userEvent.pointer({ keys: "[MouseRight]", target: screen.getByText("photos") });
+    await userEvent.click(screen.getByRole("menuitem", { name: "Hide folder" }));
+    expect(onSetHidden).toHaveBeenCalledWith(true);
+
+    rerender(
+      <RootCard root={{ ...sampleRoot, hidden: true }} isSelected={false} scan={undefined} readOnly={false} onSelect={vi.fn()} onDelete={vi.fn()} onRescan={vi.fn()} onRefresh={vi.fn()} onCopyPath={vi.fn()} onSetHidden={onSetHidden} />
+    );
+    expect(screen.getByLabelText("Hidden folder")).toBeInTheDocument();
+    await userEvent.pointer({ keys: "[MouseRight]", target: screen.getByText("photos") });
+    await userEvent.click(screen.getByRole("menuitem", { name: "Unhide folder" }));
+    expect(onSetHidden).toHaveBeenLastCalledWith(false);
+  });
 });

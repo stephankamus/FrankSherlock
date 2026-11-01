@@ -24,6 +24,8 @@ type RootCardProps<TRoot extends RootInfo = RootInfo> = {
   onToggleFaceDetection?: () => void;
   /** Clear the classification of this folder so it can be sent to the model again. */
   onReclassify?: () => void;
+  /** Hide or show the whole root (and every file indexed later). */
+  onSetHidden?: (hidden: boolean) => void;
   /**
    * Convert the HEIC/NEF files of this folder into JPEG copies.
    *
@@ -36,7 +38,7 @@ type RootCardProps<TRoot extends RootInfo = RootInfo> = {
   onCancelFaceDetect?: () => void;
 };
 
-export default function RootCard<TRoot extends RootInfo = RootInfo>({ root, isSelected, scan, readOnly, faceProgress, backlogProgress, onSelect, onDelete, onRescan, onRefresh, onCopyPath, onRelink, onDetectFaces, faceDetection, onToggleFaceDetection, onReclassify, onConvertRaw, onCancelScan, onResumeScan, onCancelFaceDetect }: RootCardProps<TRoot>) {
+export default function RootCard<TRoot extends RootInfo = RootInfo>({ root, isSelected, scan, readOnly, faceProgress, backlogProgress, onSelect, onDelete, onRescan, onRefresh, onCopyPath, onRelink, onDetectFaces, faceDetection, onToggleFaceDetection, onReclassify, onSetHidden, onConvertRaw, onCancelScan, onResumeScan, onCancelFaceDetect }: RootCardProps<TRoot>) {
   const [showMenu, setShowMenu] = useState(false);
   const [menuPos, setMenuPos] = useState({ x: 0, y: 0 });
   const menuRef = useRef<HTMLDivElement>(null);
@@ -92,7 +94,7 @@ export default function RootCard<TRoot extends RootInfo = RootInfo>({ root, isSe
 
   return (
     <div
-      className={`root-card${isSelected ? " selected" : ""}`}
+      className={`root-card${isSelected ? " selected" : ""}${root.hidden ? " root-card-is-hidden" : ""}`}
       onClick={onSelect}
       onContextMenu={handleContextMenu}
       title={root.rootPath ?? root.path}
@@ -116,6 +118,9 @@ export default function RootCard<TRoot extends RootInfo = RootInfo>({ root, isSe
         <span className="root-card-name" title={root.rootPath ?? root.path}>
           {root.rootName ?? root.name}
         </span>
+        {root.hidden && (
+          <span className="root-card-hidden" role="img" aria-label="Hidden folder" title="Hidden">{"\u{1F6AB}"}</span>
+        )}
         {!readOnly && (
           <button
             type="button"
@@ -293,6 +298,11 @@ export default function RootCard<TRoot extends RootInfo = RootInfo>({ root, isSe
           )}
           {onDetectFaces && (
             <button role="menuitem" onClick={(e) => { e.stopPropagation(); onDetectFaces(); setShowMenu(false); }}>Detect Faces</button>
+          )}
+          {onSetHidden && (
+            <button role="menuitem" onClick={(e) => { e.stopPropagation(); onSetHidden(!root.hidden); setShowMenu(false); }}>
+              {root.hidden ? "Unhide folder" : "Hide folder"}
+            </button>
           )}
           {onReclassify && (
             <button role="menuitem" onClick={(e) => { e.stopPropagation(); onReclassify(); setShowMenu(false); }}>Reclassify</button>

@@ -2839,7 +2839,8 @@ pub fn list_roots(db_path: &Path) -> AppResult<Vec<RootInfo>> {
         "SELECT r.id, r.root_path, r.root_name, r.created_at, r.last_scan_at,
                 (SELECT COUNT(*) FROM files f
                   WHERE f.root_id = r.id AND f.deleted_at IS NULL AND f.hidden_at IS NULL),
-                r.availability, r.last_seen_at, r.last_error
+                r.availability, r.last_seen_at, r.last_error,
+                EXISTS(SELECT 1 FROM hidden_folders h WHERE h.root_id = r.id AND h.rel_path = '')
          FROM roots r ORDER BY r.sort_order, r.id",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -2853,6 +2854,7 @@ pub fn list_roots(db_path: &Path) -> AppResult<Vec<RootInfo>> {
             availability: row.get(6)?,
             last_seen_at: row.get(7)?,
             last_error: row.get(8)?,
+            hidden: row.get(9)?,
         })
     })?;
     let mut out = Vec::new();
@@ -4446,12 +4448,14 @@ fn load_hidden_rules(conn: &Connection, root_id: i64) -> AppResult<Vec<String>> 
 }
 
 /// A rule covers the folder itself and everything below it, never a sibling that merely
-/// shares the name prefix (`a/b` does not cover `a/bc/x.jpg`).
+/// shares the name prefix (`a/b` does not cover `a/bc/x.jpg`). The empty rule is the root
+/// folder and covers every file of the root.
 fn path_is_hidden_by(rules: &[String], rel_path: &str) -> bool {
     rules.iter().any(|rule| {
-        rel_path
-            .strip_prefix(rule.as_str())
-            .is_some_and(|rest| rest.starts_with('/'))
+        rule.is_empty()
+            || rel_path
+                .strip_prefix(rule.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
     })
 }
 
@@ -4498,12 +4502,8 @@ pub fn set_folder_hidden(
     hidden: bool,
 ) -> AppResult<u64> {
     let normalized = crate::paths::normalize_rel_path(rel_path);
+    // An empty path is the root itself.
     let folder = normalized.trim_matches('/');
-    if folder.is_empty() {
-        return Err(AppError::InvalidPath(
-            "the root folder cannot be hidden as a folder".to_string(),
-        ));
-    }
     let conn = open_conn(db_path)?;
     let tx = conn.unchecked_transaction()?;
     let now = now_epoch_secs();
@@ -4516,7 +4516,7 @@ pub fn set_folder_hidden(
         changed = tx.execute(
             "UPDATE files SET hidden_at = ?3, hidden_via_folder = 1
               WHERE root_id = ?1 AND hidden_at IS NULL
-                AND substr(rel_path, 1, ?4) = ?2 || '/'",
+                AND (?2 = '' OR substr(rel_path, 1, ?4) = ?2 || '/')",
             params![root_id, folder, now, folder.chars().count() as i64 + 1],
         )? as u64;
     } else {
@@ -4529,7 +4529,7 @@ pub fn set_folder_hidden(
             let mut stmt = tx.prepare(
                 "SELECT id, rel_path FROM files
                   WHERE root_id = ?1 AND hidden_via_folder = 1
-                    AND substr(rel_path, 1, ?3) = ?2 || '/'",
+                    AND (?2 = '' OR substr(rel_path, 1, ?3) = ?2 || '/')",
             )?;
             let rows = stmt
                 .query_map(params![root_id, folder, folder.chars().count() as i64 + 1], |r| {
@@ -7428,6 +7428,28 @@ mod tests {
     }
 
     #[test]
+    fn hiding_the_root_covers_every_file_now_and_later() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/demo").expect("root");
+        let manual =
+            upsert_file_record(&db_path, &sample_record(root_id, "top.jpg", "fp-t")).expect("t");
+        upsert_file_record(&db_path, &sample_record(root_id, "Trip/a.jpg", "fp-a")).expect("a");
+        set_files_hidden(&db_path, &[manual], true).expect("manual hide");
+
+        assert_eq!(set_folder_hidden(&db_path, root_id, "", true).expect("hide"), 1);
+        upsert_file_record(&db_path, &sample_record(root_id, "later.jpg", "fp-l")).expect("later");
+        assert_eq!(hidden_count(&db_path, &[root_id]).expect("count"), 3);
+        let roots = list_roots(&db_path).expect("roots");
+        assert!(roots[0].hidden);
+        assert_eq!(roots[0].file_count, 0);
+
+        assert_eq!(set_folder_hidden(&db_path, root_id, "", false).expect("show"), 2);
+        assert_eq!(hidden_count(&db_path, &[root_id]).expect("count"), 1, "manual hide stays");
+        assert!(!list_roots(&db_path).expect("roots")[0].hidden);
+    }
+
+    #[test]
     fn showing_a_folder_keeps_files_hidden_by_hand() {
         let (_dir, db_path) = test_db_path();
         init_database(&db_path).expect("init");
@@ -7445,7 +7467,6 @@ mod tests {
         assert_eq!(set_folder_hidden(&db_path, root_id, "Trip/sub", false).expect("show"), 1);
         assert_eq!(hidden_count(&db_path, &[root_id]).expect("count"), 1, "a.jpg stays hidden");
         assert!(list_hidden_folders(&db_path, root_id).expect("rules").is_empty());
-        assert!(set_folder_hidden(&db_path, root_id, "", true).is_err());
     }
 
     /// The backlog row is a positional projection: the `SELECT` list and the

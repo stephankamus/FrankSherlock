@@ -183,6 +183,11 @@ export default function Sidebar<TRoot extends RootInfo = RootInfo>({
                   onToggleFaceDetection={
                     !readOnly && onToggleFaceDetection ? onToggleFaceDetection : undefined
                   }
+                  onSetHidden={
+                    !readOnly && onSetFolderHidden
+                      ? (hidden) => void onSetFolderHidden(root.id, "", hidden)
+                      : undefined
+                  }
                   onReclassify={
                     !readOnly && onReclassifyRoot ? () => onReclassifyRoot(root) : undefined
                   }
@@ -195,6 +200,7 @@ export default function Sidebar<TRoot extends RootInfo = RootInfo>({
                 />
                 {selectedRootId === root.id && (
                   <DirectoryTree
+                    key={root.hidden ? "hidden" : "visible"}
                     rootId={root.id}
                     selectedSubdir={selectedSubdir}
                     onSelectSubdir={onSelectSubdir}

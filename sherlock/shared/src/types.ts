@@ -128,6 +128,8 @@ export type RootInfo = {
   rootName?: string;
   /** Desktop console spelling of `path`. */
   rootPath?: string;
+  /** The whole root is hidden by a folder rule (desktop only). */
+  hidden?: boolean;
   /** Desktop only: index creation time. */
   createdAt?: number;
   /** Desktop only: last completed scan, for the console line. */
