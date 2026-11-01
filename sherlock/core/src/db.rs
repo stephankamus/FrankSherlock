@@ -467,6 +467,21 @@ fn run_migrations(conn: &mut Connection) -> AppResult<()> {
         // The person and its faces stay in place so new faces of the same unknown person
         // can still join it; only the listings filter on this column.
         M::up("ALTER TABLE people ADD COLUMN ignored_at INTEGER;"),
+        // Migration 24: hidden folders. A rule hides every file under a folder, now and in
+        // the future; `hidden_via_folder` marks the rows a rule hid, so un-hiding the folder
+        // leaves alone the files the user had hidden one by one.
+        M::up(
+            r#"
+            CREATE TABLE IF NOT EXISTS hidden_folders (
+                root_id INTEGER NOT NULL,
+                rel_path TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (root_id, rel_path),
+                FOREIGN KEY (root_id) REFERENCES roots(id) ON DELETE CASCADE
+            );
+            ALTER TABLE files ADD COLUMN hidden_via_folder INTEGER NOT NULL DEFAULT 0;
+            "#,
+        ),
     ]);
 
     migrations
@@ -2223,6 +2238,7 @@ pub fn merge_moved_row(
             now_epoch_secs()
         ],
     )?;
+    reconcile_folder_hiding(&tx, kept_id)?;
     refresh_fts(&tx, kept_id)?;
     tx.commit()?;
     Ok(())
@@ -2500,8 +2516,11 @@ pub fn insert_pending_rows(db_path: &Path, records: &[FileRecordUpsert]) -> AppR
             ON CONFLICT(root_id, rel_path) DO NOTHING
             "#,
         )?;
+        let mut rules: std::collections::HashMap<i64, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut to_hide: Vec<(i64, &str)> = Vec::new();
         for record in records {
-            inserted += stmt.execute(params![
+            let added = stmt.execute(params![
                 record.root_id,
                 record.rel_path,
                 record.filename,
@@ -2512,7 +2531,25 @@ pub fn insert_pending_rows(db_path: &Path, records: &[FileRecordUpsert]) -> AppR
                 record.fingerprint,
                 record.scan_marker,
                 now,
-            ])? as u64;
+            ])?;
+            inserted += added as u64;
+            // Only rows that did not exist yet: a file the user brought back by hand
+            // must not be hidden again by the next scan.
+            if added == 1 {
+                if !rules.contains_key(&record.root_id) {
+                    rules.insert(record.root_id, load_hidden_rules(&tx, record.root_id)?);
+                }
+                if path_is_hidden_by(&rules[&record.root_id], &record.rel_path) {
+                    to_hide.push((record.root_id, record.rel_path.as_str()));
+                }
+            }
+        }
+        for (root_id, rel_path) in to_hide {
+            tx.execute(
+                "UPDATE files SET hidden_at = ?3, hidden_via_folder = 1
+                  WHERE root_id = ?1 AND rel_path = ?2 AND hidden_at IS NULL",
+                params![root_id, rel_path, now],
+            )?;
         }
     }
     tx.commit()?;
@@ -2523,6 +2560,11 @@ pub fn upsert_file_record(db_path: &Path, record: &FileRecordUpsert) -> AppResul
     let conn = open_conn(db_path)?;
     let tx = conn.unchecked_transaction()?;
     let now = now_epoch_secs();
+    let existed: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM files WHERE root_id = ?1 AND rel_path = ?2)",
+        params![record.root_id, record.rel_path],
+        |r| r.get(0),
+    )?;
     tx.execute(
         r#"
         INSERT INTO files (
@@ -2598,6 +2640,9 @@ pub fn upsert_file_record(db_path: &Path, record: &FileRecordUpsert) -> AppResul
         params![record.root_id, record.rel_path],
         |r| r.get(0),
     )?;
+    if !existed {
+        reconcile_folder_hiding(&tx, file_id)?;
+    }
     refresh_fts(&tx, file_id)?;
     tx.commit()?;
     Ok(file_id)
@@ -2640,6 +2685,7 @@ pub fn move_file_by_id(
             now_epoch_secs()
         ],
     )?;
+    reconcile_folder_hiding(&tx, file_id)?;
     refresh_fts(&tx, file_id)?;
     tx.commit()?;
     Ok(())
@@ -3461,6 +3507,7 @@ pub fn rename_file_record(
         "UPDATE files SET rel_path = ?2, abs_path = ?3, filename = ?4, updated_at = ?5 WHERE id = ?1",
         params![file_id, new_rel_path, new_abs_path, new_filename, now],
     )?;
+    reconcile_folder_hiding(&tx, file_id)?;
     refresh_fts(&tx, file_id)?;
     tx.commit()?;
     Ok(())
@@ -4388,6 +4435,124 @@ pub fn now_epoch_secs_pub() -> i64 {
 
 // ── Visibility (hidden photos) ──────────────────────────────────────
 
+// ── Hidden folders ──────────────────────────────────────────────────
+
+fn load_hidden_rules(conn: &Connection, root_id: i64) -> AppResult<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT rel_path FROM hidden_folders WHERE root_id = ?1")?;
+    let rules = stmt
+        .query_map(params![root_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+    Ok(rules)
+}
+
+/// A rule covers the folder itself and everything below it, never a sibling that merely
+/// shares the name prefix (`a/b` does not cover `a/bc/x.jpg`).
+fn path_is_hidden_by(rules: &[String], rel_path: &str) -> bool {
+    rules.iter().any(|rule| {
+        rel_path
+            .strip_prefix(rule.as_str())
+            .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
+/// Make a row agree with the folder rules after it appeared or moved: hide it when it now
+/// sits under a hidden folder, and bring it back when a rule hid it and it left. A row the
+/// user hid by hand is never touched.
+fn reconcile_folder_hiding(conn: &Connection, file_id: i64) -> AppResult<()> {
+    let (root_id, rel_path, hidden, via_folder): (i64, String, bool, bool) = conn.query_row(
+        "SELECT root_id, rel_path, hidden_at IS NOT NULL, hidden_via_folder != 0
+           FROM files WHERE id = ?1",
+        params![file_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    let covered = path_is_hidden_by(&load_hidden_rules(conn, root_id)?, &rel_path);
+    if covered && !hidden {
+        conn.execute(
+            "UPDATE files SET hidden_at = ?2, hidden_via_folder = 1 WHERE id = ?1",
+            params![file_id, now_epoch_secs()],
+        )?;
+    } else if !covered && hidden && via_folder {
+        conn.execute(
+            "UPDATE files SET hidden_at = NULL, hidden_via_folder = 0 WHERE id = ?1",
+            params![file_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Folders hidden under a root, for the desktop tree.
+pub fn list_hidden_folders(db_path: &Path, root_id: i64) -> AppResult<Vec<String>> {
+    let conn = open_conn(db_path)?;
+    load_hidden_rules(&conn, root_id)
+}
+
+/// Hide (or show again) a folder and everything below it. Returns how many files changed.
+///
+/// Hiding stores a rule, so files that appear in the folder later are hidden as they are
+/// indexed, and hides the rows already there. Showing removes the rule and only brings
+/// back the rows that rule hid and no other rule still covers.
+pub fn set_folder_hidden(
+    db_path: &Path,
+    root_id: i64,
+    rel_path: &str,
+    hidden: bool,
+) -> AppResult<u64> {
+    let normalized = crate::paths::normalize_rel_path(rel_path);
+    let folder = normalized.trim_matches('/');
+    if folder.is_empty() {
+        return Err(AppError::InvalidPath(
+            "the root folder cannot be hidden as a folder".to_string(),
+        ));
+    }
+    let conn = open_conn(db_path)?;
+    let tx = conn.unchecked_transaction()?;
+    let now = now_epoch_secs();
+    let changed;
+    if hidden {
+        tx.execute(
+            "INSERT OR IGNORE INTO hidden_folders (root_id, rel_path, created_at) VALUES (?1, ?2, ?3)",
+            params![root_id, folder, now],
+        )?;
+        changed = tx.execute(
+            "UPDATE files SET hidden_at = ?3, hidden_via_folder = 1
+              WHERE root_id = ?1 AND hidden_at IS NULL
+                AND substr(rel_path, 1, ?4) = ?2 || '/'",
+            params![root_id, folder, now, folder.chars().count() as i64 + 1],
+        )? as u64;
+    } else {
+        tx.execute(
+            "DELETE FROM hidden_folders WHERE root_id = ?1 AND rel_path = ?2",
+            params![root_id, folder],
+        )?;
+        let rules = load_hidden_rules(&tx, root_id)?;
+        let candidates: Vec<(i64, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, rel_path FROM files
+                  WHERE root_id = ?1 AND hidden_via_folder = 1
+                    AND substr(rel_path, 1, ?3) = ?2 || '/'",
+            )?;
+            let rows = stmt
+                .query_map(params![root_id, folder, folder.chars().count() as i64 + 1], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        let mut count = 0u64;
+        for (id, path) in candidates {
+            if !path_is_hidden_by(&rules, &path) {
+                count += tx.execute(
+                    "UPDATE files SET hidden_at = NULL, hidden_via_folder = 0 WHERE id = ?1",
+                    params![id],
+                )? as u64;
+            }
+        }
+        changed = count;
+    }
+    tx.commit()?;
+    Ok(changed)
+}
+
 /// Hide or unhide a batch of rows, returning how many actually changed.
 ///
 /// One transaction for the whole batch: hiding a 40-tile selection and reporting a
@@ -4413,7 +4578,8 @@ pub fn set_files_hidden(db_path: &Path, file_ids: &[i64], hidden: bool) -> AppRe
     } else {
         {
             let mut stmt = tx.prepare(
-                "UPDATE files SET hidden_at = NULL WHERE id = ?1 AND hidden_at IS NOT NULL",
+                "UPDATE files SET hidden_at = NULL, hidden_via_folder = 0
+                  WHERE id = ?1 AND hidden_at IS NOT NULL",
             )?;
             for id in file_ids {
                 changed += stmt.execute(params![id])? as u64;
@@ -6204,6 +6370,17 @@ pub fn list_subdirectories(
     root_id: i64,
     parent_prefix: &str,
 ) -> AppResult<Vec<SubdirEntry>> {
+    list_subdirectories_filtered(db_path, root_id, parent_prefix, false)
+}
+
+/// Like [`list_subdirectories`]; with `include_hidden` the hidden files count and hidden
+/// folders are listed (flagged), which only the desktop's "show hidden" mode asks for.
+pub fn list_subdirectories_filtered(
+    db_path: &Path,
+    root_id: i64,
+    parent_prefix: &str,
+    include_hidden: bool,
+) -> AppResult<Vec<SubdirEntry>> {
     let conn = open_conn(db_path)?;
     let normalized = crate::paths::normalize_rel_path(parent_prefix);
     let prefix = normalized.trim_end_matches('/');
@@ -6221,10 +6398,12 @@ pub fn list_subdirectories(
     // We extract the next path segment after the prefix to group by directory.
     let mut stmt = conn.prepare(
         "SELECT rel_path FROM files
-         WHERE root_id = ? AND deleted_at IS NULL AND hidden_at IS NULL AND rel_path LIKE ?",
+         WHERE root_id = ?1 AND deleted_at IS NULL AND (?3 OR hidden_at IS NULL)
+           AND rel_path LIKE ?2",
     )?;
+    let rules = load_hidden_rules(&conn, root_id)?;
 
-    let rows = stmt.query_map(params![root_id, like_pattern], |row| {
+    let rows = stmt.query_map(params![root_id, like_pattern, include_hidden], |row| {
         row.get::<_, String>(0)
     })?;
 
@@ -6259,10 +6438,13 @@ pub fn list_subdirectories(
             } else {
                 format!("{prefix}/{name}")
             };
+            let hidden = path_is_hidden_by(&rules, &format!("{rel_path}/"))
+                || rules.contains(&rel_path);
             SubdirEntry {
                 rel_path,
                 name,
                 file_count: count,
+                hidden,
             }
         })
         .collect();
@@ -7212,6 +7394,58 @@ mod tests {
             .find(|entry| entry.rel_path == "Trip")
             .expect("Trip entry");
         assert_eq!(trip.file_count, 1);
+    }
+
+    #[test]
+    fn hiding_a_folder_hides_existing_and_future_files_but_not_siblings() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/demo").expect("root");
+        upsert_file_record(&db_path, &sample_record(root_id, "Trip/a.jpg", "fp-a")).expect("a");
+        upsert_file_record(&db_path, &sample_record(root_id, "Trip/sub/b.jpg", "fp-b")).expect("b");
+        upsert_file_record(&db_path, &sample_record(root_id, "Trip2/c.jpg", "fp-c")).expect("c");
+        upsert_file_record(&db_path, &sample_record(root_id, "Tr_p/d.jpg", "fp-d")).expect("d");
+
+        assert_eq!(set_folder_hidden(&db_path, root_id, "Trip", true).expect("hide"), 2);
+        assert_eq!(hidden_count(&db_path, &[root_id]).expect("count"), 2);
+
+        // A file that shows up later, through either insertion path, is hidden at once.
+        upsert_file_record(&db_path, &sample_record(root_id, "Trip/new.jpg", "fp-n")).expect("new");
+        let pending = sample_record(root_id, "Trip/sub/pending.jpg", "fp-p");
+        insert_pending_rows(&db_path, &[pending]).expect("pending");
+        assert_eq!(hidden_count(&db_path, &[root_id]).expect("count"), 4);
+
+        let visible = list_subdirectories(&db_path, root_id, "").expect("subdirs");
+        let names: Vec<&str> = visible.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["Tr_p", "Trip2"]);
+
+        let all = list_subdirectories_filtered(&db_path, root_id, "", true).expect("all");
+        let trip = all.iter().find(|e| e.name == "Trip").expect("Trip listed");
+        assert!(trip.hidden);
+        assert!(!all.iter().find(|e| e.name == "Trip2").expect("Trip2").hidden);
+        let sub = list_subdirectories_filtered(&db_path, root_id, "Trip", true).expect("nested");
+        assert!(sub.iter().all(|e| e.hidden));
+    }
+
+    #[test]
+    fn showing_a_folder_keeps_files_hidden_by_hand() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/demo").expect("root");
+        let a = upsert_file_record(&db_path, &sample_record(root_id, "Trip/a.jpg", "fp-a")).expect("a");
+        upsert_file_record(&db_path, &sample_record(root_id, "Trip/sub/b.jpg", "fp-b")).expect("b");
+        set_files_hidden(&db_path, &[a], true).expect("manual hide");
+
+        assert_eq!(set_folder_hidden(&db_path, root_id, "Trip", true).expect("hide"), 1);
+        set_folder_hidden(&db_path, root_id, "Trip/sub", true).expect("hide sub");
+
+        // The inner rule still covers b.jpg after the outer one goes away.
+        assert_eq!(set_folder_hidden(&db_path, root_id, "Trip", false).expect("show"), 0);
+        assert_eq!(hidden_count(&db_path, &[root_id]).expect("count"), 2);
+        assert_eq!(set_folder_hidden(&db_path, root_id, "Trip/sub", false).expect("show"), 1);
+        assert_eq!(hidden_count(&db_path, &[root_id]).expect("count"), 1, "a.jpg stays hidden");
+        assert!(list_hidden_folders(&db_path, root_id).expect("rules").is_empty());
+        assert!(set_folder_hidden(&db_path, root_id, "", true).is_err());
     }
 
     /// The backlog row is a positional projection: the `SELECT` list and the
@@ -8472,11 +8706,11 @@ mod tests {
         init_database(&db_path).expect("init");
 
         let conn = open_conn(&db_path).expect("open");
-        // Verify user_version is set (23 migrations applied → version 23)
+        // Verify user_version is set (24 migrations applied → version 24)
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 23);
+        assert_eq!(version, 24);
 
         // Migration 19 records where a converted HEIC/NEF copy came from.
         let conversion_columns: Vec<String> = {
@@ -8568,8 +8802,8 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        // We have 23 migrations (indices 0..22), so user_version should be 23
-        assert_eq!(version, 23);
+        // We have 24 migrations (indices 0..23), so user_version should be 24
+        assert_eq!(version, 24);
     }
 
     /// A database written by a *newer* build is refused, never adopted silently.

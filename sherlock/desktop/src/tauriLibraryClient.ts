@@ -62,8 +62,8 @@ export function createTauriLibraryClient(): LibraryClient {
       return (await listRoots()).map(toSharedRoot);
     },
 
-    listSubdirs(rootId, prefix) {
-      return listSubdirectories(rootId, prefix);
+    listSubdirs(rootId, prefix, includeHidden) {
+      return listSubdirectories(rootId, prefix, includeHidden);
     },
 
     listAlbums() {

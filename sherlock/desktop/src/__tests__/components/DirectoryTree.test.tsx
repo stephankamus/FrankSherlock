@@ -11,7 +11,7 @@ import {
 import type { ReactElement } from "react";
 
 // The tree asks the client, not `api.ts`: the web resolves the same call over HTTP.
-const mockListSubdirs = vi.fn(async (_rootId: number, _prefix: string) => [] as SubdirEntry[]);
+const mockListSubdirs = vi.fn(async (_rootId: number, _prefix: string, _includeHidden?: boolean) => [] as SubdirEntry[]);
 
 const client: LibraryClient = {
   capabilities: READ_ONLY_CAPABILITIES,
@@ -61,7 +61,7 @@ describe("DirectoryTree", () => {
       expect(screen.getByText("Photos")).toBeInTheDocument();
     });
 
-    expect(mockListSubdirs).toHaveBeenCalledWith(1, "");
+    expect(mockListSubdirs).toHaveBeenCalledWith(1, "", false);
   });
 
   it("renders nothing when no subdirectories", async () => {
@@ -125,7 +125,7 @@ describe("DirectoryTree", () => {
       expect(screen.getByText("2024")).toBeInTheDocument();
     });
 
-    expect(mockListSubdirs).toHaveBeenCalledWith(1, "Photos");
+    expect(mockListSubdirs).toHaveBeenCalledWith(1, "Photos", false);
   });
 
   it("collapses expanded node on second chevron click", async () => {
@@ -194,5 +194,44 @@ describe("DirectoryTree", () => {
     });
 
     expect(screen.queryByText("Photos")).not.toBeInTheDocument();
+  });
+  it("offers no context menu without the write action", async () => {
+    mockListSubdirs.mockResolvedValueOnce(topLevelDirs);
+    render(wrap(<DirectoryTree rootId={1} selectedSubdir={null} onSelectSubdir={vi.fn()} />));
+    await waitFor(() => expect(screen.getByText("Photos")).toBeInTheDocument());
+
+    await userEvent.pointer({ keys: "[MouseRight]", target: screen.getByText("Photos") });
+
+    expect(screen.queryByText("Hide folder")).not.toBeInTheDocument();
+  });
+
+  it("hides a folder from its context menu and reloads the tree", async () => {
+    const onSetFolderHidden = vi.fn(async () => {});
+    mockListSubdirs.mockResolvedValue(topLevelDirs);
+    render(wrap(
+      <DirectoryTree rootId={7} selectedSubdir={null} onSelectSubdir={vi.fn()} onSetFolderHidden={onSetFolderHidden} />,
+    ));
+    await waitFor(() => expect(screen.getByText("Photos")).toBeInTheDocument());
+
+    await userEvent.pointer({ keys: "[MouseRight]", target: screen.getByText("Photos") });
+    await userEvent.click(screen.getByText("Hide folder"));
+
+    expect(onSetFolderHidden).toHaveBeenCalledWith(7, "Photos", true);
+    await waitFor(() => expect(mockListSubdirs).toHaveBeenCalledTimes(2));
+  });
+
+  it("marks hidden folders and offers to unhide them", async () => {
+    const onSetFolderHidden = vi.fn(async () => {});
+    mockListSubdirs.mockResolvedValue([{ relPath: "Secret", name: "Secret", fileCount: 2, hidden: true }]);
+    render(wrap(
+      <DirectoryTree rootId={1} selectedSubdir={null} onSelectSubdir={vi.fn()} includeHidden onSetFolderHidden={onSetFolderHidden} />,
+    ));
+    await waitFor(() => expect(screen.getByLabelText("Hidden folder")).toBeInTheDocument());
+    expect(mockListSubdirs).toHaveBeenCalledWith(1, "", true);
+
+    await userEvent.pointer({ keys: "[MouseRight]", target: screen.getByText("Secret") });
+    await userEvent.click(screen.getByText("Unhide folder"));
+
+    expect(onSetFolderHidden).toHaveBeenCalledWith(1, "Secret", false);
   });
 });

@@ -525,3 +525,13 @@
   opacity: 0.55;
   cursor: default;
 }
+
+/* ── Hidden folders (desktop "show hidden") ────────────── */
+.dir-tree-hidden {
+  opacity: 0.55;
+}
+
+.dir-tree-hidden-icon {
+  margin-right: 4px;
+  font-size: 0.85em;
+}

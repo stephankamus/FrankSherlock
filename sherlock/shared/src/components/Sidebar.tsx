@@ -22,6 +22,10 @@ type SidebarProps<TRoot extends RootInfo = RootInfo> = {
   selectedSubdir: string | null;
   faceProgress: FaceDetectProgress | null;
   onSelectSubdir: (subdir: string | null) => void;
+  /** List hidden folders in the tree (desktop "show hidden"). */
+  includeHiddenFolders?: boolean;
+  /** Hide or show a folder and everything below it; omitted where the app is read-only. */
+  onSetFolderHidden?: (rootId: number, relPath: string, hidden: boolean) => Promise<void> | void;
   onSelectRoot: (rootId: number | null) => void;
   onDeleteRoot: (root: TRoot) => void;
   onPickAndScan: () => void;
@@ -82,7 +86,7 @@ type SidebarProps<TRoot extends RootInfo = RootInfo> = {
 export default function Sidebar<TRoot extends RootInfo = RootInfo>({
   roots, selectedRootId, activeScans, dbStats, readOnly,
   setupReady, albums, smartFolders, activeAlbumName, activeSmartFolderId,
-  selectedSubdir, faceProgress, onSelectSubdir,
+  selectedSubdir, faceProgress, onSelectSubdir, includeHiddenFolders, onSetFolderHidden,
   onSelectRoot, onDeleteRoot, onRescanRoot, onRefreshRoot, onCopyRootPath, onPickAndScan,
   onRelinkRoot, onReclassifyRoot, onConvertRawRoot, onCompactDatabase, compacting,
   thumbRepair, onRepairThumbnails, onCancelThumbRepair, onProcessBacklog,
@@ -194,6 +198,8 @@ export default function Sidebar<TRoot extends RootInfo = RootInfo>({
                     rootId={root.id}
                     selectedSubdir={selectedSubdir}
                     onSelectSubdir={onSelectSubdir}
+                    includeHidden={includeHiddenFolders}
+                    onSetFolderHidden={readOnly ? undefined : onSetFolderHidden}
                   />
                 )}
               </div>

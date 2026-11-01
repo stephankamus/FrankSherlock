@@ -560,6 +560,8 @@ pub struct SubdirEntry {
     pub rel_path: String,
     pub name: String,
     pub file_count: u64,
+    /// Covered by a hidden-folder rule; only listed when hidden files are included.
+    pub hidden: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

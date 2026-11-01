@@ -63,7 +63,8 @@ export interface LibraryClient {
 
   search(request: SearchRequest): Promise<SearchResponse>;
   listRoots(): Promise<RootInfo[]>;
-  listSubdirs(rootId: number, prefix: string): Promise<SubdirEntry[]>;
+  /** `includeHidden` is honoured by the desktop only; the web never sees hidden folders. */
+  listSubdirs(rootId: number, prefix: string, includeHidden?: boolean): Promise<SubdirEntry[]>;
   listAlbums(): Promise<Album[]>;
   listSmartFolders(): Promise<SmartFolder[]>;
   listPeople(): Promise<PersonInfo[]>;

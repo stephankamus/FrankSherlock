@@ -237,6 +237,8 @@ export type SubdirEntry = {
   relPath: string;
   name: string;
   fileCount: number;
+  /** Covered by a hidden-folder rule; only present when hidden entries were requested. */
+  hidden?: boolean;
 };
 
 export type Album = {

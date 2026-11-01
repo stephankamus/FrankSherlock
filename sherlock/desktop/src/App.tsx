@@ -13,7 +13,7 @@ import {
   getCliFolderPath, getFailedClassifications, getFileMetadata, getFileProperties,
   getHiddenFileCount, getVisionSettings, listRoots,
   pendingScanSummary, relinkRoot, removeRoot, renameFile, reorderRoots,
-  resetRootClassifications, setFilesHidden, startScan, updateFileMetadata, updateSettings,
+  resetRootClassifications, setFilesHidden, setFolderHidden, startScan, updateFileMetadata, updateSettings,
   updateFileDescription, appendFilesDescription,
 } from "./api";
 import type {
@@ -845,6 +845,22 @@ export default function App() {
    * rows this action actually hid: unhiding something that was already hidden when
    * the user clicked would be a different edit than the one being undone.
    */
+  async function handleSetFolderHidden(rootId: number, relPath: string, hide: boolean) {
+    try {
+      const changed = await setFolderHidden(rootId, relPath, hide);
+      await runSearch(0, false, undefined, true);
+      await refreshHiddenCount();
+      const name = relPath.split("/").pop() ?? relPath;
+      setNotice(
+        hide
+          ? `Folder "${name}" hidden (${changed} files now, and new ones as they are indexed)`
+          : `Folder "${name}" visible again (${changed} files)`,
+      );
+    } catch (err) {
+      setError(errorMessage(err));
+    }
+  }
+
   async function applyHidden(targets: SearchItem[], hide: boolean) {
     if (targets.length === 0) return;
     const ids = targets.map((item) => item.id);
@@ -1259,6 +1275,8 @@ export default function App() {
           activeAlbumName={activeAlbumName}
           activeSmartFolderId={smartFolderManager.activeSmartFolderId}
           selectedSubdir={selectedSubdir}
+          includeHiddenFolders={showHidden}
+          onSetFolderHidden={handleSetFolderHidden}
           onSelectSubdir={(subdir) => {
             setQuery((q) => {
               const cleaned = q.replace(/\bsubdir:(?:"[^"]*?"|\S+)\s*/i, "").trim();

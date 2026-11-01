@@ -1373,9 +1373,28 @@ async fn compact_database(state: State<'_, AppState>) -> Result<CompactResult, S
 fn list_subdirectories(
     root_id: i64,
     parent_prefix: String,
+    include_hidden: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<Vec<SubdirEntry>, String> {
-    db::list_subdirectories(&state.paths.db_file, root_id, &parent_prefix)
+    db::list_subdirectories_filtered(
+        &state.paths.db_file,
+        root_id,
+        &parent_prefix,
+        include_hidden.unwrap_or(false),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Hide or show a whole folder (and its subfolders), including files indexed later.
+#[tauri::command]
+fn set_folder_hidden(
+    root_id: i64,
+    rel_path: String,
+    hidden: bool,
+    state: State<'_, AppState>,
+) -> Result<u64, String> {
+    require_writable(state.inner())?;
+    db::set_folder_hidden(&state.paths.db_file, root_id, &rel_path, hidden)
         .map_err(|e| e.to_string())
 }
 
@@ -3584,6 +3603,7 @@ pub fn run() {
             retry_failed,
             failed_classifications,
             list_subdirectories,
+            set_folder_hidden,
             set_files_hidden,
             hidden_file_count,
             publish_library,

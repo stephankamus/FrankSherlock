@@ -332,8 +332,17 @@ export async function getBacklogStatus(): Promise<BacklogProgress | null> {
   return invoke<BacklogProgress | null>("backlog_status");
 }
 
-export async function listSubdirectories(rootId: number, parentPrefix: string): Promise<SubdirEntry[]> {
-  return invoke<SubdirEntry[]>("list_subdirectories", { rootId, parentPrefix });
+export async function listSubdirectories(
+  rootId: number,
+  parentPrefix: string,
+  includeHidden = false,
+): Promise<SubdirEntry[]> {
+  return invoke<SubdirEntry[]>("list_subdirectories", { rootId, parentPrefix, includeHidden });
+}
+
+/** Hide or show a folder and everything below it, files indexed later included. */
+export async function setFolderHidden(rootId: number, relPath: string, hidden: boolean): Promise<number> {
+  return invoke<number>("set_folder_hidden", { rootId, relPath, hidden });
 }
 
 export async function loadUserConfig(): Promise<Record<string, unknown>> {
