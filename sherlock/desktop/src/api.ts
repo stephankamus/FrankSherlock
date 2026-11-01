@@ -579,6 +579,23 @@ export async function listPersons(rootScope: number[] = []): Promise<PersonInfo[
   return invoke<PersonInfo[]>("list_persons", { rootScope });
 }
 
+export async function listIgnoredPersons(rootScope: number[] = []): Promise<PersonInfo[]> {
+  return invoke<PersonInfo[]>("list_ignored_persons", { rootScope });
+}
+
+export async function setPersonsIgnored(personIds: number[], ignored: boolean): Promise<number> {
+  return invoke<number>("set_persons_ignored", { personIds, ignored });
+}
+
+export async function mergePersons(sourceId: number, targetId: number): Promise<void> {
+  return invoke<void>("merge_persons", { sourceId, targetId });
+}
+
+/** Hide every photo a person appears in; resolves with how many photos changed. */
+export async function hidePersonFiles(personId: number): Promise<number> {
+  return invoke<number>("hide_person_files", { personId });
+}
+
 export async function renamePerson(personId: number, newName: string): Promise<void> {
   return invoke<void>("rename_person", { personId, newName });
 }

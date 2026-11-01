@@ -33,7 +33,7 @@ import type { RootInfo as DesktopRootInfo } from "./types";
  * and the asset protocol turns them into `asset://` URLs, which is exactly the
  * behaviour the components had before the client existed.
  */
-function assetUrl(path: string | null | undefined): string | null {
+export function assetUrl(path: string | null | undefined): string | null {
   return path ? convertFileSrc(path) : null;
 }
 

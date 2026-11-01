@@ -9,13 +9,17 @@ import {
   clusterFaces,
   getReclusterStatus,
   getUnclusteredFaceCount,
+  hidePersonFiles,
+  listIgnoredPersons,
+  mergePersons,
   reassignFacesToPerson,
   reclusterFaces,
   renamePerson,
+  setPersonsIgnored,
   setRepresentativeFace,
   unassignFaceFromPerson,
 } from "../../api";
-import { tauriLibraryClient } from "../../tauriLibraryClient";
+import { assetUrl, tauriLibraryClient } from "../../tauriLibraryClient";
 
 /**
  * The desktop's faces screen: the shared gallery plus the write actions.
@@ -34,6 +38,15 @@ const desktopFacesActions: FacesActions = {
   unassignFace: unassignFaceFromPerson,
   reassignFaces: reassignFacesToPerson,
   setRepresentativeFace,
+  mergePersons,
+  async setPersonsIgnored(personIds, ignored) {
+    await setPersonsIgnored(personIds, ignored);
+  },
+  async listIgnoredPeople() {
+    const persons = await listIgnoredPersons([]);
+    return persons.map((person) => ({ ...person, cropUrl: assetUrl(person.cropPath) }));
+  },
+  hidePhotos: hidePersonFiles,
 };
 
 type Props = Omit<ComponentProps<typeof SharedFacesView>, "actions">;

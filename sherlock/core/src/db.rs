@@ -463,6 +463,10 @@ fn run_migrations(conn: &mut Connection) -> AppResult<()> {
             UPDATE face_detections SET clustered_at = created_at WHERE person_id IS NOT NULL;
             "#,
         ),
+        // Migration 23: people the user chose to ignore (unknown faces in group photos).
+        // The person and its faces stay in place so new faces of the same unknown person
+        // can still join it; only the listings filter on this column.
+        M::up("ALTER TABLE people ADD COLUMN ignored_at INTEGER;"),
     ]);
 
     migrations
@@ -5079,7 +5083,28 @@ pub fn list_persons(
     db_path: &Path,
     root_scope: &[i64],
 ) -> AppResult<Vec<crate::models::PersonInfo>> {
+    list_persons_filtered(db_path, root_scope, false)
+}
+
+/// People the user chose to ignore, for the "Ignored people" screen.
+pub fn list_ignored_persons(
+    db_path: &Path,
+    root_scope: &[i64],
+) -> AppResult<Vec<crate::models::PersonInfo>> {
+    list_persons_filtered(db_path, root_scope, true)
+}
+
+fn list_persons_filtered(
+    db_path: &Path,
+    root_scope: &[i64],
+    ignored: bool,
+) -> AppResult<Vec<crate::models::PersonInfo>> {
     let conn = open_conn(db_path)?;
+    let ignored_clause = if ignored {
+        "p.ignored_at IS NOT NULL"
+    } else {
+        "p.ignored_at IS NULL"
+    };
 
     // `files` is joined unconditionally now: the visibility filter has to apply even
     // when no root is selected, and a person whose every photo is hidden should not
@@ -5100,7 +5125,7 @@ pub fn list_persons(
          FROM people p
          JOIN face_detections fd ON fd.person_id = p.id
          JOIN files fil ON fil.id = fd.file_id
-         WHERE fil.deleted_at IS NULL AND fil.hidden_at IS NULL {scope_clause}
+         WHERE fil.deleted_at IS NULL AND fil.hidden_at IS NULL AND {ignored_clause} {scope_clause}
          GROUP BY p.id
          HAVING face_count > 0
          ORDER BY face_count DESC"
@@ -5161,6 +5186,55 @@ pub fn list_persons(
     }
 
     Ok(persons)
+}
+
+/// Mark people as ignored (or bring them back). Returns how many rows changed.
+pub fn set_persons_ignored(db_path: &Path, person_ids: &[i64], ignored: bool) -> AppResult<u64> {
+    if person_ids.is_empty() {
+        return Ok(0);
+    }
+    let conn = open_conn(db_path)?;
+    let tx = conn.unchecked_transaction()?;
+    let now = now_epoch_secs();
+    let mut changed = 0u64;
+    for id in person_ids {
+        changed += if ignored {
+            tx.execute(
+                "UPDATE people SET ignored_at = ?1 WHERE id = ?2 AND ignored_at IS NULL",
+                params![now, id],
+            )?
+        } else {
+            tx.execute(
+                "UPDATE people SET ignored_at = NULL WHERE id = ?1 AND ignored_at IS NOT NULL",
+                params![id],
+            )?
+        } as u64;
+    }
+    tx.commit()?;
+    Ok(changed)
+}
+
+/// Ids of the photos a person appears in, for hiding them all at once. Includes group
+/// photos, so the caller has to warn that other people in them disappear too.
+pub fn person_file_ids(db_path: &Path, person_id: i64) -> AppResult<Vec<i64>> {
+    let conn = open_conn(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT fd.file_id
+           FROM face_detections fd
+           JOIN files f ON f.id = fd.file_id
+          WHERE fd.person_id = ?1 AND f.deleted_at IS NULL
+          ORDER BY fd.file_id",
+    )?;
+    let ids = stmt
+        .query_map(params![person_id], |row| row.get(0))?
+        .collect::<Result<Vec<i64>, _>>()?;
+    Ok(ids)
+}
+
+/// Hide every photo a person appears in. Returns how many photos changed.
+pub fn hide_person_files(db_path: &Path, person_id: i64) -> AppResult<u64> {
+    let ids = person_file_ids(db_path, person_id)?;
+    set_files_hidden(db_path, &ids, true)
 }
 
 pub fn rename_person(db_path: &Path, person_id: i64, new_name: &str) -> AppResult<()> {
@@ -5276,7 +5350,25 @@ pub fn unassign_face_from_person(db_path: &Path, face_id: i64) -> AppResult<()> 
 }
 
 pub fn merge_persons(db_path: &Path, source_id: i64, target_id: i64) -> AppResult<()> {
+    if source_id == target_id {
+        return Err(AppError::Config("cannot merge a person into itself".to_string()));
+    }
     let conn = open_conn(db_path)?;
+    for id in [source_id, target_id] {
+        let exists: bool =
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM people WHERE id = ?1)", params![id], |r| r.get(0))?;
+        if !exists {
+            return Err(AppError::Config(format!("person {id} not found")));
+        }
+    }
+    // The target's name wins, unless it is still a generated one and the source was named.
+    let name_of = |id: i64| -> AppResult<String> {
+        Ok(conn.query_row("SELECT name FROM people WHERE id = ?1", params![id], |r| r.get(0))?)
+    };
+    let source_name = name_of(source_id)?;
+    if is_default_person_name(&name_of(target_id)?) && !is_default_person_name(&source_name) {
+        conn.execute("UPDATE people SET name = ?1 WHERE id = ?2", params![source_name, target_id])?;
+    }
     // Reassign all faces from source to target
     conn.execute(
         "UPDATE face_detections SET person_id = ?1 WHERE person_id = ?2",
@@ -5454,6 +5546,17 @@ pub fn cluster_faces(db_path: &Path, threshold: f32) -> AppResult<crate::models:
         result
     };
 
+    // Ignored people take part in grouping, so new faces of the same unknown person join
+    // them, but they never merge with a visible person and are never pruned.
+    let ignored_people: std::collections::HashSet<i64> = {
+        let mut stmt = conn.prepare("SELECT id FROM people WHERE ignored_at IS NOT NULL")?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        ids
+    };
+
     // Build an index: face_id → position in all_faces
     let face_idx: std::collections::HashMap<i64, usize> = all_faces
         .iter()
@@ -5626,6 +5729,11 @@ pub fn cluster_faces(db_path: &Path, threshold: f32) -> AppResult<crate::models:
 
         for i in 0..person_embs.len() {
             for j in (i + 1)..person_embs.len() {
+                if ignored_people.contains(&person_embs[i].person_id)
+                    != ignored_people.contains(&person_embs[j].person_id)
+                {
+                    continue;
+                }
                 if !person_embs[i]
                     .file_ids
                     .is_disjoint(&person_embs[j].file_ids)
@@ -5700,7 +5808,7 @@ pub fn cluster_faces(db_path: &Path, threshold: f32) -> AppResult<crate::models:
     {
         for pe in &person_embs {
             let n = pe.embeddings.len();
-            if n < 3 {
+            if n < 3 || ignored_people.contains(&pe.person_id) {
                 continue;
             }
             let mut to_prune = Vec::new();
@@ -5782,7 +5890,7 @@ pub fn recluster_faces(db_path: &Path, threshold: f32) -> AppResult<crate::model
     let conn = open_conn(db_path)?;
 
     let named: std::collections::HashMap<i64, String> = {
-        let mut stmt = conn.prepare("SELECT id, name FROM people")?;
+        let mut stmt = conn.prepare("SELECT id, name FROM people WHERE ignored_at IS NULL")?;
         let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
         rows.filter_map(|r| r.ok())
             .filter(|(_, name)| !is_default_person_name(name))
@@ -5797,8 +5905,14 @@ pub fn recluster_faces(db_path: &Path, threshold: f32) -> AppResult<crate::model
             .collect()
     };
 
-    conn.execute("UPDATE face_detections SET person_id = NULL, clustered_at = NULL", [])?;
-    conn.execute("DELETE FROM people", [])?;
+    // Ignored people keep their faces: the user already decided about them.
+    conn.execute(
+        "UPDATE face_detections SET person_id = NULL, clustered_at = NULL
+          WHERE person_id IS NULL
+             OR person_id NOT IN (SELECT id FROM people WHERE ignored_at IS NOT NULL)",
+        [],
+    )?;
+    conn.execute("DELETE FROM people WHERE ignored_at IS NULL", [])?;
     drop(conn);
 
     let result = cluster_faces(db_path, threshold)?;
@@ -8199,11 +8313,11 @@ mod tests {
         init_database(&db_path).expect("init");
 
         let conn = open_conn(&db_path).expect("open");
-        // Verify user_version is set (22 migrations applied → version 22)
+        // Verify user_version is set (23 migrations applied → version 23)
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 22);
+        assert_eq!(version, 23);
 
         // Migration 19 records where a converted HEIC/NEF copy came from.
         let conversion_columns: Vec<String> = {
@@ -8295,8 +8409,8 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        // We have 22 migrations (indices 0..21), so user_version should be 22
-        assert_eq!(version, 22);
+        // We have 23 migrations (indices 0..22), so user_version should be 23
+        assert_eq!(version, 23);
     }
 
     /// A database written by a *newer* build is refused, never adopted silently.
@@ -10261,6 +10375,105 @@ mod tests {
         let persons = list_persons(&db_path, &[]).expect("list after merge");
         assert_eq!(persons.len(), 1);
         assert_eq!(persons[0].face_count, 2);
+    }
+
+    /// Three photos with one orthogonal face each: three separate people.
+    fn three_people(db_path: &std::path::Path) -> (Vec<i64>, Vec<i64>) {
+        init_database(db_path).expect("init");
+        let root_id = upsert_root(db_path, "/tmp/people").expect("root");
+        let mut file_ids = Vec::new();
+        for (n, axis) in ["a.jpg", "b.jpg", "c.jpg"].iter().zip(0..3) {
+            upsert_file_record(db_path, &sample_record(root_id, n, &format!("fp-{n}"))).expect("file");
+            let fid = file_id_by_path(db_path, root_id, n);
+            let emb: Vec<f32> = (0..512).map(|i| if i == axis { 1.0 } else { 0.0 }).collect();
+            insert_test_face(db_path, fid, &emb);
+            file_ids.push(fid);
+        }
+        cluster_faces(db_path, 0.45).expect("cluster");
+        let people = list_persons(db_path, &[]).expect("list");
+        assert_eq!(people.len(), 3);
+        (people.iter().map(|p| p.id).collect(), file_ids)
+    }
+
+    #[test]
+    fn merge_keeps_the_target_name_unless_it_is_generated() {
+        let (_dir, db_path) = test_db_path();
+        let (ids, _) = three_people(&db_path);
+        rename_person(&db_path, ids[0], "Alice").expect("rename");
+        rename_person(&db_path, ids[1], "Bob").expect("rename");
+
+        // Both named: the target keeps its name.
+        merge_persons(&db_path, ids[1], ids[0]).expect("merge");
+        // Generated target absorbs a named source.
+        rename_person(&db_path, ids[2], "Person 9").expect("rename");
+        merge_persons(&db_path, ids[0], ids[2]).expect("merge");
+
+        let people = list_persons(&db_path, &[]).expect("list");
+        assert_eq!(people.len(), 1);
+        assert_eq!(people[0].name, "Alice");
+        assert_eq!(people[0].face_count, 3);
+        assert!(merge_persons(&db_path, ids[2], ids[2]).is_err());
+        assert!(merge_persons(&db_path, 9999, ids[2]).is_err());
+    }
+
+    #[test]
+    fn ignored_people_leave_the_list_and_come_back() {
+        let (_dir, db_path) = test_db_path();
+        let (ids, _) = three_people(&db_path);
+
+        assert_eq!(set_persons_ignored(&db_path, &[ids[0], ids[1]], true).expect("ignore"), 2);
+        assert_eq!(set_persons_ignored(&db_path, &[ids[0]], true).expect("again"), 0);
+        let visible = list_persons(&db_path, &[]).expect("list");
+        assert_eq!(visible.iter().map(|p| p.id).collect::<Vec<_>>(), vec![ids[2]]);
+        let ignored = list_ignored_persons(&db_path, &[]).expect("ignored");
+        assert_eq!(ignored.len(), 2);
+
+        assert_eq!(set_persons_ignored(&db_path, &[ids[0]], false).expect("restore"), 1);
+        assert_eq!(list_persons(&db_path, &[]).expect("list").len(), 2);
+        assert_eq!(list_ignored_persons(&db_path, &[]).expect("ignored").len(), 1);
+    }
+
+    #[test]
+    fn recluster_and_new_faces_respect_ignored_people() {
+        let (_dir, db_path) = test_db_path();
+        let (ids, files) = three_people(&db_path);
+        rename_person(&db_path, ids[1], "Bob").expect("rename");
+        set_persons_ignored(&db_path, &[ids[0]], true).expect("ignore");
+        let ignored_file = person_file_ids(&db_path, ids[0]).expect("ids")[0];
+        let axis = files.iter().position(|f| *f == ignored_file).expect("file");
+
+        recluster_faces(&db_path, 0.45).expect("recluster");
+        let ignored = list_ignored_persons(&db_path, &[]).expect("ignored");
+        assert_eq!(ignored.len(), 1);
+        assert_eq!(ignored[0].id, ids[0]);
+        let visible = list_persons(&db_path, &[]).expect("list");
+        assert_eq!(visible.len(), 2);
+        assert!(visible.iter().any(|p| p.name == "Bob"));
+
+        // A new face of the ignored person joins it instead of surfacing as a new one.
+        let root_id = upsert_root(&db_path, "/tmp/people").expect("root");
+        upsert_file_record(&db_path, &sample_record(root_id, "d.jpg", "fp-d")).expect("file");
+        let fid = file_id_by_path(&db_path, root_id, "d.jpg");
+        let emb: Vec<f32> = (0..512).map(|i| if i == axis { 1.0 } else { 0.0 }).collect();
+        insert_test_face(&db_path, fid, &emb);
+        cluster_faces(&db_path, 0.45).expect("cluster");
+        assert_eq!(list_persons(&db_path, &[]).expect("list").len(), 2);
+        assert_eq!(list_ignored_persons(&db_path, &[]).expect("ignored")[0].face_count, 2);
+    }
+
+    #[test]
+    fn hide_person_files_hides_every_photo_of_the_person() {
+        let (_dir, db_path) = test_db_path();
+        let (ids, files) = three_people(&db_path);
+
+        let own = person_file_ids(&db_path, ids[0]).expect("ids");
+        assert_eq!(own.len(), 1);
+        assert!(files.contains(&own[0]));
+        assert_eq!(hide_person_files(&db_path, ids[0]).expect("hide"), 1);
+        assert_eq!(hide_person_files(&db_path, ids[0]).expect("again"), 0);
+        let visible = list_persons(&db_path, &[]).expect("list");
+        assert_eq!(visible.len(), 2);
+        assert!(visible.iter().all(|p| p.id != ids[0]));
     }
 
     #[test]

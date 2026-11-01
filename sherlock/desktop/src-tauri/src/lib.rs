@@ -2419,6 +2419,31 @@ fn list_persons(
 }
 
 #[tauri::command]
+fn list_ignored_persons(
+    root_scope: Vec<i64>,
+    state: State<'_, AppState>,
+) -> Result<Vec<models::PersonInfo>, String> {
+    db::list_ignored_persons(&state.paths.db_file, &root_scope).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_persons_ignored(
+    person_ids: Vec<i64>,
+    ignored: bool,
+    state: State<'_, AppState>,
+) -> Result<u64, String> {
+    require_writable(&state)?;
+    db::set_persons_ignored(&state.paths.db_file, &person_ids, ignored).map_err(|e| e.to_string())
+}
+
+/// Hides every photo the person appears in; returns how many photos changed.
+#[tauri::command]
+fn hide_person_files(person_id: i64, state: State<'_, AppState>) -> Result<u64, String> {
+    require_writable(&state)?;
+    db::hide_person_files(&state.paths.db_file, person_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn rename_person(
     person_id: i64,
     new_name: String,
@@ -2429,6 +2454,7 @@ fn rename_person(
 
 #[tauri::command]
 fn merge_persons(source_id: i64, target_id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    require_writable(&state)?;
     db::merge_persons(&state.paths.db_file, source_id, target_id).map_err(|e| e.to_string())
 }
 
@@ -3567,6 +3593,9 @@ pub fn run() {
             list_persons,
             rename_person,
             merge_persons,
+            list_ignored_persons,
+            set_persons_ignored,
+            hide_person_files,
             list_faces_for_person,
             unassign_face_from_person,
             reassign_faces_to_person,

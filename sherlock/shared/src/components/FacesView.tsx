@@ -25,6 +25,13 @@ export type FacesActions = {
   unassignFace(faceId: number): Promise<void>;
   reassignFaces(faceIds: number[], targetPersonId: number): Promise<void>;
   setRepresentativeFace(personId: number, faceId: number): Promise<void>;
+  /** Fold `sourceId` into `targetId`; the target's name wins unless it is a generated one. */
+  mergePersons(sourceId: number, targetId: number): Promise<void>;
+  /** Mark people as ignored (or bring them back); ignored people leave the gallery. */
+  setPersonsIgnored(personIds: number[], ignored: boolean): Promise<void>;
+  listIgnoredPeople(): Promise<PersonInfo[]>;
+  /** Hide every photo the person appears in; resolves with how many photos changed. */
+  hidePhotos(personId: number): Promise<number>;
 };
 
 type Props = {
@@ -60,6 +67,8 @@ export default function FacesView({
   const canEdit = library.capabilities.write && actions != null;
 
   const [persons, setPersons] = useState<PersonInfo[]>([]);
+  const [showIgnored, setShowIgnored] = useState(false);
+  const [ignoredCount, setIgnoredCount] = useState(0);
   const [loading, setLoading] = useState(true);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editValue, setEditValue] = useState("");
@@ -101,12 +110,18 @@ export default function FacesView({
   const loadPersons = useCallback(() => {
     setLoading(true);
     scrubFacesCache.current.clear();
-    library
-      .listPeople()
+    const loader = showIgnored && actions ? actions.listIgnoredPeople() : library.listPeople();
+    loader
       .then(setPersons)
       .catch(() => {})
       .finally(() => setLoading(false));
-  }, [library]);
+    if (actions && library.capabilities.write) {
+      actions
+        .listIgnoredPeople()
+        .then((list) => setIgnoredCount(list.length))
+        .catch(() => {});
+    }
+  }, [library, actions, showIgnored]);
 
   useEffect(() => {
     loadPersons();
@@ -412,6 +427,58 @@ export default function FacesView({
     setContextMenuState({ x: e.clientX, y: e.clientY, person });
   }
 
+  async function handleMerge(source: PersonInfo, target: PersonInfo) {
+    if (!actions) return;
+    setContextMenuState(null);
+    const ok = window.confirm(
+      `Merge "${source.name}" (${source.faceCount} faces) into "${target.name}"?\n\n` +
+        `All faces will belong to "${target.name}". This cannot be undone.`,
+    );
+    if (!ok) return;
+    try {
+      await actions.mergePersons(source.id, target.id);
+      onNotice(`Merged "${source.name}" into "${target.name}"`);
+      loadPersons();
+    } catch (err) {
+      onError(String(err));
+    }
+  }
+
+  async function handleIgnore(person: PersonInfo, ignored: boolean) {
+    if (!actions) return;
+    setContextMenuState(null);
+    try {
+      await actions.setPersonsIgnored([person.id], ignored);
+      onNotice(ignored ? `Ignored "${person.name}"` : `Restored "${person.name}"`);
+      loadPersons();
+    } catch (err) {
+      onError(String(err));
+    }
+  }
+
+  async function handleHidePhotos(person: PersonInfo) {
+    if (!actions) return;
+    setContextMenuState(null);
+    const ok = window.confirm(
+      `Hide every photo of "${person.name}" (${person.faceCount} faces)?\n\n` +
+        "Group photos are hidden too, so the other people in them lose those photos as well. " +
+        "Hidden photos can be shown again from the hidden view.",
+    );
+    if (!ok) return;
+    try {
+      const hidden = await actions.hidePhotos(person.id);
+      onNotice(`Hid ${hidden} photo${hidden === 1 ? "" : "s"} of "${person.name}"`);
+      loadPersons();
+    } catch (err) {
+      onError(String(err));
+    }
+  }
+
+  function toggleIgnoredView() {
+    setSelectedPerson(null);
+    setShowIgnored((v) => !v);
+  }
+
   async function handlePinAsThumbnail() {
     if (!contextMenu || !actions) return;
     const { person } = contextMenu;
@@ -502,22 +569,68 @@ export default function FacesView({
         onMouseDown={(e) => e.stopPropagation()}
         data-testid="faces-context-menu"
       >
-        {isScrubbing && (
+        {showIgnored ? (
           <button
             type="button"
             className="context-menu-item"
-            onClick={handlePinAsThumbnail}
+            onClick={() => handleIgnore(contextMenu.person, false)}
           >
-            Pin as Thumbnail
+            Restore
           </button>
+        ) : (
+          <>
+            {isScrubbing && (
+              <button
+                type="button"
+                className="context-menu-item"
+                onClick={handlePinAsThumbnail}
+              >
+                Pin as Thumbnail
+              </button>
+            )}
+            <button
+              type="button"
+              className="context-menu-item"
+              onClick={handleShuffle}
+            >
+              Shuffle
+            </button>
+            {persons.length > 1 && (
+              <div className="context-menu-parent">
+                <span>Merge into</span>
+                <span className="context-menu-arrow">&#9654;</span>
+                <div className="context-menu-submenu">
+                  {persons
+                    .filter((p) => p.id !== contextMenu.person.id)
+                    .map((p) => (
+                      <button
+                        key={p.id}
+                        type="button"
+                        className="context-menu-item"
+                        onClick={() => handleMerge(contextMenu.person, p)}
+                      >
+                        {p.name} ({p.faceCount})
+                      </button>
+                    ))}
+                </div>
+              </div>
+            )}
+            <button
+              type="button"
+              className="context-menu-item"
+              onClick={() => handleIgnore(contextMenu.person, true)}
+            >
+              Ignore person
+            </button>
+            <button
+              type="button"
+              className="context-menu-item"
+              onClick={() => handleHidePhotos(contextMenu.person)}
+            >
+              Hide photos
+            </button>
+          </>
         )}
-        <button
-          type="button"
-          className="context-menu-item"
-          onClick={handleShuffle}
-        >
-          Shuffle
-        </button>
       </div>
     );
   }
@@ -638,10 +751,16 @@ export default function FacesView({
     <div className="tool-view">
       <div className="tool-toolbar">
         <div className="tool-toolbar-stats">
+          {showIgnored && <>Ignored: </>}
           <strong>{persons.length}</strong> {persons.length !== 1 ? "people" : "person"},{" "}
           <strong>{totalFaces}</strong> face{totalFaces !== 1 ? "s" : ""} total
         </div>
-        {canEdit && (
+        {canEdit && (showIgnored || ignoredCount > 0) && (
+          <button type="button" onClick={toggleIgnoredView}>
+            {showIgnored ? "Back to People" : `Ignored people (${ignoredCount})`}
+          </button>
+        )}
+        {canEdit && !showIgnored && (
           <button
             type="button"
             onClick={handleRecluster}
@@ -661,7 +780,9 @@ export default function FacesView({
         {loading && <div className="tool-loading">Loading...</div>}
         {!loading && persons.length === 0 && !isReclustering && (
           <div className="tool-empty">
-            {canEdit
+            {showIgnored
+              ? <>No ignored people.</>
+              : canEdit
               ? <>No faces clustered yet. Right-click a folder and select "Detect Faces" to scan for faces.</>
               : <>No faces clustered yet.</>}
           </div>

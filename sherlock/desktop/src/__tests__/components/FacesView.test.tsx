@@ -637,4 +637,85 @@ describe("FacesView", () => {
       expect(defaultProps.onNotice).toHaveBeenCalledWith('Moved 1 face(s) to Alice');
     });
   });
+
+  describe("merge, ignore and hide photos", () => {
+    async function openMenu(people: PersonInfo[], ignored: PersonInfo[] = []) {
+      mockedInvoke.mockImplementation(async (cmd: string) => {
+        if (cmd === "list_persons") return people;
+        if (cmd === "list_ignored_persons") return ignored;
+        if (cmd === "hide_person_files") return 4;
+        return null;
+      });
+      render(<FacesView {...defaultProps} />);
+      await waitFor(() => expect(screen.getByText("Person 1")).toBeInTheDocument());
+      fireEvent.contextMenu(screen.getByText("Person 1").closest(".faces-card")!);
+      await waitFor(() => expect(screen.getByTestId("faces-context-menu")).toBeInTheDocument());
+    }
+
+    it("merges a person into the chosen one after confirming", async () => {
+      vi.spyOn(window, "confirm").mockReturnValue(true);
+      await openMenu([mockPerson, mockPerson2]);
+
+      await userEvent.click(screen.getByText("Alice (3)"));
+
+      await waitFor(() => {
+        expect(mockedInvoke).toHaveBeenCalledWith("merge_persons", { sourceId: 1, targetId: 2 });
+      });
+      expect(defaultProps.onNotice).toHaveBeenCalledWith('Merged "Person 1" into "Alice"');
+    });
+
+    it("does not merge when the confirmation is declined", async () => {
+      vi.spyOn(window, "confirm").mockReturnValue(false);
+      await openMenu([mockPerson, mockPerson2]);
+
+      await userEvent.click(screen.getByText("Alice (3)"));
+
+      expect(mockedInvoke).not.toHaveBeenCalledWith("merge_persons", expect.anything());
+    });
+
+    it("ignores a person", async () => {
+      await openMenu([mockPerson, mockPerson2]);
+
+      await userEvent.click(screen.getByRole("button", { name: "Ignore person" }));
+
+      await waitFor(() => {
+        expect(mockedInvoke).toHaveBeenCalledWith("set_persons_ignored", {
+          personIds: [1],
+          ignored: true,
+        });
+      });
+    });
+
+    it("hides every photo of a person after confirming", async () => {
+      const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+      await openMenu([mockPerson]);
+
+      await userEvent.click(screen.getByRole("button", { name: "Hide photos" }));
+
+      await waitFor(() => {
+        expect(mockedInvoke).toHaveBeenCalledWith("hide_person_files", { personId: 1 });
+      });
+      expect(confirm.mock.calls[0][0]).toMatch(/Group photos are hidden too/);
+      expect(defaultProps.onNotice).toHaveBeenCalledWith('Hid 4 photos of "Person 1"');
+    });
+
+    it("lists ignored people and restores one", async () => {
+      await openMenu([mockPerson], [mockPerson2]);
+      fireEvent.keyDown(document, { key: "Escape" });
+
+      await userEvent.click(await screen.findByRole("button", { name: "Ignored people (1)" }));
+      await waitFor(() => expect(screen.getByText("Alice")).toBeInTheDocument());
+      expect(screen.queryByText("Person 1")).not.toBeInTheDocument();
+
+      fireEvent.contextMenu(screen.getByText("Alice").closest(".faces-card")!);
+      await userEvent.click(await screen.findByRole("button", { name: "Restore" }));
+
+      await waitFor(() => {
+        expect(mockedInvoke).toHaveBeenCalledWith("set_persons_ignored", {
+          personIds: [2],
+          ignored: false,
+        });
+      });
+    });
+  });
 });
