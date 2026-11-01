@@ -1769,6 +1769,30 @@ fn update_file_metadata(
     .map_err(|e| e.to_string())
 }
 
+/// Replace one description with text the user wrote.
+#[tauri::command]
+fn update_file_description(
+    file_id: i64,
+    description: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    require_writable(state.inner())?;
+    db::set_manual_description(&state.paths.db_file, file_id, &description)
+        .map_err(|e| e.to_string())
+}
+
+/// Append a text to the description of every selected file; returns how many changed.
+#[tauri::command]
+fn append_files_description(
+    file_ids: Vec<i64>,
+    text: String,
+    state: State<'_, AppState>,
+) -> Result<u64, String> {
+    require_writable(state.inner())?;
+    db::append_files_description(&state.paths.db_file, &file_ids, &text)
+        .map_err(|e| e.to_string())
+}
+
 // ── Duplicates ──────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -3507,6 +3531,8 @@ pub fn run() {
             get_file_metadata,
             get_file_properties,
             update_file_metadata,
+            update_file_description,
+            append_files_description,
             find_duplicates,
             create_album,
             delete_album,

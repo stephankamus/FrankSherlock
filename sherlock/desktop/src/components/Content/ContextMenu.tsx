@@ -15,6 +15,8 @@ type Props = {
   onCopyOcrText: () => void;
   onRename: () => void;
   onEditMetadata: () => void;
+  onEditDescription?: () => void;
+  onAddDescription?: () => void;
   onProperties: () => void;
   onDelete: () => void;
   onAddToAlbum: (albumId: number) => void;
@@ -28,7 +30,7 @@ type Props = {
 
 export default function ContextMenu({
   x, y, selectedCount, albums, description, extractedText, confidence,
-  onCopyPath, onCopyDescription, onCopyOcrText, onRename, onEditMetadata, onProperties,
+  onCopyPath, onCopyDescription, onCopyOcrText, onRename, onEditMetadata, onEditDescription, onAddDescription, onProperties,
   onDelete, onAddToAlbum, onCreateAlbumFromSelection, onClose,
   onToggleHidden, selectionAllHidden = false,
 }: Props) {
@@ -110,6 +112,18 @@ export default function ContextMenu({
           title={isUnclassified ? "Not yet classified" : undefined}
         >
           <span>Edit Metadata</span>
+        </button>
+      )}
+
+      {selectedCount === 1 && onEditDescription && (
+        <button className="context-menu-item" role="menuitem" onClick={onEditDescription}>
+          <span>Edit Description</span>
+        </button>
+      )}
+
+      {selectedCount > 1 && onAddDescription && (
+        <button className="context-menu-item" role="menuitem" onClick={onAddDescription}>
+          <span>Add Description to {selectedCount}</span>
         </button>
       )}
 

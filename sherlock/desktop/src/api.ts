@@ -425,6 +425,15 @@ export async function updateFileMetadata(
   });
 }
 
+export async function updateFileDescription(fileId: number, description: string): Promise<void> {
+  return invoke<void>("update_file_description", { fileId, description });
+}
+
+/** Appends `text` to the description of every file; resolves to how many rows changed. */
+export async function appendFilesDescription(fileIds: number[], text: string): Promise<number> {
+  return invoke<number>("append_files_description", { fileIds, text });
+}
+
 // ── Albums ──────────────────────────────────────────────────────────
 
 export async function createAlbum(name: string): Promise<Album> {

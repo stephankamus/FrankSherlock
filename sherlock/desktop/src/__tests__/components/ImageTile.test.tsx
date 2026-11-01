@@ -121,4 +121,36 @@ describe("ImageTile", () => {
     );
     expect(screen.queryByLabelText("Hide this photo")).not.toBeInTheDocument();
   });
+
+  it("shows a selection checkbox that does not trigger the tile click", async () => {
+    const user = userEvent.setup();
+    const onClick = vi.fn();
+    const onToggleSelect = vi.fn();
+    renderTile(
+      <ImageTile item={mockItem} index={3} isSelected={false} isFocused={false} onClick={onClick} onDoubleClick={() => {}} onContextMenu={() => {}} onToggleSelect={onToggleSelect} />
+    );
+
+    await user.keyboard("{Shift>}");
+    await user.click(screen.getByRole("checkbox", { name: "Select this photo" }));
+    await user.keyboard("{/Shift}");
+
+    expect(onToggleSelect).toHaveBeenCalledTimes(1);
+    expect(onToggleSelect.mock.calls[0][0]).toBe(3);
+    expect(onToggleSelect.mock.calls[0][1].shiftKey).toBe(true);
+    expect(onClick).not.toHaveBeenCalled();
+  });
+
+  it("reflects the selection in the checkbox and omits it when read-only", () => {
+    const { rerender } = renderTile(
+      <ImageTile item={mockItem} index={0} isSelected isFocused={false} onClick={() => {}} onDoubleClick={() => {}} onContextMenu={() => {}} onToggleSelect={() => {}} />
+    );
+    expect(screen.getByRole("checkbox", { name: "Deselect this photo" })).toBeChecked();
+
+    rerender(
+      <LibraryProvider client={tauriLibraryClient}>
+        <ImageTile item={mockItem} index={0} isSelected isFocused={false} onClick={() => {}} onDoubleClick={() => {}} onContextMenu={() => {}} />
+      </LibraryProvider>
+    );
+    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+  });
 });

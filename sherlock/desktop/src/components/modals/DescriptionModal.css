@@ -1,0 +1,29 @@
+.description-modal {
+  width: min(520px, 90vw);
+}
+
+.description-modal textarea {
+  width: 100%;
+  min-height: 140px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--font-size-sm);
+  box-sizing: border-box;
+  resize: vertical;
+  margin-bottom: 8px;
+}
+
+.description-modal textarea:focus {
+  outline: none;
+  border-color: var(--border-focus);
+}
+
+.description-modal-hint {
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  margin: 0 0 8px;
+}

@@ -193,6 +193,32 @@
   background: var(--accent);
 }
 
+/* Selection checkbox: top-left, shown on hover and on every selected tile */
+.tile-select-box {
+  position: absolute;
+  top: 5px;
+  left: 5px;
+  z-index: 3;
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--accent);
+  opacity: 0;
+  transition: opacity 0.1s;
+}
+
+.tile:hover .tile-select-box,
+.tile-selected .tile-select-box,
+.tile-select-box:focus-visible {
+  opacity: 1;
+}
+
+/* The origin badge shares the corner: step aside for the checkbox */
+.tile-selectable .tile-source-badge {
+  left: 28px;
+}
+
 .tile-hidden-badge {
   position: absolute;
   bottom: 4px;
@@ -445,4 +471,31 @@ button.scanning-indicator:focus-visible {
   background: rgba(255,255,255,0.15);
   border-color: rgba(255,255,255,0.25);
   color: #fff;
+}
+
+/* ── Selection bar ───────────────────────────────────────── */
+.selection-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-height: 32px;
+  margin-bottom: 8px;
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+}
+
+.selection-bar-count {
+  min-width: 96px;
+  color: var(--text-primary);
+}
+
+.selection-bar button {
+  font-size: var(--font-size-sm);
+}
+
+.selection-bar-primary {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
 }

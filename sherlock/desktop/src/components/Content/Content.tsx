@@ -1,5 +1,5 @@
 import type { RefObject } from "react";
-import { ImageGrid, ResultsMeta, Toolbar } from "@frank-sherlock/shared";
+import { ImageGrid, ResultsMeta, SelectionBar, Toolbar } from "@frank-sherlock/shared";
 import type { SearchItem, SortField, SortOrder } from "../../types";
 import "./Content.css";
 
@@ -19,6 +19,11 @@ type ContentProps = {
   onIncludeHiddenChange?: (value: boolean) => void;
   hiddenCount?: number;
   onTileToggleHidden?: (idx: number) => void;
+  onTileToggleSelect?: (idx: number, e: React.MouseEvent) => void;
+  onSelectAll?: () => void;
+  onClearSelection?: () => void;
+  onHideSelected?: () => void;
+  onAddDescription?: () => void;
   items: SearchItem[];
   total: number;
   loading: boolean;
@@ -41,6 +46,7 @@ export default function Content({
   query, onQueryChange, selectedMediaType, onMediaTypeChange, mediaTypeOptions,
   sortBy, onSortByChange, sortOrder, onSortOrderChange, hasTextQuery, onSaveSmartFolder,
   includeHidden, onIncludeHiddenChange, hiddenCount, onTileToggleHidden,
+  onTileToggleSelect, onSelectAll, onClearSelection, onHideSelected, onAddDescription,
   items, total, loading, loadingMore, canLoadMore, isScanning, selectedRootName, onShowLogs,
   selectedIndices, focusIndex, gridRef, sentinelRef, onTileClick, onTileDoubleClick,
   onTileContextMenu,
@@ -74,6 +80,21 @@ export default function Content({
           onShowLogs={onShowLogs}
         />
 
+        {onSelectAll && onClearSelection && (
+          <SelectionBar
+            selectedCount={selectedIndices.size}
+            visibleCount={items.length}
+            onSelectAll={onSelectAll}
+            onClear={onClearSelection}
+            onHide={onHideSelected}
+            allHidden={
+              selectedIndices.size > 0 &&
+              [...selectedIndices].every((index) => items[index]?.hiddenAt != null)
+            }
+            onAddDescription={onAddDescription}
+          />
+        )}
+
         <ImageGrid
           items={items}
           selectedIndices={selectedIndices}
@@ -83,6 +104,7 @@ export default function Content({
           onTileDoubleClick={onTileDoubleClick}
           onTileContextMenu={onTileContextMenu}
           onTileToggleHidden={onTileToggleHidden}
+          onTileToggleSelect={onTileToggleSelect}
         />
 
         {canLoadMore && (

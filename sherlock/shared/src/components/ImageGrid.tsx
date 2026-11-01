@@ -13,11 +13,12 @@ type ImageGridProps = {
   onTileDoubleClick: (idx: number) => void;
   onTileContextMenu: (idx: number, e: React.MouseEvent) => void;
   onTileToggleHidden?: (idx: number) => void;
+  onTileToggleSelect?: (idx: number, e: React.MouseEvent) => void;
 };
 
 export default function ImageGrid({
   items, selectedIndices, focusIndex, gridRef, onTileClick, onTileDoubleClick, onTileContextMenu,
-  onTileToggleHidden,
+  onTileToggleHidden, onTileToggleSelect,
 }: ImageGridProps) {
   return (
     <div className="grid" role="list" ref={gridRef}>
@@ -32,6 +33,7 @@ export default function ImageGrid({
           onDoubleClick={onTileDoubleClick}
           onContextMenu={onTileContextMenu}
           onToggleHidden={onTileToggleHidden}
+          onToggleSelect={onTileToggleSelect}
         />
       ))}
     </div>

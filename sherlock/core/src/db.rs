@@ -2,7 +2,9 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
-use rusqlite::{params, params_from_iter, types::Value, Connection, OpenFlags, Row};
+use rusqlite::{
+    params, params_from_iter, types::Value, Connection, OpenFlags, OptionalExtension, Row,
+};
 use rusqlite_migration::{HookError, Migrations, M};
 
 use crate::error::{AppError, AppResult};
@@ -3524,6 +3526,10 @@ pub fn get_file_properties(db_path: &Path, file_id: i64) -> AppResult<FileProper
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `description_lang` tag of a description the user typed or extended. The language
+/// conversion pass skips it: rewriting it would throw the user's words away.
+pub const MANUAL_DESCRIPTION_LANG: &str = "manual";
+
 pub fn update_file_metadata(
     db_path: &Path,
     file_id: i64,
@@ -3538,7 +3544,8 @@ pub fn update_file_metadata(
     let now = now_epoch_secs();
     tx.execute(
         "UPDATE files SET media_type = ?2, description = ?3, extracted_text = ?4,
-                canonical_mentions = ?5, location_text = ?6, updated_at = ?7
+                canonical_mentions = ?5, location_text = ?6, updated_at = ?7,
+                description_lang = CASE WHEN description <> ?3 THEN ?8 ELSE description_lang END
          WHERE id = ?1 AND deleted_at IS NULL",
         params![
             file_id,
@@ -3547,7 +3554,8 @@ pub fn update_file_metadata(
             extracted_text,
             canonical_mentions,
             location_text,
-            now
+            now,
+            MANUAL_DESCRIPTION_LANG
         ],
     )?;
     refresh_fts(&tx, file_id)?;
@@ -3628,6 +3636,7 @@ pub fn list_descriptions_needing_language(
           WHERE deleted_at IS NULL
             AND description <> ''
             AND description_lang <> ?1
+            AND description_lang <> 'manual'
           ORDER BY id",
     )?;
     let rows = stmt
@@ -3664,6 +3673,54 @@ pub fn set_file_description(
     refresh_fts(&tx, file_id)?;
     tx.commit()?;
     Ok(())
+}
+
+/// Replace one description with text the user wrote.
+pub fn set_manual_description(db_path: &Path, file_id: i64, description: &str) -> AppResult<()> {
+    set_file_description(db_path, file_id, description.trim(), MANUAL_DESCRIPTION_LANG)
+}
+
+/// Append `text` to the description of every listed row, in one transaction.
+///
+/// A row that already ends with the text is left alone, so repeating the action on the
+/// same selection does not stack copies. Returns how many rows changed.
+pub fn append_files_description(db_path: &Path, file_ids: &[i64], text: &str) -> AppResult<u64> {
+    let text = text.trim();
+    if text.is_empty() || file_ids.is_empty() {
+        return Ok(0);
+    }
+    let conn = open_conn(db_path)?;
+    let tx = conn.unchecked_transaction()?;
+    let now = now_epoch_secs();
+    let mut changed = 0u64;
+    {
+        let mut read =
+            tx.prepare("SELECT description FROM files WHERE id = ?1 AND deleted_at IS NULL")?;
+        let mut write = tx.prepare(
+            "UPDATE files SET description = ?2, description_lang = ?3, updated_at = ?4
+              WHERE id = ?1",
+        )?;
+        for &file_id in file_ids {
+            let current: Option<String> = read
+                .query_row(params![file_id], |row| row.get(0))
+                .optional()?;
+            let Some(current) = current else { continue };
+            let current = current.trim_end();
+            if current.ends_with(text) {
+                continue;
+            }
+            let next = if current.is_empty() {
+                text.to_string()
+            } else {
+                format!("{current}\n{text}")
+            };
+            write.execute(params![file_id, next, MANUAL_DESCRIPTION_LANG, now])?;
+            refresh_fts(&tx, file_id)?;
+            changed += 1;
+        }
+    }
+    tx.commit()?;
+    Ok(changed)
 }
 
 /// A row the model flagged as a document.
@@ -10073,6 +10130,82 @@ mod tests {
         names.sort();
         assert_eq!(names.iter().filter(|n| n.as_str() == "Maria").count(), 1);
         assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn append_description_concatenates_once_and_stays_searchable() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/append").expect("root");
+        let mut with_text = sample_record(root_id, "a.jpg", "fa");
+        with_text.description = "A church".to_string();
+        upsert_file_record(&db_path, &with_text).expect("a");
+        let mut empty = sample_record(root_id, "b.jpg", "fb");
+        empty.description = String::new();
+        upsert_file_record(&db_path, &empty).expect("b");
+        let a = file_id_by_path(&db_path, root_id, "a.jpg");
+        let b = file_id_by_path(&db_path, root_id, "b.jpg");
+
+        let changed =
+            append_files_description(&db_path, &[a, b, 999_999], " Wedding of 2015 ").expect("append");
+        assert_eq!(changed, 2);
+        let again = append_files_description(&db_path, &[a, b], "Wedding of 2015").expect("again");
+        assert_eq!(again, 0, "repeating the action must not stack copies");
+
+        let conn = open_conn(&db_path).expect("open");
+        let read = |id: i64| -> (String, String) {
+            conn.query_row(
+                "SELECT description, description_lang FROM files WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("row")
+        };
+        assert_eq!(read(a), ("A church\nWedding of 2015".to_string(), "manual".to_string()));
+        assert_eq!(read(b), ("Wedding of 2015".to_string(), "manual".to_string()));
+        let hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files_fts WHERE files_fts MATCH 'wedding'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("fts");
+        assert_eq!(hits, 2);
+        let pending = list_descriptions_needing_language(&db_path, "pt_br").expect("worklist");
+        assert!(pending.is_empty(), "manual descriptions are not converted");
+    }
+
+    #[test]
+    fn manual_description_and_metadata_edit_mark_the_row_manual() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/manual").expect("root");
+        upsert_file_record(&db_path, &sample_record(root_id, "a.jpg", "fa")).expect("a");
+        let a = file_id_by_path(&db_path, root_id, "a.jpg");
+
+        set_manual_description(&db_path, a, "  My words  ").expect("set");
+        let conn = open_conn(&db_path).expect("open");
+        let (text, lang): (String, String) = conn
+            .query_row(
+                "SELECT description, description_lang FROM files WHERE id = ?1",
+                params![a],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!((text.as_str(), lang.as_str()), ("My words", "manual"));
+
+        // Saving the metadata form with an unchanged description keeps the tag.
+        set_file_description(&db_path, a, "Original", "pt_br").expect("tag");
+        update_file_metadata(&db_path, a, "photo", "Original", "", "", "Rome").expect("same");
+        let lang: String = conn
+            .query_row("SELECT description_lang FROM files WHERE id = ?1", params![a], |r| r.get(0))
+            .expect("lang");
+        assert_eq!(lang, "pt_br");
+        update_file_metadata(&db_path, a, "photo", "Edited", "", "", "Rome").expect("edit");
+        let lang: String = conn
+            .query_row("SELECT description_lang FROM files WHERE id = ?1", params![a], |r| r.get(0))
+            .expect("lang");
+        assert_eq!(lang, "manual");
     }
 
     #[test]

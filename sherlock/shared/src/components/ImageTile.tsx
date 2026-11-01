@@ -15,6 +15,12 @@ type Props = {
   onContextMenu: (index: number, e: React.MouseEvent) => void;
   /** Hides or unhides this photo. Absent on the read-only web client. */
   onToggleHidden?: (index: number) => void;
+  /**
+   * Checkbox click. The event carries Shift/Ctrl so the caller can extend the selection
+   * as a range. Absent on the read-only web client, which has nothing to do with a
+   * selection.
+   */
+  onToggleSelect?: (index: number, e: React.MouseEvent) => void;
 };
 
 /**
@@ -34,6 +40,7 @@ export default function ImageTile({
   onDoubleClick,
   onContextMenu,
   onToggleHidden,
+  onToggleSelect,
 }: Props) {
   const library = useLibrary();
   const thumb = library.thumbUrl(item);
@@ -55,7 +62,7 @@ export default function ImageTile({
 
   return (
     <article
-      className={`tile${isSelected ? " tile-selected" : ""}${isFocused ? " tile-focused" : ""}${isHidden ? " tile-hidden" : ""}`}
+      className={`tile${onToggleSelect ? " tile-selectable" : ""}${isSelected ? " tile-selected" : ""}${isFocused ? " tile-focused" : ""}${isHidden ? " tile-hidden" : ""}`}
       role="listitem"
       onClick={(e) => onClick(index, e)}
       onDoubleClick={() => onDoubleClick(index)}
@@ -79,6 +86,23 @@ export default function ImageTile({
           <div className="tile-thumb-placeholder">
             <span className="badge">{item.mediaType}</span>
           </div>
+        )}
+        {onToggleSelect && (
+          // Like the hide button, this must not reach the tile: a plain tile click
+          // replaces the selection, the checkbox adds to it.
+          <input
+            type="checkbox"
+            className="tile-select-box"
+            checked={isSelected}
+            aria-label={isSelected ? "Deselect this photo" : "Select this photo"}
+            title="Select (Shift for a range)"
+            onChange={() => {}}
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleSelect(index, e);
+            }}
+            onDoubleClick={(e) => e.stopPropagation()}
+          />
         )}
         {isVideo && (
           <span className="tile-video-badge" aria-label="Video">&#9654;</span>

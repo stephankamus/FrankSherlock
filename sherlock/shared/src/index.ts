@@ -10,6 +10,7 @@ export { default as ImageTile } from "./components/ImageTile";
 export { default as ImageGrid } from "./components/ImageGrid";
 export { default as Toolbar } from "./components/Toolbar";
 export { default as ResultsMeta } from "./components/ResultsMeta";
+export { default as SelectionBar } from "./components/SelectionBar";
 export { default as ModalOverlay } from "./components/ModalOverlay";
 export { default as HelpModal } from "./components/HelpModal";
 export { default as ToastContainer } from "./components/ToastContainer";

@@ -14,6 +14,7 @@ import {
   getHiddenFileCount, getVisionSettings, listRoots,
   pendingScanSummary, relinkRoot, removeRoot, renameFile, reorderRoots,
   resetRootClassifications, setFilesHidden, startScan, updateFileMetadata, updateSettings,
+  updateFileDescription, appendFilesDescription,
 } from "./api";
 import type {
   DbStats,
@@ -50,6 +51,7 @@ import RawConversionModal from "./components/modals/RawConversionModal";
 import ConfirmFileDeleteModal from "./components/modals/ConfirmFileDeleteModal";
 import RenameModal from "./components/modals/RenameModal";
 import EditMetadataModal from "./components/modals/EditMetadataModal";
+import DescriptionModal from "./components/modals/DescriptionModal";
 import PropertiesModal from "./components/modals/PropertiesModal";
 import ModelInfoModal from "./components/modals/ModelInfoModal";
 import ModelPickerModal from "./components/modals/ModelPickerModal";
@@ -152,6 +154,10 @@ export default function App() {
     interrupted: boolean;
   } | null>(null);
   const [editMetadataItem, setEditMetadataItem] = useState<SearchItem | null>(null);
+  /** Photo whose description is being edited, with the text loaded from the index. */
+  const [editDescription, setEditDescription] = useState<{ item: SearchItem; text: string | null } | null>(null);
+  /** Photos that receive the text typed in the "Add description" modal. */
+  const [addDescriptionTargets, setAddDescriptionTargets] = useState<SearchItem[] | null>(null);
   const [facePreviewItems, setFacePreviewItems] = useState<SearchItem[]>([]);
   const [propertiesItem, setPropertiesItem] = useState<SearchItem | null>(null);
   const [forceShowSetup, setForceShowSetup] = useState(false);
@@ -433,7 +439,7 @@ export default function App() {
     if (!backlog.shareOffline) setMediaOfflineHidden(false);
   }, [backlog.shareOffline]);
 
-  const hasModalOpen = !!(confirmDeleteFiles || renameItem || editMetadataItem || propertiesItem || albumManager.showCreateAlbum || smartFolderManager.showCreateSmartFolder || visionPicker || startupPrompt || showLogs || (backlog.shareOffline && !mediaOfflineHidden));
+  const hasModalOpen = !!(confirmDeleteFiles || renameItem || editMetadataItem || editDescription || addDescriptionTargets || propertiesItem || albumManager.showCreateAlbum || smartFolderManager.showCreateSmartFolder || visionPicker || startupPrompt || showLogs || (backlog.shareOffline && !mediaOfflineHidden));
 
   const onRequestDelete = useCallback(() => {
     const filesToDelete = [...selectedIndices].sort((a, b) => a - b)
@@ -653,6 +659,82 @@ export default function App() {
       rangeSelect(anchorIndex, idx);
     } else {
       selectOnly(idx);
+    }
+  }
+
+  /** The checkbox adds to the selection; Shift extends it from the anchor. */
+  function onTileToggleSelect(idx: number, e: React.MouseEvent) {
+    if (e.shiftKey && anchorIndex != null) {
+      rangeSelect(anchorIndex, idx);
+    } else {
+      toggleSelect(idx);
+    }
+  }
+
+  function selectedItems(): SearchItem[] {
+    return [...selectedIndices]
+      .sort((a, b) => a - b)
+      .map((index) => items[index])
+      .filter((item): item is SearchItem => Boolean(item));
+  }
+
+  function handleHideSelected() {
+    const targets = selectedItems();
+    if (targets.length === 0) return;
+    void applyHidden(targets, !targets.every((item) => item.hiddenAt != null));
+  }
+
+  function openAddDescription() {
+    const targets = selectedItems();
+    if (targets.length > 0) setAddDescriptionTargets(targets);
+  }
+
+  function handleContextAddDescription() {
+    setContextMenu(null);
+    openAddDescription();
+  }
+
+  function handleContextEditDescription() {
+    setContextMenu(null);
+    if (selectedIndices.size !== 1) return;
+    const item = items[[...selectedIndices][0]];
+    if (!item) return;
+    setEditDescription({ item, text: null });
+    getFileMetadata(item.id)
+      .then((meta) => setEditDescription((cur) => (cur?.item.id === item.id ? { item, text: meta.description } : cur)))
+      .catch((err) => {
+        setEditDescription(null);
+        setError(errorMessage(err));
+      });
+  }
+
+  async function handleSaveDescription(text: string) {
+    if (!editDescription) return;
+    const { item } = editDescription;
+    setEditDescription(null);
+    try {
+      await updateFileDescription(item.id, text);
+      await runSearch(0, false);
+      setNotice("Description updated");
+    } catch (err) {
+      setError(errorMessage(err));
+    }
+  }
+
+  async function handleAddDescription(text: string) {
+    if (!addDescriptionTargets) return;
+    const ids = addDescriptionTargets.map((item) => item.id);
+    setAddDescriptionTargets(null);
+    try {
+      const changed = await appendFilesDescription(ids, text);
+      await runSearch(0, false);
+      setNotice(
+        changed === 0
+          ? "Description already present"
+          : `Description added to ${changed} photo${changed === 1 ? "" : "s"}`,
+      );
+    } catch (err) {
+      setError(errorMessage(err));
     }
   }
 
@@ -1090,6 +1172,8 @@ export default function App() {
           onCopyOcrText={handleContextCopyOcrText}
           onRename={handleContextRename}
           onEditMetadata={handleContextEditMetadata}
+          onEditDescription={handleContextEditDescription}
+          onAddDescription={handleContextAddDescription}
           onProperties={handleContextProperties}
           onDelete={handleContextDelete}
           onAddToAlbum={handleAddToAlbum}
@@ -1107,6 +1191,23 @@ export default function App() {
           fileId={editMetadataItem.id}
           onSave={handleSaveMetadata}
           onCancel={() => setEditMetadataItem(null)}
+        />
+      )}
+      {editDescription && (
+        <DescriptionModal
+          mode="edit"
+          initialValue={editDescription.text ?? ""}
+          loading={editDescription.text === null}
+          onCancel={() => setEditDescription(null)}
+          onConfirm={handleSaveDescription}
+        />
+      )}
+      {addDescriptionTargets && (
+        <DescriptionModal
+          mode="append"
+          count={addDescriptionTargets.length}
+          onCancel={() => setAddDescriptionTargets(null)}
+          onConfirm={handleAddDescription}
         />
       )}
       {propertiesItem && (
@@ -1318,6 +1419,11 @@ export default function App() {
             onIncludeHiddenChange={setShowHidden}
             hiddenCount={hiddenCount}
             onTileToggleHidden={handleTileToggleHidden}
+            onTileToggleSelect={onTileToggleSelect}
+            onSelectAll={() => selectAll(items.length)}
+            onClearSelection={clearSelection}
+            onHideSelected={handleHideSelected}
+            onAddDescription={openAddDescription}
             items={items}
             total={total}
             loading={loading}
