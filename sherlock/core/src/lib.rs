@@ -21,3 +21,4 @@ pub mod paths;
 pub mod query_parser;
 pub mod similarity;
 pub mod thumbnail;
+pub mod video_compat;

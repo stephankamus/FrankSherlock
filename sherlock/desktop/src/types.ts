@@ -550,3 +550,37 @@ export type LogSnapshot = {
   truncated: boolean;
   sizeBytes: number;
 };
+
+export type VideoWebReport = {
+  total: number;
+  transcode: number;
+  remux: number;
+  totalBytes: number;
+  totalSecs: number;
+  transcodeSecs: number;
+  groups: { label: string; count: number }[];
+  ffmpegReady: boolean;
+  message: string;
+};
+
+export type VideoConvertOptions = {
+  maxHeight: number | null;
+  crf: number;
+};
+
+export type VideoJobStatus = {
+  running: boolean;
+  rootId: number;
+  done: number;
+  total: number;
+  current: string;
+  doneSecs: number;
+  totalSecs: number;
+  startedAtMs: number;
+  converted: number;
+  failed: number;
+  cancelled: boolean;
+  outBytes: number;
+  errors: string[];
+  fatal: string | null;
+};

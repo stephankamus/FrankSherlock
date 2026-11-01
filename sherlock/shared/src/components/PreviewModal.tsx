@@ -59,6 +59,11 @@ function detectLayout(items: SearchItem[]): {
 }
 
 /** Resolve the playback URL through the client (stream server on the desktop). */
+/** The same media URL without the `playback=web` switch, i.e. the untouched original. */
+function withoutPlayback(url: string): string {
+  return url.replace(/([?&])playback=web&?/, "$1").replace(/[?&]$/, "");
+}
+
 function useVideoStreamUrl(item: SearchItem | undefined): string | null {
   const library = useLibrary();
   const [url, setUrl] = useState<string | null>(null);
@@ -237,6 +242,13 @@ export default function PreviewModal({
               Video playback not available. Your system may need GStreamer plugins
               (gst-plugins-good, gst-plugins-bad, gst-libav) for codec support.
             </p>
+            {videoUrl && videoUrl.includes("playback=web") && (
+              <p style={{ marginTop: 8 }}>
+                <a href={withoutPlayback(videoUrl)} download>
+                  Download the original file
+                </a>
+              </p>
+            )}
           </div>
         )}
 

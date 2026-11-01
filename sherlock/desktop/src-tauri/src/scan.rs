@@ -3637,6 +3637,9 @@ fn collect_image_probes_incremental(
         .filter_entry(|e| {
             // Skip child root subtrees before descending
             if e.file_type().is_dir() && e.path() != root {
+                if e.file_name() == sherlock_core::video_compat::OUTPUT_DIR_NAME {
+                    return false;
+                }
                 return !excluded_prefixes.iter().any(|p| e.path().starts_with(p));
             }
             true
@@ -5170,6 +5173,28 @@ mod tests {
         .expect("probes filtered");
         assert_eq!(probes_filtered.probes.len(), 1);
         assert_eq!(probes_filtered.probes[0].filename, "parent.jpg");
+    }
+
+    #[test]
+    fn discovery_skips_the_web_video_copies() {
+        let root_dir = tempfile::tempdir().expect("tempdir");
+        write_test_image(&root_dir.path().join("keep.jpg"), 0x11);
+        let copies = root_dir.path().join("Trip").join("FrankSherlock-MP4");
+        std::fs::create_dir_all(&copies).expect("mkdir");
+        std::fs::write(copies.join("clip__mov.mp4"), b"x").expect("copy");
+
+        let dummy_db = root_dir.path().join("dummy.sqlite");
+        let probes = collect_image_probes_incremental(
+            root_dir.path(),
+            &HashMap::new(),
+            &[],
+            &dummy_db,
+            0,
+            None,
+        )
+        .expect("probes");
+        assert_eq!(probes.probes.len(), 1);
+        assert_eq!(probes.probes[0].filename, "keep.jpg");
     }
 
     #[test]

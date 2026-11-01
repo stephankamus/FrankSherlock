@@ -97,7 +97,10 @@ WEBKIT_DISABLE_DMABUF_RENDERER=1 GDK_BACKEND=wayland,x11 npm run tauri:dev
   **Only exception, authorized by the user in the modal**: the opt-in HEIC/NEF conversion writes
   JPEG copies into `FrankSherlock-JPG/` inside the directory of the original. No other feature
   writes to a root, and there is deliberately no fallback to the app cache, so the library is
-  not spread across two places. See [`plans/heic-nef-conversion.md`](plans/heic-nef-conversion.md).
+  not spread across two places.
+  The opt-in "Convert videos for web" writes browser-playable MP4 copies into
+  `FrankSherlock-MP4/` next to the original video; the scan skips that folder and the copies
+  are mapped to the original through the `video_conversions` table, not indexed. See [`plans/heic-nef-conversion.md`](plans/heic-nef-conversion.md).
 - **Incremental**: Unchanged files (same mtime + size) skip fingerprinting and classification entirely — only a scan marker update.
 - **Move-aware**: Renamed/moved files detected by fingerprint, preserving all classification data.
 - **Resilient**: Scan jobs checkpoint after each file. Interrupted scans resume from last cursor.

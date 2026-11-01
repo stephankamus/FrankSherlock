@@ -37,6 +37,7 @@ type SidebarProps<TRoot extends RootInfo = RootInfo> = {
   onReclassifyRoot?: (root: TRoot) => void;
   /** Convert the HEIC/NEF files of a root into JPEG copies. */
   onConvertRawRoot?: (root: TRoot) => void;
+  onConvertVideosRoot?: (root: TRoot) => void;
   onCompactDatabase?: () => void;
   compacting?: boolean;
   /** Live progress of the "Repair Thumbnails" tool. */
@@ -88,7 +89,7 @@ export default function Sidebar<TRoot extends RootInfo = RootInfo>({
   setupReady, albums, smartFolders, activeAlbumName, activeSmartFolderId,
   selectedSubdir, faceProgress, onSelectSubdir, includeHiddenFolders, onSetFolderHidden,
   onSelectRoot, onDeleteRoot, onRescanRoot, onRefreshRoot, onCopyRootPath, onPickAndScan,
-  onRelinkRoot, onReclassifyRoot, onConvertRawRoot, onCompactDatabase, compacting,
+  onRelinkRoot, onReclassifyRoot, onConvertRawRoot, onConvertVideosRoot, onCompactDatabase, compacting,
   thumbRepair, onRepairThumbnails, onCancelThumbRepair, onProcessBacklog,
   backlog, onCancelBacklog, failedCount, onRetryFailed,
   onDetectFaces, onCancelFaceDetect,
@@ -193,6 +194,9 @@ export default function Sidebar<TRoot extends RootInfo = RootInfo>({
                   }
                   onConvertRaw={
                     !readOnly && onConvertRawRoot ? () => onConvertRawRoot(root) : undefined
+                  }
+                  onConvertVideos={
+                    !readOnly && onConvertVideosRoot ? () => onConvertVideosRoot(root) : undefined
                   }
                   onCancelScan={scan?.status === "running" ? () => onCancelScan(scan) : undefined}
                   onResumeScan={scan?.status === "interrupted" ? () => onResumeScan(scan) : undefined}

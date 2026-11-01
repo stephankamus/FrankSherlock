@@ -519,3 +519,45 @@ async fn the_root_serves_the_api_pointer_without_the_bundle() {
     let (status, _, _) = get_with_headers(&fixture.state, "/people/42", &[]).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn video_playback_prefers_the_converted_copy_only_when_asked() {
+    let fixture = build();
+    let db_file = fixture.library.join("index.rev-001.sqlite");
+    let media = fixture.library.parent().expect("temp dir").join("media/a");
+    std::fs::create_dir_all(media.join("FrankSherlock-MP4")).expect("copy dir");
+    std::fs::write(media.join("clip.avi"), b"original-bytes").expect("original");
+    std::fs::write(media.join("FrankSherlock-MP4/clip__avi.mp4"), b"converted-bytes").expect("copy");
+
+    let root_id = db::list_roots(&db_file).expect("roots")[0].id;
+    let mut video = record(root_id, "a/clip.avi", 9);
+    video.media_type = "video".to_string();
+    video.video_codec = Some("mjpeg".to_string());
+    let id = db::upsert_file_record(&db_file, &video).expect("video");
+    db::upsert_video_conversion(
+        &db_file,
+        &db::VideoConversionRecord {
+            root_id,
+            file_id: id,
+            output_rel_path: "a/FrankSherlock-MP4/clip__avi.mp4",
+            source_mtime_ns: video.mtime_ns,
+            source_size_bytes: video.size_bytes,
+            output_size_bytes: 15,
+        },
+    )
+    .expect("conversion");
+
+    let (status, original) = get(&fixture.state, &format!("/api/media/{id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(original, b"original-bytes");
+
+    let (status, copy) = get(&fixture.state, &format!("/api/media/{id}?playback=web")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(copy, b"converted-bytes");
+
+    // A copy that vanished from the share falls back to the original.
+    std::fs::remove_file(media.join("FrankSherlock-MP4/clip__avi.mp4")).expect("remove copy");
+    let (status, fallback) = get(&fixture.state, &format!("/api/media/{id}?playback=web")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(fallback, b"original-bytes");
+}

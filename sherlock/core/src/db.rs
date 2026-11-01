@@ -482,6 +482,29 @@ fn run_migrations(conn: &mut Connection) -> AppResult<()> {
             ALTER TABLE files ADD COLUMN hidden_via_folder INTEGER NOT NULL DEFAULT 0;
             "#,
         ),
+        // Migration 25: browser-playable copies of videos.
+        //
+        // A separate table, and the copy is not an indexed file: it has the same content as
+        // its source, so indexing it would double every video in the library (and spend a
+        // second round of frame extraction and classification on it). The row records
+        // which copy stands in for which file, and the source's mtime/size at conversion
+        // time so an edited original is not served through a stale copy.
+        M::up(
+            r#"
+            CREATE TABLE IF NOT EXISTS video_conversions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                root_id INTEGER NOT NULL,
+                file_id INTEGER NOT NULL UNIQUE,
+                output_rel_path TEXT NOT NULL,
+                source_mtime_ns INTEGER NOT NULL,
+                source_size_bytes INTEGER NOT NULL,
+                output_size_bytes INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY (root_id) REFERENCES roots(id) ON DELETE CASCADE,
+                FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+            );
+            "#,
+        ),
     ]);
 
     migrations
@@ -1459,6 +1482,136 @@ pub fn delete_raw_conversion(db_path: &Path, root_id: i64, source_rel_path: &str
         params![root_id, source_rel_path],
     )?;
     Ok(())
+}
+
+/// One browser-playable copy of a video.
+#[derive(Debug, Clone)]
+pub struct VideoConversionRecord<'a> {
+    pub root_id: i64,
+    pub file_id: i64,
+    pub output_rel_path: &'a str,
+    pub source_mtime_ns: i64,
+    pub source_size_bytes: i64,
+    pub output_size_bytes: i64,
+}
+
+pub fn upsert_video_conversion(db_path: &Path, record: &VideoConversionRecord<'_>) -> AppResult<()> {
+    let conn = open_conn(db_path)?;
+    conn.execute(
+        "INSERT INTO video_conversions (
+             root_id, file_id, output_rel_path, source_mtime_ns,
+             source_size_bytes, output_size_bytes, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(file_id) DO UPDATE SET
+             root_id = excluded.root_id,
+             output_rel_path = excluded.output_rel_path,
+             source_mtime_ns = excluded.source_mtime_ns,
+             source_size_bytes = excluded.source_size_bytes,
+             output_size_bytes = excluded.output_size_bytes,
+             created_at = excluded.created_at",
+        params![
+            record.root_id,
+            record.file_id,
+            record.output_rel_path,
+            record.source_mtime_ns,
+            record.source_size_bytes,
+            record.output_size_bytes,
+            now_epoch_secs()
+        ],
+    )?;
+    Ok(())
+}
+
+/// Rel path of the copy that currently stands in for `file_id`, if it is still valid.
+///
+/// Valid means the original has the mtime and size it had when the copy was made. Errors
+/// (for instance a snapshot published before the table existed) read as "no copy": the
+/// web then serves the original, which is the behaviour it had before this feature.
+pub fn current_video_conversion(db_path: &Path, file_id: i64) -> Option<String> {
+    let conn = open_conn(db_path).ok()?;
+    conn.query_row(
+        "SELECT v.output_rel_path
+           FROM video_conversions v
+           JOIN files f ON f.id = v.file_id
+          WHERE v.file_id = ?1 AND f.deleted_at IS NULL
+            AND f.mtime_ns = v.source_mtime_ns AND f.size_bytes = v.source_size_bytes",
+        params![file_id],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+}
+
+pub fn delete_video_conversion(db_path: &Path, file_id: i64) -> AppResult<()> {
+    let conn = open_conn(db_path)?;
+    conn.execute(
+        "DELETE FROM video_conversions WHERE file_id = ?1",
+        params![file_id],
+    )?;
+    Ok(())
+}
+
+/// A video of a root that a browser cannot play and that has no valid copy yet.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoWebCandidate {
+    pub file_id: i64,
+    pub rel_path: String,
+    pub abs_path: String,
+    pub size_bytes: i64,
+    pub mtime_ns: i64,
+    pub duration_secs: f64,
+    pub video_codec: String,
+    pub audio_codec: Option<String>,
+    pub plan: crate::video_compat::WebPlan,
+}
+
+/// Videos of `root_id` that still need a browser-playable copy.
+pub fn list_video_web_candidates(db_path: &Path, root_id: i64) -> AppResult<Vec<VideoWebCandidate>> {
+    let conn = open_conn(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT f.id, f.rel_path, f.abs_path, f.size_bytes, f.mtime_ns, f.duration_secs,
+                f.video_codec, f.audio_codec
+           FROM files f
+           LEFT JOIN video_conversions v ON v.file_id = f.id
+                 AND v.source_mtime_ns = f.mtime_ns AND v.source_size_bytes = f.size_bytes
+          WHERE f.root_id = ?1 AND f.media_type = 'video'
+            AND f.deleted_at IS NULL AND f.hidden_at IS NULL
+            AND v.id IS NULL
+          ORDER BY f.rel_path",
+    )?;
+    let rows = stmt.query_map(params![root_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, Option<f64>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (file_id, rel_path, abs_path, size_bytes, mtime_ns, duration, video, audio) = row?;
+        let ext = rel_path.rsplit('.').next().unwrap_or("");
+        let Some(plan) = crate::video_compat::web_plan(ext, video.as_deref(), audio.as_deref())
+        else {
+            continue;
+        };
+        out.push(VideoWebCandidate {
+            file_id,
+            rel_path,
+            abs_path,
+            size_bytes,
+            mtime_ns,
+            duration_secs: duration.unwrap_or(0.0),
+            video_codec: video.unwrap_or_default(),
+            audio_codec: audio,
+            plan,
+        });
+    }
+    Ok(out)
 }
 
 /// Fill `source_format`/`source_rel_path` on a page of search results.
@@ -7427,6 +7580,69 @@ mod tests {
         assert!(sub.iter().all(|e| e.hidden));
     }
 
+    fn video_record(root_id: i64, rel: &str, fp: &str, video: &str, audio: Option<&str>) -> FileRecordUpsert {
+        let mut record = sample_record(root_id, rel, fp);
+        record.media_type = "video".to_string();
+        record.video_codec = Some(video.to_string());
+        record.audio_codec = audio.map(str::to_string);
+        record.duration_secs = Some(60.0);
+        record
+    }
+
+    #[test]
+    fn only_videos_a_browser_cannot_play_are_candidates() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/demo").expect("root");
+        upsert_file_record(&db_path, &video_record(root_id, "ok.mp4", "f1", "h264", Some("aac"))).expect("ok");
+        upsert_file_record(&db_path, &video_record(root_id, "Trip/hevc.mp4", "f2", "hevc", Some("aac"))).expect("hevc");
+        upsert_file_record(&db_path, &video_record(root_id, "old.avi", "f3", "mjpeg", Some("pcm_s16le"))).expect("avi");
+        let hidden = upsert_file_record(&db_path, &video_record(root_id, "hid.avi", "f4", "mjpeg", None)).expect("hid");
+        set_files_hidden(&db_path, &[hidden], true).expect("hide");
+        upsert_file_record(&db_path, &sample_record(root_id, "photo.jpg", "f5")).expect("photo");
+
+        let candidates = list_video_web_candidates(&db_path, root_id).expect("candidates");
+        let names: Vec<&str> = candidates.iter().map(|c| c.rel_path.as_str()).collect();
+        assert_eq!(names, vec!["Trip/hevc.mp4", "old.avi"]);
+    }
+
+    #[test]
+    fn a_conversion_is_served_until_the_original_changes() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/demo").expect("root");
+        let record = video_record(root_id, "clip.mov", "f1", "hevc", Some("aac"));
+        let id = upsert_file_record(&db_path, &record).expect("row");
+
+        assert!(current_video_conversion(&db_path, id).is_none());
+        upsert_video_conversion(
+            &db_path,
+            &VideoConversionRecord {
+                root_id,
+                file_id: id,
+                output_rel_path: "FrankSherlock-MP4/clip__mov.mp4",
+                source_mtime_ns: record.mtime_ns,
+                source_size_bytes: record.size_bytes,
+                output_size_bytes: 123,
+            },
+        )
+        .expect("record");
+        assert_eq!(
+            current_video_conversion(&db_path, id).as_deref(),
+            Some("FrankSherlock-MP4/clip__mov.mp4")
+        );
+        assert!(list_video_web_candidates(&db_path, root_id).expect("pending").is_empty());
+
+        // The original was edited: the copy is stale and the video is pending again.
+        let mut edited = record.clone();
+        edited.size_bytes += 1;
+        upsert_file_record(&db_path, &edited).expect("rescan");
+        assert!(current_video_conversion(&db_path, id).is_none());
+        assert_eq!(list_video_web_candidates(&db_path, root_id).expect("pending").len(), 1);
+
+        delete_video_conversion(&db_path, id).expect("delete");
+    }
+
     #[test]
     fn hiding_the_root_covers_every_file_now_and_later() {
         let (_dir, db_path) = test_db_path();
@@ -8727,11 +8943,11 @@ mod tests {
         init_database(&db_path).expect("init");
 
         let conn = open_conn(&db_path).expect("open");
-        // Verify user_version is set (24 migrations applied → version 24)
+        // Verify user_version is set (25 migrations applied → version 25)
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 24);
+        assert_eq!(version, 25);
 
         // Migration 19 records where a converted HEIC/NEF copy came from.
         let conversion_columns: Vec<String> = {
@@ -8823,8 +9039,8 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        // We have 24 migrations (indices 0..23), so user_version should be 24
-        assert_eq!(version, 24);
+        // We have 25 migrations (indices 0..24), so user_version should be 25
+        assert_eq!(version, 25);
     }
 
     /// A database written by a *newer* build is refused, never adopted silently.

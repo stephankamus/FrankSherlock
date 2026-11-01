@@ -33,12 +33,13 @@ type RootCardProps<TRoot extends RootInfo = RootInfo> = {
    * read-only session has no place to write them.
    */
   onConvertRaw?: () => void;
+  onConvertVideos?: () => void;
   onCancelScan?: () => void;
   onResumeScan?: () => void;
   onCancelFaceDetect?: () => void;
 };
 
-export default function RootCard<TRoot extends RootInfo = RootInfo>({ root, isSelected, scan, readOnly, faceProgress, backlogProgress, onSelect, onDelete, onRescan, onRefresh, onCopyPath, onRelink, onDetectFaces, faceDetection, onToggleFaceDetection, onReclassify, onSetHidden, onConvertRaw, onCancelScan, onResumeScan, onCancelFaceDetect }: RootCardProps<TRoot>) {
+export default function RootCard<TRoot extends RootInfo = RootInfo>({ root, isSelected, scan, readOnly, faceProgress, backlogProgress, onSelect, onDelete, onRescan, onRefresh, onCopyPath, onRelink, onDetectFaces, faceDetection, onToggleFaceDetection, onReclassify, onSetHidden, onConvertRaw, onConvertVideos, onCancelScan, onResumeScan, onCancelFaceDetect }: RootCardProps<TRoot>) {
   const [showMenu, setShowMenu] = useState(false);
   const [menuPos, setMenuPos] = useState({ x: 0, y: 0 });
   const menuRef = useRef<HTMLDivElement>(null);
@@ -313,6 +314,14 @@ export default function RootCard<TRoot extends RootInfo = RootInfo>({ root, isSe
               onClick={(e) => { e.stopPropagation(); onConvertRaw(); setShowMenu(false); }}
             >
               Convert HEIC/NEF…
+            </button>
+          )}
+          {onConvertVideos && (
+            <button
+              role="menuitem"
+              onClick={(e) => { e.stopPropagation(); onConvertVideos(); setShowMenu(false); }}
+            >
+              Convert videos for web…
             </button>
           )}
           <button role="menuitem" className="danger" onClick={(e) => { e.stopPropagation(); onDelete(); setShowMenu(false); }}>Remove</button>

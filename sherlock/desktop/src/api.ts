@@ -1,5 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  VideoConvertOptions,
+  VideoJobStatus,
+  VideoWebReport,
   Album,
   BacklogProgress,
   ClusterResult,
@@ -635,4 +638,23 @@ export async function setRepresentativeFace(personId: number, faceId: number): P
  */
 export async function readLogs(maxLines = 600): Promise<LogSnapshot> {
   return invoke<LogSnapshot>("read_logs", { maxLines });
+}
+
+export async function videoWebScan(rootId: number): Promise<VideoWebReport> {
+  return invoke<VideoWebReport>("video_web_scan", { rootId });
+}
+
+export async function startVideoConversion(
+  rootId: number,
+  options: VideoConvertOptions,
+): Promise<void> {
+  return invoke<void>("start_video_conversion", { rootId, options });
+}
+
+export async function cancelVideoConversion(): Promise<void> {
+  return invoke<void>("cancel_video_conversion");
+}
+
+export async function getVideoConversionStatus(): Promise<VideoJobStatus> {
+  return invoke<VideoJobStatus>("video_conversion_status");
 }

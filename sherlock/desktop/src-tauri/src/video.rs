@@ -19,7 +19,7 @@ fn ffprobe_path() -> Option<PathBuf> {
         .or_else(|| find_in_well_known_paths("ffprobe"))
 }
 
-fn ffmpeg_path() -> Option<PathBuf> {
+pub fn ffmpeg_path() -> Option<PathBuf> {
     which::which("ffmpeg")
         .ok()
         .or_else(|| find_in_well_known_paths("ffmpeg"))

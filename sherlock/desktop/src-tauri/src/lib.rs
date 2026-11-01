@@ -13,6 +13,7 @@ mod runtime;
 mod scan;
 mod thumbnail;
 mod video;
+mod video_convert;
 mod video_server;
 mod vision_estimate;
 mod vision_prep;
@@ -118,6 +119,9 @@ struct AppState {
     raw_jobs: Arc<Mutex<HashMap<i64, RawJobSlot>>>,
     /// Candidate list of the last scan, so the job does not walk the folder again.
     raw_scan_cache: Arc<Mutex<Option<RawScanCache>>>,
+    /// The single video-to-MP4 job (status polled by the modal) and its cancel flag.
+    video_job: Arc<Mutex<video_convert::VideoJobStatus>>,
+    video_cancel: Arc<AtomicBool>,
     /// Live counters of the producer/consumer pipeline (backlog, retry and the
     /// pipeline half of a `full`), polled by the sidebar.
     backlog_progress: Arc<Mutex<Option<models::BacklogProgress>>>,
@@ -961,6 +965,86 @@ fn start_raw_conversion(
     });
 
     Ok(job_id)
+}
+
+/// Report of the videos of a root a browser cannot play, with the cost of converting them.
+#[tauri::command]
+async fn video_web_scan(
+    root_id: i64,
+    state: State<'_, AppState>,
+) -> Result<video_convert::VideoWebReport, String> {
+    let db_path = state.paths.db_file.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let candidates =
+            db::list_video_web_candidates(&db_path, root_id).map_err(|e| e.to_string())?;
+        Ok(video_convert::build_report(&candidates, &video_convert::support()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn start_video_conversion(
+    root_id: i64,
+    options: Option<video_convert::ConvertOptions>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    require_writable(state.inner())?;
+    let root_path = root_path_by_id(state.inner(), root_id)?;
+    let root = config::canonical_root_path(&root_path).map_err(|e| e.to_string())?;
+    {
+        let mut status = state.video_job.lock().expect("video job mutex poisoned");
+        if status.running {
+            return Err("A video conversion is already running.".to_string());
+        }
+        *status = video_convert::VideoJobStatus {
+            running: true,
+            root_id,
+            started_at_ms: unix_now_ms(),
+            ..Default::default()
+        };
+    }
+    state.video_cancel.store(false, Ordering::Relaxed);
+    let options = options.unwrap_or_default();
+    let state_clone = state.inner().clone();
+    std::thread::spawn(move || {
+        let db_path = state_clone.paths.db_file.clone();
+        match db::list_video_web_candidates(&db_path, root_id) {
+            Ok(candidates) => video_convert::run_conversion(
+                &db_path,
+                root_id,
+                &root,
+                &candidates,
+                &options,
+                &state_clone.video_cancel,
+                &state_clone.video_job,
+            ),
+            Err(e) => {
+                if let Ok(mut s) = state_clone.video_job.lock() {
+                    s.running = false;
+                    s.fatal = Some(e.to_string());
+                }
+            }
+        }
+        if let Ok(mut s) = state_clone.video_job.lock() {
+            s.running = false;
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_video_conversion(state: State<'_, AppState>) -> Result<(), String> {
+    require_writable(state.inner())?;
+    state.video_cancel.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+#[tauri::command]
+fn video_conversion_status(
+    state: State<'_, AppState>,
+) -> Result<video_convert::VideoJobStatus, String> {
+    Ok(state.video_job.lock().expect("video job mutex poisoned").clone())
 }
 
 #[tauri::command]
@@ -3526,6 +3610,8 @@ pub fn run() {
         description_language_cancel: Arc::new(AtomicBool::new(false)),
         raw_jobs: Arc::new(Mutex::new(HashMap::new())),
         raw_scan_cache: Arc::new(Mutex::new(None)),
+        video_job: Arc::new(Mutex::new(video_convert::VideoJobStatus::default())),
+        video_cancel: Arc::new(AtomicBool::new(false)),
         backlog_progress: Arc::new(Mutex::new(None)),
         publish_progress: Arc::new(Mutex::new(None)),
         publish_report: Arc::new(Mutex::new(None)),
@@ -3584,6 +3670,10 @@ pub fn run() {
             provision_raw_support,
             start_raw_conversion,
             cancel_raw_conversion,
+            video_web_scan,
+            start_video_conversion,
+            cancel_video_conversion,
+            video_conversion_status,
             raw_conversion_status,
             raw_running_job,
             list_raw_conversions,

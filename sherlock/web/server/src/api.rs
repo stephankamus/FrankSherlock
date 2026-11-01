@@ -747,6 +747,10 @@ struct MediaParams {
     /// Width of the preview derivative. Absent, zero or garbage means the original.
     #[serde(default)]
     w: Option<String>,
+    /// `web` asks for the browser-playable copy of a video when one was made. Without it
+    /// the original is served, which is also what a download wants.
+    #[serde(default)]
+    playback: Option<String>,
 }
 
 async fn media(
@@ -793,6 +797,22 @@ async fn media(
             }
             if target.is_file() {
                 return serve_jpeg_file(&target, request.headers()).await;
+            }
+        }
+    }
+
+    let mut path = path;
+    if params.playback.as_deref() == Some("web") && row.media_type == "video" {
+        let db_path = snapshot.db_path.clone();
+        let copy = tokio::task::spawn_blocking(move || db::current_video_conversion(&db_path, id))
+            .await
+            .map_err(internal)?;
+        if let Some(copy_rel) = copy {
+            // A copy that cannot be reached falls back to the original, as before.
+            if let Ok(copy_path) = state.config.media_map.resolve(&root.path, &copy_rel) {
+                if copy_path.is_file() {
+                    path = copy_path;
+                }
             }
         }
     }

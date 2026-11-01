@@ -48,6 +48,7 @@ import ScanSummaryModal from "./components/modals/ScanSummaryModal";
 import ConfirmDeleteModal from "./components/modals/ConfirmDeleteModal";
 import ConfirmReclassifyModal from "./components/modals/ConfirmReclassifyModal";
 import RawConversionModal from "./components/modals/RawConversionModal";
+import VideoConversionModal from "./components/modals/VideoConversionModal";
 import ConfirmFileDeleteModal from "./components/modals/ConfirmFileDeleteModal";
 import RenameModal from "./components/modals/RenameModal";
 import EditMetadataModal from "./components/modals/EditMetadataModal";
@@ -117,6 +118,7 @@ export default function App() {
   const [confirmReclassifyRoot, setConfirmReclassifyRoot] = useState<RootInfo | null>(null);
   /** Root whose HEIC/NEF files are being converted into JPEG copies. */
   const [rawConvertRoot, setRawConvertRoot] = useState<RootInfo | null>(null);
+  const [videoConvertRoot, setVideoConvertRoot] = useState<RootInfo | null>(null);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
@@ -1153,6 +1155,13 @@ export default function App() {
           }}
         />
       )}
+      {videoConvertRoot && (
+        <VideoConversionModal
+          root={videoConvertRoot}
+          readOnly={readOnly}
+          onCancel={() => setVideoConvertRoot(null)}
+        />
+      )}
       {confirmDeleteRoot && (
         <ConfirmDeleteModal
           root={confirmDeleteRoot}
@@ -1299,6 +1308,7 @@ export default function App() {
           onDeleteRoot={(root) => setConfirmDeleteRoot(root)}
           onReclassifyRoot={(root) => setConfirmReclassifyRoot(root)}
           onConvertRawRoot={(root) => setRawConvertRoot(root)}
+          onConvertVideosRoot={(root) => setVideoConvertRoot(root)}
           onOpenSettings={() => setShowSettings(true)}
           onRescanRoot={(root) => scanManager.onRescanRoot(root, setup, readOnly)}
           onRefreshRoot={(root) => scanManager.onRefreshRoot(root, readOnly)}

@@ -173,8 +173,11 @@ export function createHttpLibraryClient(options: HttpLibraryClientOptions = {}):
     },
 
     async videoUrl(item) {
-      // The server answers `Range` itself, so the original URL is what a player needs.
-      return withToken(mediaUrlOf(item));
+      // The server answers `Range` itself. `playback=web` swaps in the browser-playable
+      // copy when the desktop made one for a codec the browser cannot decode.
+      const url = mediaUrlOf(item);
+      const separator = url.includes("?") ? "&" : "?";
+      return withToken(`${url}${separator}playback=web`);
     },
 
     faceCropUrl(face) {
