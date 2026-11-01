@@ -6,6 +6,8 @@ import type {
   Album,
   BacklogProgress,
   ClusterResult,
+  RefineOptions,
+  RefineResult,
   CompactResult,
   DbStats,
   DeleteFilesResult,
@@ -570,6 +572,10 @@ export async function cancelFaceDetect(): Promise<boolean> {
 }
 
 // ── Person / Clustering ─────────────────────────────────────────────
+
+export async function refinePeople(personIds: number[], options: RefineOptions): Promise<RefineResult> {
+  return invoke<RefineResult>("refine_people", { personIds, options });
+}
 
 export async function clusterFaces(): Promise<ClusterResult> {
   return invoke<ClusterResult>("cluster_faces");

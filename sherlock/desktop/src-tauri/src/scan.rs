@@ -980,7 +980,7 @@ fn run_scan_job_impl(
         // only, no model), and it must also run when the scan was cancelled: the faces
         // stored so far are already in the index.
         if outcome.faces > 0 {
-            match db::cluster_faces(db_path, crate::FACE_CLUSTER_THRESHOLD) {
+            match db::cluster_faces(db_path, crate::face_cluster_threshold()) {
                 Ok(result) => log::info!(
                     "Scan job {job_id}: grouped faces — {} new person(s), {} face(s) assigned",
                     result.new_persons,

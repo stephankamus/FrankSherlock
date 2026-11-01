@@ -135,6 +135,7 @@ export function toSettingsPayload(settings: VisionSettings): SettingsUpdatePaylo
     chainBacklog: settings.chainBacklog,
     faceDetection: settings.faceDetection,
     faceThreads: settings.faceThreads,
+    faceMatchThreshold: settings.faceMatchThreshold,
   };
 }
 
@@ -566,6 +567,29 @@ export default function SettingsModal({ onClose, onSaved, onOpenLogs }: Props) {
                 {threadPlan
                   ? ` Right now: ${threadPlan.budget} thread(s) as ${threadPlan.workers} session(s) of ${threadPlan.intraThreads}.`
                   : ""}
+              </span>
+            </div>
+
+            <div className="settings-field">
+              <label htmlFor="settings-face-match">
+                Face matching strictness ({settings.faceMatchThreshold}%)
+              </label>
+              <input
+                id="settings-face-match"
+                type="range"
+                min={10}
+                max={80}
+                step={1}
+                value={settings.faceMatchThreshold}
+                onChange={(e) => patch({ faceMatchThreshold: Number(e.target.value) })}
+              />
+              <span className="settings-hint">
+                How alike two faces must look to be grouped as the same person. Higher is
+                stricter: fewer different people get merged, but one person may be split
+                into several (use Merge to join them). Default 30%; around 45–55% works
+                better when too many people were recognized as the same one. Applies to the
+                next scan, grouping or Re-cluster; use “Re-analyze faces” on people that
+                were already grouped.
               </span>
             </div>
 

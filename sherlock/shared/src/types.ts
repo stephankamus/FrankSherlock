@@ -282,6 +282,23 @@ export type FaceInfo = {
   cropPath?: string | null;
 };
 
+/** How strictly a second pass regroups the faces of the chosen people. */
+export type RefineOptions = {
+  threshold: number;
+  minConfidence: number;
+  minFacePx: number;
+  minGroupSize: number;
+  matchExisting: boolean;
+};
+
+export type RefineResult = {
+  peopleProcessed: number;
+  facesExamined: number;
+  newPersons: number;
+  matchedFaces: number;
+  keptFaces: number;
+};
+
 /** What a clustering pass produced. */
 export type ClusterResult = {
   newPersons: number;

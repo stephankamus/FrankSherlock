@@ -6432,6 +6432,218 @@ pub fn recluster_faces_with_progress(
 
 /// Faces the next grouping pass would look at: good enough to cluster, no person yet,
 /// and not already tried. Hidden and deleted photos do not count.
+/// Second pass over the faces of the given people (typically ignored ones that lumped many
+/// individuals together): regroup them with a stricter threshold, fit each regrouped set into
+/// an existing visible person when it matches, otherwise give it a new person.
+/// A visible source keeps its largest set; an ignored source keeps only what is left over.
+pub fn refine_people(
+    db_path: &Path,
+    person_ids: &[i64],
+    opts: &crate::models::RefineOptions,
+) -> AppResult<crate::models::RefineResult> {
+    let mut result = crate::models::RefineResult::default();
+    if person_ids.is_empty() {
+        return Ok(result);
+    }
+    let conn = open_conn(db_path)?;
+    let tx = conn.unchecked_transaction()?;
+    let now = now_epoch_secs();
+
+    struct Face {
+        id: i64,
+        file_id: i64,
+        confidence: f32,
+        embedding: Vec<f32>,
+    }
+    struct Group {
+        faces: Vec<usize>,
+        files: std::collections::HashSet<i64>,
+        sum: Vec<f32>,
+        centroid: Vec<f32>,
+    }
+    struct Target {
+        person_id: i64,
+        centroid: Vec<f32>,
+        files: std::collections::HashSet<i64>,
+    }
+
+    let load_faces = |pid: i64, eligible_only: bool| -> AppResult<Vec<Face>> {
+        let mut stmt = tx.prepare(
+            "SELECT id, file_id, confidence, embedding FROM face_detections
+             WHERE person_id = ?1 AND (?2 = 0 OR (confidence >= ?3 AND bbox_w >= ?4 AND bbox_h >= ?4))",
+        )?;
+        let rows = stmt.query_map(
+            params![pid, eligible_only as i64, opts.min_confidence, opts.min_face_px],
+            |row| {
+                let blob: Vec<u8> = row.get(3)?;
+                let mut embedding = crate::face::blob_to_embedding(&blob);
+                l2_normalize(&mut embedding);
+                Ok(Face { id: row.get(0)?, file_id: row.get(1)?, confidence: row.get(2)?, embedding })
+            },
+        )?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    };
+
+    let sources: std::collections::HashSet<i64> = person_ids.iter().copied().collect();
+    let mut targets: Vec<Target> = Vec::new();
+    if opts.match_existing {
+        let visible: Vec<i64> = {
+            let mut stmt = tx.prepare("SELECT id FROM people WHERE ignored_at IS NULL")?;
+            let ids = stmt.query_map([], |r| r.get::<_, i64>(0))?.filter_map(|r| r.ok()).collect();
+            ids
+        };
+        for pid in visible.into_iter().filter(|id| !sources.contains(id)) {
+            let faces = load_faces(pid, false)?;
+            if faces.is_empty() {
+                continue;
+            }
+            let embeddings: Vec<Vec<f32>> = faces.iter().map(|f| f.embedding.clone()).collect();
+            targets.push(Target {
+                person_id: pid,
+                centroid: compute_centroid(&embeddings),
+                files: faces.iter().map(|f| f.file_id).collect(),
+            });
+        }
+    }
+
+    let move_faces = |ids: &[i64], pid: i64| -> AppResult<()> {
+        let mut stmt =
+            tx.prepare("UPDATE face_detections SET person_id = ?1, clustered_at = ?2 WHERE id = ?3")?;
+        for id in ids {
+            stmt.execute(params![pid, now, id])?;
+        }
+        Ok(())
+    };
+
+    for &source_id in person_ids {
+        let ignored: bool = match tx.query_row(
+            "SELECT ignored_at IS NOT NULL FROM people WHERE id = ?1",
+            params![source_id],
+            |r| r.get(0),
+        ) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let total: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM face_detections WHERE person_id = ?1",
+            params![source_id],
+            |r| r.get(0),
+        )?;
+        let faces = load_faces(source_id, true)?;
+        result.people_processed += 1;
+        result.faces_examined += total as u64;
+        if faces.len() < 2 {
+            result.kept_faces += total as u64;
+            continue;
+        }
+
+        let mut order: Vec<usize> = (0..faces.len()).collect();
+        order.sort_by(|&a, &b| {
+            faces[b]
+                .confidence
+                .partial_cmp(&faces[a].confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Leader pass, then two passes that reassign every face to the closest centroid.
+        let mut groups: Vec<Group> = Vec::new();
+        for pass in 0..3 {
+            let mut next: Vec<Group> = groups
+                .iter()
+                .map(|g| Group {
+                    faces: Vec::new(),
+                    files: std::collections::HashSet::new(),
+                    sum: vec![0.0; g.centroid.len()],
+                    centroid: g.centroid.clone(),
+                })
+                .collect();
+            for &fi in &order {
+                let f = &faces[fi];
+                let mut best: Option<(usize, f32)> = None;
+                for (gi, g) in next.iter().enumerate() {
+                    if g.files.contains(&f.file_id) {
+                        continue;
+                    }
+                    let sim = dot(&f.embedding, &g.centroid);
+                    if sim >= opts.threshold && best.map_or(true, |(_, b)| sim > b) {
+                        best = Some((gi, sim));
+                    }
+                }
+                let gi = match best {
+                    Some((gi, _)) => gi,
+                    None => {
+                        next.push(Group {
+                            faces: Vec::new(),
+                            files: std::collections::HashSet::new(),
+                            sum: vec![0.0; f.embedding.len()],
+                            centroid: f.embedding.clone(),
+                        });
+                        next.len() - 1
+                    }
+                };
+                let g = &mut next[gi];
+                g.faces.push(fi);
+                g.files.insert(f.file_id);
+                for (s, v) in g.sum.iter_mut().zip(f.embedding.iter()) {
+                    *s += v;
+                }
+                if pass == 0 {
+                    // The leader pass tracks the running mean so later faces compare against it.
+                    g.centroid = g.sum.clone();
+                    l2_normalize(&mut g.centroid);
+                }
+            }
+            next.retain(|g| !g.faces.is_empty());
+            for g in next.iter_mut() {
+                g.centroid = g.sum.clone();
+                l2_normalize(&mut g.centroid);
+            }
+            groups = next;
+        }
+        groups.sort_by(|a, b| b.faces.len().cmp(&a.faces.len()));
+
+        let mut moved = 0i64;
+        for (rank, g) in groups.iter().enumerate() {
+            if g.faces.len() < opts.min_group_size.max(1) || (!ignored && rank == 0) {
+                continue;
+            }
+            let ids: Vec<i64> = g.faces.iter().map(|&i| faces[i].id).collect();
+            let matched = targets
+                .iter_mut()
+                .filter(|t| t.files.is_disjoint(&g.files))
+                .map(|t| (dot(&g.centroid, &t.centroid), t))
+                .filter(|(sim, _)| *sim >= opts.threshold)
+                .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            if let Some((_, t)) = matched {
+                move_faces(&ids, t.person_id)?;
+                t.files.extend(g.files.iter().copied());
+                refresh_person_representative(&tx, t.person_id)?;
+                result.matched_faces += ids.len() as u64;
+            } else {
+                tx.execute("INSERT INTO people (name, created_at) VALUES ('', ?1)", params![now])?;
+                let new_id = tx.last_insert_rowid();
+                tx.execute(
+                    "UPDATE people SET name = ?1 WHERE id = ?2",
+                    params![format!("Person {new_id}"), new_id],
+                )?;
+                move_faces(&ids, new_id)?;
+                refresh_person_representative(&tx, new_id)?;
+                targets.push(Target {
+                    person_id: new_id,
+                    centroid: g.centroid.clone(),
+                    files: g.files.clone(),
+                });
+                result.new_persons += 1;
+            }
+            moved += ids.len() as i64;
+        }
+        result.kept_faces += (total - moved) as u64;
+        cleanup_person_after_face_removal(&tx, source_id)?;
+    }
+    tx.commit()?;
+    Ok(result)
+}
+
 pub fn unclustered_face_count(db_path: &Path) -> AppResult<u64> {
     let conn = open_conn(db_path)?;
     let count: i64 = conn.query_row(
@@ -11089,6 +11301,66 @@ mod tests {
         cluster_faces(&db_path, 0.45).expect("cluster");
         assert_eq!(list_persons(&db_path, &[]).expect("list").len(), 2);
         assert_eq!(list_ignored_persons(&db_path, &[]).expect("ignored")[0].face_count, 2);
+    }
+
+    #[test]
+    fn refine_people_splits_a_lumped_person_and_matches_existing() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/refine").expect("root");
+        let axis_emb = |axis: usize, noise: f32| -> Vec<f32> {
+            (0..512)
+                .map(|i| if i == axis { 1.0 } else if i == 2 { noise } else { 0.0 })
+                .collect()
+        };
+        let mut face_ids = Vec::new();
+        for (n, axis) in [0usize, 0, 0, 1, 1, 1, 0].iter().enumerate() {
+            let rel = format!("r{n}.jpg");
+            upsert_file_record(&db_path, &sample_record(root_id, &rel, &format!("fp-r{n}"))).expect("file");
+            let fid = file_id_by_path(&db_path, root_id, &rel);
+            face_ids.push(insert_test_face(&db_path, fid, &axis_emb(*axis, 0.05 * n as f32)));
+        }
+        // Faces 0..6 are lumped into one ignored person; face 6 is a visible person on axis 0.
+        let lumped;
+        {
+            let conn = open_conn(&db_path).expect("conn");
+            conn.execute("INSERT INTO people (name, created_at) VALUES ('Lumped', 1)", []).expect("person");
+            lumped = conn.last_insert_rowid();
+            conn.execute("INSERT INTO people (name, created_at) VALUES ('Visible', 1)", []).expect("person");
+            let visible_id = conn.last_insert_rowid();
+            conn.execute(
+                "UPDATE face_detections SET person_id = ?1 WHERE id = ?2",
+                params![visible_id, face_ids[6]],
+            )
+            .expect("assign");
+            conn.execute(
+                "UPDATE face_detections SET person_id = ?1 WHERE id != ?2",
+                params![lumped, face_ids[6]],
+            )
+            .expect("lump");
+        }
+        set_persons_ignored(&db_path, &[lumped], true).expect("ignore");
+        let visible = list_persons(&db_path, &[]).expect("list");
+        assert_eq!(visible.len(), 1);
+
+        let opts = crate::models::RefineOptions {
+            threshold: 0.6,
+            min_confidence: 0.5,
+            min_face_px: 20.0,
+            min_group_size: 2,
+            match_existing: true,
+        };
+        let res = refine_people(&db_path, &[lumped], &opts).expect("refine");
+        assert_eq!(res.matched_faces, 3);
+        assert_eq!(res.new_persons, 1);
+        assert_eq!(res.kept_faces, 0);
+
+        assert!(list_ignored_persons(&db_path, &[]).expect("ignored").is_empty());
+        let after = list_persons(&db_path, &[]).expect("list");
+        assert_eq!(after.len(), 2);
+        let mut counts: Vec<u32> = after.iter().map(|p| p.face_count as u32).collect();
+        counts.sort();
+        assert_eq!(counts, vec![3, 4]);
     }
 
     #[test]

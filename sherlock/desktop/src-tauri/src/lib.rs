@@ -47,7 +47,12 @@ use tauri::State;
 ///
 /// Lives here until it becomes a setting: the value was hardcoded in two places (this
 /// file and the tests) and the clustering pass now has to read the same one.
-const FACE_CLUSTER_THRESHOLD: f32 = 0.30;
+/// The grouping similarity chosen in the settings (`face_match_threshold`).
+pub(crate) fn face_cluster_threshold() -> f32 {
+    config::load_runtime_settings()
+        .map(|settings| settings.face_cluster_threshold())
+        .unwrap_or(config::DEFAULT_FACE_MATCH_THRESHOLD as f32 / 100.0)
+}
 
 #[derive(Debug, Clone)]
 struct ModelSelection {
@@ -2351,7 +2356,7 @@ async fn cluster_faces(state: State<'_, AppState>) -> Result<models::ClusterResu
     let db_path = state.paths.db_file.clone();
     let worker_arc = progress_arc.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        db::cluster_faces_with_progress(&db_path, FACE_CLUSTER_THRESHOLD, &|step| {
+        db::cluster_faces_with_progress(&db_path, face_cluster_threshold(), &|step| {
             *worker_arc.lock().expect("recluster progress mutex poisoned") =
                 Some(clustering_progress(step));
         })
@@ -2505,7 +2510,7 @@ fn run_recluster(
         });
     }
 
-    let result = db::recluster_faces_with_progress(db_path, 0.30, &|step| {
+    let result = db::recluster_faces_with_progress(db_path, face_cluster_threshold(), &|step| {
         *progress_arc.lock().expect("recluster progress mutex") = Some(clustering_progress(step));
     })?;
     log::info!(
@@ -2614,6 +2619,20 @@ fn list_faces_for_person(
 fn unassign_face_from_person(face_id: i64, state: State<'_, AppState>) -> Result<(), String> {
     require_writable(&state)?;
     db::unassign_face_from_person(&state.paths.db_file, face_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn refine_people(
+    person_ids: Vec<i64>,
+    options: models::RefineOptions,
+    state: State<'_, AppState>,
+) -> Result<models::RefineResult, String> {
+    require_writable(&state)?;
+    let db_path = state.paths.db_file.clone();
+    tauri::async_runtime::spawn_blocking(move || db::refine_people(&db_path, &person_ids, &options))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2867,7 +2886,7 @@ fn run_face_detection(
 
     // Auto-cluster faces into person groups
     if faces_found > 0 {
-        match db::cluster_faces(db_path, FACE_CLUSTER_THRESHOLD) {
+        match db::cluster_faces(db_path, face_cluster_threshold()) {
             Ok(result) => {
                 log::info!(
                     "Face clustering: {} new persons, {} faces assigned",
@@ -3750,6 +3769,7 @@ pub fn run() {
             list_faces_for_person,
             unassign_face_from_person,
             reassign_faces_to_person,
+            refine_people,
             set_representative_face
         ])
         .run(tauri::generate_context!())

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { invoke } from "@tauri-apps/api/core";
 import FacesView from "../../components/Content/FacesView";
@@ -749,6 +749,46 @@ describe("FacesView", () => {
         expect(mockedInvoke).toHaveBeenCalledWith("set_persons_ignored", {
           personIds: [2],
           ignored: false,
+        });
+      });
+    });
+
+    it("offers only visible people as Move to targets inside an ignored person", async () => {
+      mockedInvoke.mockImplementation(async (cmd: string) => {
+        if (cmd === "list_persons") return [mockPerson];
+        if (cmd === "list_ignored_persons") return [mockPerson2];
+        if (cmd === "list_faces_for_person") return [mockFace1, mockFace2];
+        return null;
+      });
+      render(<FacesView {...defaultProps} />);
+      await userEvent.click(await screen.findByRole("button", { name: "Ignored people (1)" }));
+      await userEvent.click((await screen.findByText("Alice")).closest(".faces-card")!);
+      const card = (await screen.findByText("face_a.jpg")).closest(".faces-detail-card")!;
+      await userEvent.click(card);
+      fireEvent.contextMenu(card);
+
+      const menu = await screen.findByTestId("detail-context-menu");
+      expect(within(menu).getByText(/Person 1/)).toBeInTheDocument();
+      expect(within(menu).queryByText(/Alice/)).not.toBeInTheDocument();
+    });
+
+    it("re-analyzes a person with the chosen options", async () => {
+      await openMenu([mockPerson], [mockPerson2]);
+
+      await userEvent.click(screen.getByRole("button", { name: "Re-analyze faces..." }));
+      await userEvent.click(screen.getByRole("radio", { name: /Very strict/ }));
+      await userEvent.click(screen.getByRole("button", { name: "Re-analyze" }));
+
+      await waitFor(() => {
+        expect(mockedInvoke).toHaveBeenCalledWith("refine_people", {
+          personIds: [1],
+          options: {
+            threshold: 0.65,
+            minConfidence: 0.65,
+            minFacePx: 40,
+            minGroupSize: 2,
+            matchExisting: true,
+          },
         });
       });
     });

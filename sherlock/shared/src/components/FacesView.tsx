@@ -3,8 +3,9 @@ import { useEffect, useState, useRef, useCallback } from "react";
 import { useContextMenuClose } from "../hooks/useContextMenuClose";
 import { useSelection } from "../hooks/useSelection";
 import FacesProgress from "./FacesProgress";
+import RefineFacesModal from "./RefineFacesModal";
 import SelectionBar from "./SelectionBar";
-import type { FaceInfo, PersonInfo, ReclusterProgress } from "../types";
+import type { FaceInfo, PersonInfo, ReclusterProgress, RefineOptions, RefineResult } from "../types";
 import { useLibrary } from "../useLibrary";
 import "./tools.css";
 import "./faces.css";
@@ -34,6 +35,8 @@ export type FacesActions = {
   listIgnoredPeople(): Promise<PersonInfo[]>;
   /** Hide every photo the person appears in; resolves with how many photos changed. */
   hidePhotos(personId: number): Promise<number>;
+  /** Regroup the faces of these people with a stricter threshold (see `RefineOptions`). */
+  refinePeople(personIds: number[], options: RefineOptions): Promise<RefineResult>;
 };
 
 type Props = {
@@ -69,8 +72,12 @@ export default function FacesView({
   const canEdit = library.capabilities.write && actions != null;
 
   const [persons, setPersons] = useState<PersonInfo[]>([]);
+  // Visible people, kept even while the ignored list is shown: they are the only valid "Move to" targets.
+  const [activePeople, setActivePeople] = useState<PersonInfo[]>([]);
   const [showIgnored, setShowIgnored] = useState(false);
   const [ignoredCount, setIgnoredCount] = useState(0);
+  const [refineTargets, setRefineTargets] = useState<PersonInfo[] | null>(null);
+  const [refining, setRefining] = useState(false);
   const [loading, setLoading] = useState(true);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editValue, setEditValue] = useState("");
@@ -130,6 +137,9 @@ export default function FacesView({
       .then(setPersons)
       .catch(() => {})
       .finally(() => setLoading(false));
+    if (showIgnored) {
+      library.listPeople().then(setActivePeople).catch(() => {});
+    }
     if (actions && library.capabilities.write) {
       actions
         .listIgnoredPeople()
@@ -379,7 +389,7 @@ export default function FacesView({
     setDetailContextMenu(null);
     try {
       await actions.reassignFaces(faceIds, targetPersonId);
-      const targetPerson = persons.find((p) => p.id === targetPersonId);
+      const targetPerson = (showIgnored ? activePeople : persons).find((p) => p.id === targetPersonId);
       onNotice(`Moved ${faceIds.length} face(s) to ${targetPerson?.name ?? "person"}`);
       applyFaceRemoval(faceIds, targetPersonId);
     } catch (err) {
@@ -513,6 +523,30 @@ export default function FacesView({
     }
   }
 
+  async function handleRefine(options: RefineOptions) {
+    if (!actions || !refineTargets) return;
+    setRefining(true);
+    try {
+      const r = await actions.refinePeople(refineTargets.map((p) => p.id), options);
+      const matched = r.matchedFaces > 0 ? `, ${r.matchedFaces} matched to existing people` : "";
+      onNotice(
+        `Re-analyzed ${r.facesExamined} faces: ${r.newPersons} new ${r.newPersons === 1 ? "person" : "people"}${matched}, ${r.keptFaces} unchanged`,
+      );
+      setRefineTargets(null);
+      personClear();
+      loadPersons();
+    } catch (err) {
+      onError(String(err));
+    } finally {
+      setRefining(false);
+    }
+  }
+
+  function openRefine(targets: PersonInfo[]) {
+    setContextMenuState(null);
+    setRefineTargets(targets);
+  }
+
   async function handleBulkIgnore() {
     if (!actions || personSelected.size === 0) return;
     const chosen = persons.filter((_, i) => personSelected.has(i));
@@ -616,6 +650,13 @@ export default function FacesView({
         >
           View photos
         </button>
+        <button
+          type="button"
+          className="context-menu-item"
+          onClick={() => openRefine([contextMenu.person])}
+        >
+          Re-analyze faces...
+        </button>
         {showIgnored ? (
           <button
             type="button"
@@ -684,7 +725,8 @@ export default function FacesView({
 
   function renderDetailContextMenu() {
     if (!canEdit || !detailContextMenu || !selectedPerson) return null;
-    const otherPersons = persons.filter((p) => p.id !== selectedPerson.id);
+    const targets = showIgnored ? activePeople : persons;
+    const otherPersons = targets.filter((p) => p.id !== selectedPerson.id);
     return (
       <div
         className="context-menu"
@@ -807,6 +849,14 @@ export default function FacesView({
             {showIgnored ? "Back to People" : `Ignored people (${ignoredCount})`}
           </button>
         )}
+        {canEdit && personSelected.size > 0 && (
+          <button
+            type="button"
+            onClick={() => openRefine(persons.filter((_, i) => personSelected.has(i)))}
+          >
+            {`Re-analyze (${personSelected.size})`}
+          </button>
+        )}
         {canEdit && !showIgnored && (
           <button
             type="button"
@@ -915,6 +965,14 @@ export default function FacesView({
       </div>
 
       {renderPersonGridContextMenu()}
+      {refineTargets && (
+        <RefineFacesModal
+          peopleNames={refineTargets.map((p) => p.name)}
+          busy={refining}
+          onConfirm={handleRefine}
+          onClose={() => setRefineTargets(null)}
+        />
+      )}
     </div>
   );
 }

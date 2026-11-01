@@ -14,6 +14,7 @@ import {
   mergePersons,
   reassignFacesToPerson,
   reclusterFaces,
+  refinePeople,
   renamePerson,
   setPersonsIgnored,
   setRepresentativeFace,
@@ -47,6 +48,7 @@ const desktopFacesActions: FacesActions = {
     return persons.map((person) => ({ ...person, cropUrl: assetUrl(person.cropPath) }));
   },
   hidePhotos: hidePersonFiles,
+  refinePeople,
 };
 
 type Props = Omit<ComponentProps<typeof SharedFacesView>, "actions">;

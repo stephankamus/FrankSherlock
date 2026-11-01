@@ -32,6 +32,7 @@ const settings: VisionSettings = {
   chainBacklog: true,
   faceDetection: false,
   faceThreads: 0,
+  faceMatchThreshold: 30,
 };
 
 const models: VisionModelOption[] = [

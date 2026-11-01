@@ -58,6 +58,7 @@ const settings: VisionSettings = {
   chainBacklog: true,
   faceDetection: false,
   faceThreads: 0,
+  faceMatchThreshold: 30,
 };
 
 describe("SettingsModal", () => {
@@ -188,6 +189,7 @@ describe("SettingsModal", () => {
         chainBacklog: false,
         faceDetection: false,
         faceThreads: 0,
+        faceMatchThreshold: 30,
       }),
     );
     expect(onSaved).toHaveBeenCalled();

@@ -692,6 +692,34 @@ pub struct PersonInfo {
     pub thumbnail_path: Option<String>,
 }
 
+/// How strictly `refine_people` regroups the faces of people that were lumped together.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefineOptions {
+    /// Cosine similarity a face must reach with a group's centroid to join it.
+    pub threshold: f32,
+    /// Faces below this detector confidence are left where they are.
+    pub min_confidence: f32,
+    /// Faces whose box is smaller than this (pixels) are left where they are.
+    pub min_face_px: f32,
+    /// Regrouped sets smaller than this stay with the original person.
+    pub min_group_size: usize,
+    /// Try to fit each regrouped set into an existing visible person first.
+    pub match_existing: bool,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefineResult {
+    pub people_processed: u64,
+    pub faces_examined: u64,
+    pub new_persons: u64,
+    /// Faces moved into people that already existed.
+    pub matched_faces: u64,
+    /// Faces that stayed with their original person.
+    pub kept_faces: u64,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterResult {

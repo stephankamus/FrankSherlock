@@ -466,6 +466,7 @@ describe("App - API integration on init", () => {
       chainBacklog: true,
       faceDetection: false,
       faceThreads: 0,
+      faceMatchThreshold: 30,
     });
     mockInitApp.mockResolvedValueOnce(initResult({
       roots: [mockRoot],
@@ -498,6 +499,7 @@ describe("App - API integration on init", () => {
       chainBacklog: true,
       faceDetection: false,
       faceThreads: 0,
+      faceMatchThreshold: 30,
     });
     mockInitApp.mockResolvedValueOnce(initResult({ roots: [mockRoot] }));
     renderApp();
@@ -531,6 +533,7 @@ describe("App - API integration on init", () => {
       chainBacklog: true,
       faceDetection: false,
       faceThreads: 0,
+      faceMatchThreshold: 30,
     });
     mockInitApp.mockResolvedValueOnce(initResult({ roots: [mockRoot] }));
     renderApp();

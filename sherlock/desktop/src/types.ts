@@ -11,6 +11,8 @@ import type {
   ParsedQuery as SharedParsedQuery,
   PersonInfo as SharedPersonInfo,
   ReclusterProgress as SharedReclusterProgress,
+  RefineOptions as SharedRefineOptions,
+  RefineResult as SharedRefineResult,
   RootInfo as SharedRootInfo,
   ScanJobStatus as SharedScanJobStatus,
   SearchItem as SharedSearchItem,
@@ -365,6 +367,10 @@ export type PersonInfo = SharedPersonInfo;
 
 export type ClusterResult = SharedClusterResult;
 
+export type RefineOptions = SharedRefineOptions;
+
+export type RefineResult = SharedRefineResult;
+
 export type FaceInfo = SharedFaceInfo;
 
 export type ReclusterProgress = SharedReclusterProgress;
@@ -469,6 +475,8 @@ export type VisionSettings = {
    * thread and the rest belongs to the vision model.
    */
   faceThreads: number;
+  /** Similarity (percent, 10-80) two faces need to be grouped as one person; higher is stricter. */
+  faceMatchThreshold: number;
 };
 
 /** What `faceThreads` resolves to on this machine. */
@@ -501,6 +509,7 @@ export type SettingsUpdatePayload = {
   chainBacklog: boolean;
   faceDetection: boolean;
   faceThreads: number;
+  faceMatchThreshold: number;
 };
 
 export type VisionModelOption = {

@@ -252,12 +252,27 @@ face_detection = false
 # something else. Each worker carries its own copy of the models (~180 MB), so the
 # engine starts at most 8 of them.
 face_threads = 0
+
+# How alike two faces must look to be grouped as the same person, in percent
+# (cosine similarity x 100, 10..=80). Higher = stricter: fewer different people end up
+# merged, at the cost of splitting one person into several (which "Merge" fixes).
+# Applies to the grouping that follows a scan and to Re-cluster.
+face_match_threshold = 30
 "#;
 
 /// Default longest-side for images sent to the vision model.
 pub const DEFAULT_IMAGE_MAX_SIDE: u32 = 1024;
 /// Default Hamming distance used to fold near-duplicate photos (`0` = off).
 pub const DEFAULT_DEDUPE_DHASH_DISTANCE: u32 = 6;
+
+/// Default, floor and ceiling of `face_match_threshold` (percent).
+pub const DEFAULT_FACE_MATCH_THRESHOLD: u32 = 30;
+pub const MIN_FACE_MATCH_THRESHOLD: u32 = 10;
+pub const MAX_FACE_MATCH_THRESHOLD: u32 = 80;
+
+fn default_face_match_threshold() -> u32 {
+    DEFAULT_FACE_MATCH_THRESHOLD
+}
 /// Upper bound accepted from `settings.toml`; beyond this bursts collapse.
 pub const MAX_DEDUPE_DHASH_DISTANCE: u32 = 16;
 /// Default resampler for the image handed to the model.
@@ -535,6 +550,8 @@ pub struct RuntimeSettings {
     /// faces left (GPU idle) is allowed the whole budget. Lower it when the machine is
     /// busy with something else.
     pub face_threads: u32,
+    /// Similarity (percent) two faces need to be grouped as one person; higher is stricter.
+    pub face_match_threshold: u32,
 }
 
 impl Default for RuntimeSettings {
@@ -553,6 +570,7 @@ impl Default for RuntimeSettings {
             chain_backlog: true,
             face_detection: false,
             face_threads: 0,
+            face_match_threshold: DEFAULT_FACE_MATCH_THRESHOLD,
         }
     }
 }
@@ -586,6 +604,8 @@ pub struct SettingsUpdate {
     pub chain_backlog: bool,
     pub face_detection: bool,
     pub face_threads: u32,
+    #[serde(default = "default_face_match_threshold")]
+    pub face_match_threshold: u32,
 }
 
 impl RuntimeSettings {
@@ -641,7 +661,17 @@ impl RuntimeSettings {
         self.chain_backlog = update.chain_backlog;
         self.face_detection = update.face_detection;
         self.face_threads = Self::normalize_face_threads(update.face_threads);
+        self.face_match_threshold = Self::normalize_face_match_threshold(update.face_match_threshold);
         Ok(())
+    }
+
+    pub fn normalize_face_match_threshold(value: u32) -> u32 {
+        value.clamp(MIN_FACE_MATCH_THRESHOLD, MAX_FACE_MATCH_THRESHOLD)
+    }
+
+    /// The cosine similarity the face grouping works with.
+    pub fn face_cluster_threshold(&self) -> f32 {
+        Self::normalize_face_match_threshold(self.face_match_threshold) as f32 / 100.0
     }
 
     /// `0` keeps "all cores"; anything else is clamped to the supported ceiling.
@@ -839,6 +869,19 @@ fn parse_runtime_settings(data: &str) -> AppResult<RuntimeSettings> {
                     ),
                 }
             }
+            "face_match_threshold" => {
+                let parsed = parse_settings_string(value.trim())?;
+                match parsed.trim().parse::<u32>() {
+                    Ok(v) => {
+                        settings.face_match_threshold = RuntimeSettings::normalize_face_match_threshold(v)
+                    }
+                    Err(_) => log::warn!(
+                        "settings.toml: ignoring face_match_threshold '{parsed}' (expected: {}..={})",
+                        MIN_FACE_MATCH_THRESHOLD,
+                        MAX_FACE_MATCH_THRESHOLD
+                    ),
+                }
+            }
             _ => {}
         }
     }
@@ -869,6 +912,7 @@ pub fn save_runtime_settings(settings: &RuntimeSettings) -> AppResult<()> {
         "chain_backlog",
         "face_detection",
         "face_threads",
+        "face_match_threshold",
     ];
 
     let model_line = match &settings.model_override {
@@ -950,6 +994,13 @@ pub fn save_runtime_settings(settings: &RuntimeSettings) -> AppResult<()> {
         format!(
             "face_threads = {}",
             RuntimeSettings::normalize_face_threads(settings.face_threads)
+        ),
+    );
+    replacements.insert(
+        "face_match_threshold",
+        format!(
+            "face_match_threshold = {}",
+            RuntimeSettings::normalize_face_match_threshold(settings.face_match_threshold)
         ),
     );
 
@@ -1331,6 +1382,7 @@ mod tests {
             chain_backlog: false,
             face_detection: true,
             face_threads: 6,
+            face_match_threshold: 55,
         }
     }
 
@@ -1401,6 +1453,7 @@ mod tests {
             chain_backlog: false,
             face_detection: true,
             face_threads: 6,
+            face_match_threshold: 55,
         };
         save_runtime_settings(&settings).expect("save");
 
