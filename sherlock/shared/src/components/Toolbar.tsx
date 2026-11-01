@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 
 import type { SortField, SortOrder } from "../types";
+import PeopleFilter from "./PeopleFilter";
 import "./library.css";
 
 type Props = {
@@ -20,6 +21,8 @@ type Props = {
   onIncludeHiddenChange?: (value: boolean) => void;
   /** How many rows are hidden in the current scope, for the toggle label. */
   hiddenCount?: number;
+  /** Show the People selector. It needs a `LibraryProvider` above the toolbar. */
+  showPeopleFilter?: boolean;
 };
 
 const sortOptions: { value: SortField; label: string; icon: JSX.Element; requiresQuery?: boolean }[] = [
@@ -44,7 +47,7 @@ const sortOptions: { value: SortField; label: string; icon: JSX.Element; require
 export default function Toolbar({
   query, onQueryChange, selectedMediaType, onMediaTypeChange, mediaTypeOptions,
   sortBy, onSortByChange, sortOrder, onSortOrderChange, hasTextQuery, onSaveSmartFolder,
-  includeHidden = false, onIncludeHiddenChange, hiddenCount = 0,
+  includeHidden = false, onIncludeHiddenChange, hiddenCount = 0, showPeopleFilter = false,
 }: Props) {
   useEffect(() => {
     if (!hasTextQuery && sortBy === "relevance") {
@@ -95,6 +98,7 @@ export default function Toolbar({
           <span>{includeHidden ? "hidden on" : `hidden ${hiddenCount}`}</span>
         </button>
       )}
+      {showPeopleFilter && <PeopleFilter query={query} onQueryChange={onQueryChange} />}
       <select
         value={selectedMediaType}
         onChange={(e) => onMediaTypeChange(e.target.value)}

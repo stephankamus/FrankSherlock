@@ -289,6 +289,7 @@ export default function App() {
                 sortOrder={sortOrder}
                 onSortOrderChange={setSortOrder}
                 hasTextQuery={query.trim().length > 0}
+                showPeopleFilter
               />
               <ResultsMeta
                 count={search.items.length}
@@ -330,9 +331,9 @@ export default function App() {
           {mode === "faces" && (
             <FacesView
               onBack={() => setMode("library")}
-              onSelectPerson={(personId, personName) => {
+              onSelectPerson={(personId) => {
                 setMode("library");
-                setQuery(personName ? `face:"${personName}"` : `face:${personId}`);
+                setQuery(`face:${personId}`);
               }}
               onPreviewFile={(ids) => { void previewFileIds(ids); }}
               onNotice={setNotice}

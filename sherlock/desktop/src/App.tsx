@@ -1380,9 +1380,9 @@ export default function App() {
         {faces.facesMode ? (
           <FacesView
             onBack={() => faces.setFacesMode(false)}
-            onSelectPerson={(personId, personName) => {
+            onSelectPerson={(personId) => {
               faces.setFacesMode(false);
-              setQuery(personName ? `face:"${personName}"` : `face:${personId}`);
+              setQuery(`face:${personId}`);
             }}
             onPreviewFile={async (fileIds) => {
               try {

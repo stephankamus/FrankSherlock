@@ -605,6 +605,17 @@ export default function FacesView({
         onMouseDown={(e) => e.stopPropagation()}
         data-testid="faces-context-menu"
       >
+        <button
+          type="button"
+          className="context-menu-item"
+          onClick={() => {
+            const person = contextMenu.person;
+            setContextMenuState(null);
+            onSelectPerson(person.id, person.name);
+          }}
+        >
+          View photos
+        </button>
         {showIgnored ? (
           <button
             type="button"

@@ -673,6 +673,14 @@ describe("FacesView", () => {
       expect(mockedInvoke).not.toHaveBeenCalledWith("merge_persons", expect.anything());
     });
 
+    it("opens the photos of a person from the context menu", async () => {
+      await openMenu([mockPerson, mockPerson2]);
+
+      await userEvent.click(screen.getByRole("button", { name: "View photos" }));
+
+      expect(defaultProps.onSelectPerson).toHaveBeenCalledWith(1, "Person 1");
+    });
+
     it("ignores a person", async () => {
       await openMenu([mockPerson, mockPerson2]);
 

@@ -68,6 +68,7 @@ export default function Content({
         includeHidden={includeHidden}
         onIncludeHiddenChange={onIncludeHiddenChange}
         hiddenCount={hiddenCount}
+        showPeopleFilter
       />
 
       <div className="content-body">
