@@ -10,7 +10,7 @@ Este repositório é um fork de uso pessoal do [FrankSherlock](https://github.co
 
 As principais mudanças em relação ao projeto original são: pipeline de scan com um único decode por foto gerando miniatura e imagem de visão, sobreposição de CPU e GPU no backlog, cache de miniaturas por raiz com auto-cura e deduplicação por dHash, otimizações no request de visão (downscale, `num_ctx` derivado da imagem e prompt curto), conversão opcional de HEIC/NEF para JPEG, endurecimento de shares de rede (raízes offline, relink e compactação do banco), descrições em português, fotos ocultas, visualizador de logs ao vivo, prompt de retomada ao abrir uma pasta já indexada e — a maior adição — uma publicação de snapshot imutável com um cliente web somente leitura (PWA) com login por token, para abrir a biblioteca no celular ou em outra máquina sem GPU.
 
-Não pretendo publicar releases nem acompanhar o updater do repositório de origem: as alterações locais seriam sobrescritas. Por isso o botão **Check for Updates** fica oculto na interface. O plugin do updater continua no código para o dia em que este fork tiver o próprio canal de atualização. A versão atual deste fork é **0.9.0**.
+Não pretendo publicar releases nem acompanhar o updater do repositório de origem: as alterações locais seriam sobrescritas. Por isso o botão **Check for Updates** fica oculto na interface. O plugin do updater continua no código para o dia em que este fork tiver o próprio canal de atualização. A versão atual deste fork é **0.9.5**.
 
 ## About this fork (EN-US)
 
@@ -18,7 +18,7 @@ This repository is a personal-use fork of [FrankSherlock](https://github.com/aki
 
 The main changes over the original project are: a scan pipeline that decodes each photo once to produce both the thumbnail and the vision image, CPU/GPU overlap in the backlog pass, a per-root thumbnail cache with self-healing and dHash deduplication, faster vision requests (downscale, image-derived `num_ctx` and a short prompt), opt-in HEIC/NEF to JPEG conversion, network-share hardening (offline roots, relink and database compaction), Portuguese descriptions, hidden photos, a live log viewer, a startup prompt when opening an already indexed folder, and — the largest addition — immutable snapshot publishing with a read-only web client (PWA) and token login, so the library opens on a phone or on another machine without a GPU.
 
-I do not intend to publish releases or follow the upstream updater: local changes would be overwritten. For that reason the **Check for Updates** button is hidden in the UI. The updater plugin stays in the code for the day this fork gets its own update channel. The current version of this fork is **0.9.0**.
+I do not intend to publish releases or follow the upstream updater: local changes would be overwritten. For that reason the **Check for Updates** button is hidden in the UI. The updater plugin stays in the code for the day this fork gets its own update channel. The current version of this fork is **0.9.5**.
 
 ---
 

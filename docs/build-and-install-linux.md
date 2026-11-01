@@ -44,14 +44,14 @@ sherlock/desktop/src-tauri/target/release/bundle/deb/frank_sherlock_<version>_am
 sherlock/desktop/src-tauri/target/release/bundle/appimage/frank_sherlock_<version>_amd64.AppImage
 ```
 
-Reference sizes for 0.9.0: 42 MB deb (118 MB installed) and 97 MB AppImage. Both contain the binary, `libonnxruntime.so`, `libpdfium.so` and `surya_ocr.py`.
+Reference sizes for 0.9.0 (indicative for later versions): 42 MB deb (118 MB installed) and 97 MB AppImage. Both contain the binary, `libonnxruntime.so`, `libpdfium.so` and `surya_ocr.py`.
 
 Inspect before installing:
 
 ```bash
 B=sherlock/desktop/src-tauri/target/release/bundle
-dpkg-deb -I "$B/deb/frank_sherlock_0.9.0_amd64.deb" | sed -n '1,15p'
-dpkg-deb -c "$B/deb/frank_sherlock_0.9.0_amd64.deb" | grep -E "usr/bin|\.desktop|surya_ocr|libpdfium"
+dpkg-deb -I "$B/deb/frank_sherlock_0.9.5_amd64.deb" | sed -n '1,15p'
+dpkg-deb -c "$B/deb/frank_sherlock_0.9.5_amd64.deb" | grep -E "usr/bin|\.desktop|surya_ocr|libpdfium"
 ```
 
 ## 4. Install
@@ -60,7 +60,7 @@ dpkg-deb -c "$B/deb/frank_sherlock_0.9.0_amd64.deb" | grep -E "usr/bin|\.desktop
 
 ```bash
 cd ~/repos/FrankSherlock
-sudo apt install ./sherlock/desktop/src-tauri/target/release/bundle/deb/frank_sherlock_0.9.0_amd64.deb
+sudo apt install ./sherlock/desktop/src-tauri/target/release/bundle/deb/frank_sherlock_0.9.5_amd64.deb
 ```
 
 `apt` resolves the declared dependencies (`libwebkit2gtk-4.1-0`, `libgtk-3-0`); `dpkg -i` alone would not. Launch from Activities as **Frank Sherlock**, or run `sherlock_app`.
@@ -76,8 +76,8 @@ Reinstalling a newer build: run the same `apt install ./file.deb`; apt upgrades 
 ### AppImage
 
 ```bash
-chmod +x sherlock/desktop/src-tauri/target/release/bundle/appimage/frank_sherlock_0.9.0_amd64.AppImage
-./sherlock/desktop/src-tauri/target/release/bundle/appimage/frank_sherlock_0.9.0_amd64.AppImage
+chmod +x sherlock/desktop/src-tauri/target/release/bundle/appimage/frank_sherlock_0.9.5_amd64.AppImage
+./sherlock/desktop/src-tauri/target/release/bundle/appimage/frank_sherlock_0.9.5_amd64.AppImage
 ```
 
 If FUSE is unavailable, run it with `--appimage-extract-and-run`.
@@ -105,7 +105,7 @@ FRANK_SHERLOCK_DATA_DIR=/tmp/frank-build-test sherlock_app
 
 ## 6. Fork-specific notes
 
-- **Version.** This fork is versioned independently: `0.9.0` in [`tauri.conf.json`](../sherlock/desktop/src-tauri/tauri.conf.json). Tauri uses that field for the bundle name and the version shown by the app, so bump it for every local release and keep the matching [`releases/`](../releases) note next to it.
+- **Version.** This fork is versioned independently: `0.9.5` in [`tauri.conf.json`](../sherlock/desktop/src-tauri/tauri.conf.json). Tauri uses that field for the bundle name and the version shown by the app, so bump it for every local release and keep the matching [`releases/`](../releases) note next to it.
 - **Updater endpoint.** [`tauri.conf.json`](../sherlock/desktop/src-tauri/tauri.conf.json) still points the updater at `akitaonrails/FrankSherlock`, but the sidebar **Check for Updates** button is hidden by `SHOW_UPDATE_CONTROLS = false` in [`App.tsx`](../sherlock/desktop/src/App.tsx). Do not trigger an upstream update over a local build until this fork has its own feed.
 - **Release signing.** Building `.sig` files requires `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`; that is why local builds disable updater artifacts. Only GitHub Actions sets them (see [`.github/workflows/release.yml`](../.github/workflows/release.yml)).
 
