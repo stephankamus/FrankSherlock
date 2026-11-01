@@ -2230,8 +2230,44 @@ fn get_unclustered_face_count(state: State<'_, AppState>) -> Result<u64, String>
 }
 
 #[tauri::command]
-fn cluster_faces(state: State<'_, AppState>) -> Result<models::ClusterResult, String> {
-    db::cluster_faces(&state.paths.db_file, FACE_CLUSTER_THRESHOLD).map_err(|e| e.to_string())
+async fn cluster_faces(state: State<'_, AppState>) -> Result<models::ClusterResult, String> {
+    // The same slot the re-cluster uses, so the screen can show the progress of this run
+    // and the two never overlap. A synchronous command would run on the UI thread.
+    let progress_arc = state.recluster_progress.clone();
+    {
+        let mut progress = progress_arc.lock().expect("recluster progress mutex poisoned");
+        if progress.is_some() {
+            return Err("Face grouping is already running".to_string());
+        }
+        *progress = Some(clustering_progress(db::ClusterStep {
+            stage: "assigning",
+            processed: 0,
+            total: 0,
+        }));
+    }
+    let db_path = state.paths.db_file.clone();
+    let worker_arc = progress_arc.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        db::cluster_faces_with_progress(&db_path, FACE_CLUSTER_THRESHOLD, &|step| {
+            *worker_arc.lock().expect("recluster progress mutex poisoned") =
+                Some(clustering_progress(step));
+        })
+    })
+    .await;
+    *progress_arc.lock().expect("recluster progress mutex poisoned") = None;
+    result
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+fn clustering_progress(step: db::ClusterStep) -> models::ReclusterProgress {
+    models::ReclusterProgress {
+        phase: "clustering".into(),
+        stage: step.stage.into(),
+        total: step.total,
+        processed: step.processed,
+        result: None,
+    }
 }
 
 /// What `face_threads` resolves to on this machine.
@@ -2326,6 +2362,7 @@ fn run_recluster(
             let mut progress = progress_arc.lock().expect("recluster progress mutex");
             *progress = Some(models::ReclusterProgress {
                 phase: "crops".into(),
+                stage: String::new(),
                 total: total_crops,
                 processed: 0,
                 result: None,
@@ -2358,13 +2395,16 @@ fn run_recluster(
         let mut progress = progress_arc.lock().expect("recluster progress mutex");
         *progress = Some(models::ReclusterProgress {
             phase: "clustering".into(),
+            stage: "assigning".into(),
             total: 0,
             processed: 0,
             result: None,
         });
     }
 
-    let result = db::recluster_faces(db_path, 0.30)?;
+    let result = db::recluster_faces_with_progress(db_path, 0.30, &|step| {
+        *progress_arc.lock().expect("recluster progress mutex") = Some(clustering_progress(step));
+    })?;
     log::info!(
         "Re-clustering complete: {} persons, {} faces assigned",
         result.new_persons,
@@ -2376,6 +2416,7 @@ fn run_recluster(
         let mut progress = progress_arc.lock().expect("recluster progress mutex");
         *progress = Some(models::ReclusterProgress {
             phase: "done".into(),
+            stage: String::new(),
             total: 0,
             processed: 0,
             result: Some(result),

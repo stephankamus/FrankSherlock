@@ -721,6 +721,10 @@ pub struct ReclusterProgress {
     /// `"crops"` while regenerating missing crops, `"clustering"` during assignment + merge,
     /// `"done"` when finished (briefly, before clearing).
     pub phase: String,
+    /// While `phase` is `"clustering"`: `"assigning"`, `"comparing"`, `"merging"` or
+    /// `"pruning"`. Empty otherwise.
+    pub stage: String,
+    /// Size of the current step; 0 when it is not known up front.
     pub total: u64,
     pub processed: u64,
     /// Populated once clustering finishes.

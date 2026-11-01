@@ -287,6 +287,9 @@ export type ClusterResult = {
 /** Live progress of a re-cluster run (desktop-only operation, shared shape). */
 export type ReclusterProgress = {
   phase: "crops" | "clustering" | "done";
+  /** While clustering: which step of the grouping the run is in. */
+  stage: "" | "assigning" | "comparing" | "merging" | "pruning";
+  /** Size of the current step; 0 when it is not known up front. */
   total: number;
   processed: number;
   result: ClusterResult | null;

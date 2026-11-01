@@ -20,6 +20,7 @@ export { default as DirectoryTree } from "./components/DirectoryTree";
 export { default as DuplicatesView } from "./components/DuplicatesView";
 export { default as FacesView } from "./components/FacesView";
 export type { FacesActions } from "./components/FacesView";
+export { estimateRemainingSeconds, formatDuration } from "./components/FacesProgress";
 export { default as PreviewModal } from "./components/PreviewModal";
 export { default as RootCard } from "./components/RootCard";
 export { default as Sidebar } from "./components/Sidebar";

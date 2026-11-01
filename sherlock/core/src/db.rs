@@ -5494,6 +5494,12 @@ fn l2_normalize(v: &mut [f32]) {
     }
 }
 
+/// Dot product; equals the cosine similarity for the L2-normalized vectors the
+/// clustering works with, without recomputing both norms on every comparison.
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
 fn compute_centroid(embeddings: &[Vec<f32>]) -> Vec<f32> {
     if embeddings.is_empty() {
         return Vec::new();
@@ -5513,7 +5519,26 @@ fn compute_centroid(embeddings: &[Vec<f32>]) -> Vec<f32> {
     mean
 }
 
+/// Where a grouping pass is, for the progress bar. `total` is 0 when the size of the
+/// step is not known up front (the merge loop only knows what it has merged so far).
+#[derive(Debug, Clone, Copy)]
+pub struct ClusterStep {
+    /// `"assigning"`, `"comparing"`, `"merging"` or `"pruning"`.
+    pub stage: &'static str,
+    pub processed: u64,
+    pub total: u64,
+}
+
 pub fn cluster_faces(db_path: &Path, threshold: f32) -> AppResult<crate::models::ClusterResult> {
+    cluster_faces_with_progress(db_path, threshold, &|_| {})
+}
+
+/// `on_step` may be called from several threads and often; keep it cheap.
+pub fn cluster_faces_with_progress(
+    db_path: &Path,
+    threshold: f32,
+    on_step: &(dyn Fn(ClusterStep) + Sync),
+) -> AppResult<crate::models::ClusterResult> {
     let conn = open_conn(db_path)?;
     let now = now_epoch_secs();
 
@@ -5527,19 +5552,25 @@ pub fn cluster_faces(db_path: &Path, threshold: f32) -> AppResult<crate::models:
         embedding: Vec<f32>,
         file_id: i64,
         person_id: Option<i64>,
+        pending: bool,
     }
     let mut all_faces: Vec<FaceRecord> = {
         let mut stmt = conn.prepare(
-            "SELECT id, embedding, file_id, person_id FROM face_detections
+            "SELECT id, embedding, file_id, person_id, clustered_at IS NULL FROM face_detections
              WHERE confidence >= ?1 AND bbox_w >= ?2 AND bbox_h >= ?2",
         )?;
         let rows = stmt.query_map(params![MIN_CONFIDENCE, MIN_BBOX_DIM], |row| {
             let blob: Vec<u8> = row.get(1)?;
             Ok(FaceRecord {
                 id: row.get(0)?,
-                embedding: crate::face::blob_to_embedding(&blob),
+                embedding: {
+                    let mut e = crate::face::blob_to_embedding(&blob);
+                    l2_normalize(&mut e);
+                    e
+                },
                 file_id: row.get(2)?,
                 person_id: row.get(3)?,
+                pending: row.get(4)?,
             })
         })?;
         let result: Vec<FaceRecord> = rows.filter_map(|r| r.ok()).collect();
@@ -5619,11 +5650,27 @@ pub fn cluster_faces(db_path: &Path, threshold: f32) -> AppResult<crate::models:
 
     let mut new_persons = 0u64;
     let mut assigned_faces = 0u64;
+    // People that gained a face in this run: the only ones the merge and outlier passes
+    // have to look at, since every other pair was already judged by an earlier run.
+    // A person holding a face no pass has looked at yet counts as well.
+    let mut touched: std::collections::HashSet<i64> = all_faces
+        .iter()
+        .filter(|f| f.pending)
+        .filter_map(|f| f.person_id)
+        .collect();
 
     let mut update_stmt =
         conn.prepare("UPDATE face_detections SET person_id = ?1 WHERE id = ?2")?;
 
-    for &face_id in &unassigned_ids {
+    // One transaction for the whole assignment: a commit per face dominated the run.
+    // An early `?` drops the connection, which rolls the open transaction back.
+    conn.execute_batch("BEGIN")?;
+    let assign_total = unassigned_ids.len() as u64;
+    on_step(ClusterStep { stage: "assigning", processed: 0, total: assign_total });
+    for (done, &face_id) in unassigned_ids.iter().enumerate() {
+        if done % 100 == 0 {
+            on_step(ClusterStep { stage: "assigning", processed: done as u64, total: assign_total });
+        }
         let idx = face_idx[&face_id];
         // Copy needed fields to avoid borrowing all_faces across mutation
         let face_embedding = all_faces[idx].embedding.clone();
@@ -5636,7 +5683,7 @@ pub fn cluster_faces(db_path: &Path, threshold: f32) -> AppResult<crate::models:
             if c.file_ids.contains(&face_file_id) {
                 continue;
             }
-            let sim = crate::face::cosine_similarity(&face_embedding, &c.centroid);
+            let sim = dot(&face_embedding, &c.centroid);
             if sim > best_sim {
                 best_sim = sim;
                 best_person_id = Some(c.person_id);
@@ -5648,6 +5695,7 @@ pub fn cluster_faces(db_path: &Path, threshold: f32) -> AppResult<crate::models:
             update_stmt.execute(params![pid, face_id])?;
             assigned_faces += 1;
             all_faces[idx].person_id = Some(pid);
+            touched.insert(pid);
 
             if let Some(c) = centroids.iter_mut().find(|c| c.person_id == pid) {
                 let new_count = c.count + 1;
@@ -5669,6 +5717,7 @@ pub fn cluster_faces(db_path: &Path, threshold: f32) -> AppResult<crate::models:
             new_persons += 1;
             assigned_faces += 1;
             all_faces[idx].person_id = Some(new_pid);
+            touched.insert(new_pid);
 
             let mut file_ids = std::collections::HashSet::new();
             file_ids.insert(face_file_id);
@@ -5681,36 +5730,39 @@ pub fn cluster_faces(db_path: &Path, threshold: f32) -> AppResult<crate::models:
         }
     }
     drop(update_stmt);
+    conn.execute_batch("COMMIT")?;
 
     // ── Merge pass: count-gated linkage ──
     let merge_threshold = threshold * 0.85;
 
-    // Build per-person embedding lists from in-memory data (no re-query)
     struct PersonEmbeddings {
-        person_id: i64,
         face_ids: Vec<i64>,
         embeddings: Vec<Vec<f32>>,
         file_ids: std::collections::HashSet<i64>,
+        /// Normalized mean of the embeddings, for the cheap pre-filter in `merge_score`.
+        centroid: Vec<f32>,
     }
-    let mut person_embs: Vec<PersonEmbeddings> = Vec::new();
-    {
-        let mut pmap: std::collections::HashMap<i64, PersonEmbeddings> =
-            std::collections::HashMap::new();
-        for f in all_faces.iter() {
-            if let Some(pid) = f.person_id {
-                let entry = pmap.entry(pid).or_insert_with(|| PersonEmbeddings {
-                    person_id: pid,
-                    face_ids: Vec::new(),
-                    embeddings: Vec::new(),
-                    file_ids: std::collections::HashSet::new(),
-                });
-                entry.face_ids.push(f.id);
-                entry.embeddings.push(f.embedding.clone());
-                entry.file_ids.insert(f.file_id);
-            }
+    let mut people: std::collections::BTreeMap<i64, PersonEmbeddings> =
+        std::collections::BTreeMap::new();
+    for f in all_faces.iter() {
+        if let Some(pid) = f.person_id {
+            let entry = people.entry(pid).or_insert_with(|| PersonEmbeddings {
+                face_ids: Vec::new(),
+                embeddings: Vec::new(),
+                file_ids: std::collections::HashSet::new(),
+                centroid: Vec::new(),
+            });
+            entry.face_ids.push(f.id);
+            entry.embeddings.push(f.embedding.clone());
+            entry.file_ids.insert(f.file_id);
         }
-        person_embs.extend(pmap.into_values());
     }
+    for pe in people.values_mut() {
+        pe.centroid = compute_centroid(&pe.embeddings);
+    }
+
+    /// Fraction of the merge threshold two centroids must reach before their faces are compared.
+    const CENTROID_PREFILTER: f32 = 0.5;
 
     fn min_matching_pairs(a: usize, b: usize) -> usize {
         let smaller = a.min(b);
@@ -5723,65 +5775,156 @@ pub fn cluster_faces(db_path: &Path, threshold: f32) -> AppResult<crate::models:
         }
     }
 
-    loop {
-        let mut merge_pair: Option<(usize, usize)> = None;
-        let mut best_merge_score = 0.0f32;
-
-        for i in 0..person_embs.len() {
-            for j in (i + 1)..person_embs.len() {
-                if ignored_people.contains(&person_embs[i].person_id)
-                    != ignored_people.contains(&person_embs[j].person_id)
-                {
-                    continue;
-                }
-                if !person_embs[i]
-                    .file_ids
-                    .is_disjoint(&person_embs[j].file_ids)
-                {
-                    continue;
-                }
-
-                let n_a = person_embs[i].embeddings.len();
-                let n_b = person_embs[j].embeddings.len();
-                let required = min_matching_pairs(n_a, n_b);
-
-                let mut matching_count = 0usize;
-                let mut best_sim = 0.0f32;
-                for ea in &person_embs[i].embeddings {
-                    for eb in &person_embs[j].embeddings {
-                        let sim = crate::face::cosine_similarity(ea, eb);
-                        if sim >= merge_threshold {
-                            matching_count += 1;
-                        }
-                        if sim > best_sim {
-                            best_sim = sim;
-                        }
+    // Centroid similarity when the two people qualify for a merge.
+    fn merge_score(
+        a: &PersonEmbeddings,
+        b: &PersonEmbeddings,
+        merge_threshold: f32,
+    ) -> Option<f32> {
+        if !a.file_ids.is_disjoint(&b.file_ids) {
+            return None;
+        }
+        // Two people that share enough face pairs above the threshold have centroids
+        // that point the same way; comparing every pair of faces for the rest is what
+        // made the pass quadratic in the number of faces.
+        let centroid_sim = dot(&a.centroid, &b.centroid);
+        if centroid_sim < merge_threshold * CENTROID_PREFILTER {
+            return None;
+        }
+        let required = min_matching_pairs(a.embeddings.len(), b.embeddings.len());
+        let mut matching = 0usize;
+        for ea in &a.embeddings {
+            for eb in &b.embeddings {
+                if dot(ea, eb) >= merge_threshold {
+                    matching += 1;
+                    if matching >= required {
+                        // Stop at the first proof: big clusters would otherwise be
+                        // compared face by face on every merge. The centroids rank
+                        // the candidates instead of the single best pair.
+                        return Some(centroid_sim);
                     }
-                }
-
-                if matching_count >= required && best_sim > best_merge_score {
-                    best_merge_score = best_sim;
-                    merge_pair = Some((i, j));
                 }
             }
         }
+        None
+    }
 
-        let Some((i, j)) = merge_pair else {
+    // Scores of every qualifying pair with at least one person in `rows`, computed on
+    // all cores: this is the only quadratic part of the grouping.
+    // `all_rows` is true when `rows` is every touched person: a pair of two of them is
+    // then seen from both sides and only the higher id's row keeps it.
+    let score_rows = |rows: &[i64],
+                      people: &std::collections::BTreeMap<i64, PersonEmbeddings>,
+                      all_rows: bool,
+                      on_row: &(dyn Fn() + Sync)|
+     -> Vec<(f32, i64, i64)> {
+        if rows.is_empty() {
+            return Vec::new();
+        }
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let ignored = &ignored_people;
+        let others: Vec<(i64, &PersonEmbeddings)> = people.iter().map(|(k, v)| (*k, v)).collect();
+        let score_against = |a: i64, candidates: &[(i64, &PersonEmbeddings)]| {
+            let pa = &people[&a];
+            let mut found = Vec::new();
+            for &(b, pb) in candidates {
+                if b == a || (all_rows && b < a) {
+                    continue;
+                }
+                if ignored.contains(&a) != ignored.contains(&b) {
+                    continue;
+                }
+                if let Some(score) = merge_score(pa, pb, merge_threshold) {
+                    found.push((score, a.min(b), a.max(b)));
+                }
+            }
+            found
+        };
+        std::thread::scope(|scope| {
+            // Few rows (one merged person): split the people they are compared with.
+            if rows.len() < cores {
+                let chunk = others.len().div_ceil(cores).max(1);
+                let handles: Vec<_> = rows
+                    .iter()
+                    .flat_map(|&a| {
+                        others.chunks(chunk).map(move |part| (a, part))
+                    })
+                    .map(|(a, part)| scope.spawn(move || score_against(a, part)))
+                    .collect();
+                let found = handles
+                    .into_iter()
+                    .flat_map(|h| h.join().unwrap_or_default())
+                    .collect();
+                for _ in rows {
+                    on_row();
+                }
+                return found;
+            }
+            let chunk = rows.len().div_ceil(cores);
+            let handles: Vec<_> = rows
+                .chunks(chunk)
+                .map(|part| {
+                    let others = &others;
+                    scope.spawn(move || {
+                        let mut found = Vec::new();
+                        for &a in part {
+                            found.extend(score_against(a, others));
+                            on_row();
+                        }
+                        found
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap_or_default())
+                .collect()
+        })
+    };
+
+    let initial_rows: Vec<i64> = people.keys().copied().filter(|id| touched.contains(id)).collect();
+    let compared = std::sync::atomic::AtomicU64::new(0);
+    let compare_total = initial_rows.len() as u64;
+    on_step(ClusterStep { stage: "comparing", processed: 0, total: compare_total });
+    let mut candidates = score_rows(&initial_rows, &people, true, &|| {
+        let done = compared.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if done % 8 == 0 || done == compare_total {
+            on_step(ClusterStep { stage: "comparing", processed: done, total: compare_total });
+        }
+    });
+    let mut merged = 0u64;
+    // Merges and pruning are thousands of tiny writes; one commit instead of one each.
+    conn.execute_batch("BEGIN")?;
+
+    loop {
+        // Highest score first; ties go to the lowest ids so a run is reproducible.
+        let best = candidates
+            .iter()
+            .enumerate()
+            .max_by(|(_, x), (_, y)| {
+                x.0.partial_cmp(&y.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then((y.1, y.2).cmp(&(x.1, x.2)))
+            })
+            .map(|(i, c)| (i, *c));
+        let Some((best_idx, (score, lo, hi))) = best else {
             break;
         };
+        candidates.swap_remove(best_idx);
 
-        let target_pid = person_embs[i].person_id;
-        let source_pid = person_embs[j].person_id;
-        let n_a = person_embs[i].embeddings.len();
-        let n_b = person_embs[j].embeddings.len();
+        // Keep the person the user named; otherwise the older one.
+        let name_of = |id: i64| -> String {
+            conn.query_row("SELECT name FROM people WHERE id = ?1", params![id], |r| r.get(0))
+                .unwrap_or_default()
+        };
+        let (target_pid, source_pid) =
+            if is_default_person_name(&name_of(lo)) && !is_default_person_name(&name_of(hi)) {
+                (hi, lo)
+            } else {
+                (lo, hi)
+            };
         log::info!(
-            "Merging person {} ({} faces) into person {} ({} faces) (best sim: {:.3}, required {} pairs)",
-            source_pid,
-            n_b,
-            target_pid,
-            n_a,
-            best_merge_score,
-            min_matching_pairs(n_a, n_b)
+            "Merging person {source_pid} into person {target_pid} (best sim: {score:.3})"
         );
 
         conn.execute(
@@ -5790,53 +5933,61 @@ pub fn cluster_faces(db_path: &Path, threshold: f32) -> AppResult<crate::models:
         )?;
         conn.execute("DELETE FROM people WHERE id = ?1", params![source_pid])?;
 
-        // Update in-memory person_id for merged faces
-        for fid in &person_embs[j].face_ids {
-            if let Some(&idx) = face_idx.get(fid) {
-                all_faces[idx].person_id = Some(target_pid);
-            }
+        let removed = people.remove(&source_pid).expect("merged person is tracked");
+        if let Some(target) = people.get_mut(&target_pid) {
+            target.face_ids.extend(removed.face_ids);
+            target.embeddings.extend(removed.embeddings);
+            target.file_ids.extend(removed.file_ids);
+            target.centroid = compute_centroid(&target.embeddings);
         }
+        touched.insert(target_pid);
+        touched.remove(&source_pid);
 
-        let removed = person_embs.remove(j);
-        person_embs[i].face_ids.extend(removed.face_ids);
-        person_embs[i].embeddings.extend(removed.embeddings);
-        person_embs[i].file_ids.extend(removed.file_ids);
+        // Only the merged person changed, so only its row of scores is stale.
+        candidates.retain(|c| c.1 != target_pid && c.2 != target_pid && c.1 != source_pid && c.2 != source_pid);
+        candidates.extend(score_rows(&[target_pid], &people, false, &|| {}));
+        merged += 1;
+        on_step(ClusterStep { stage: "merging", processed: merged, total: 0 });
     }
 
     // ── Outlier pruning: average-neighbor similarity ──
     const OUTLIER_AVG_THRESHOLD: f32 = 0.20;
-    {
-        for pe in &person_embs {
-            let n = pe.embeddings.len();
-            if n < 3 || ignored_people.contains(&pe.person_id) {
-                continue;
-            }
-            let mut to_prune = Vec::new();
-            for (idx, emb) in pe.embeddings.iter().enumerate() {
-                let mut sim_sum = 0.0f32;
-                for (jdx, other_emb) in pe.embeddings.iter().enumerate() {
-                    if idx == jdx {
-                        continue;
-                    }
-                    sim_sum += crate::face::cosine_similarity(emb, other_emb);
-                }
-                let avg_sim = sim_sum / (n - 1) as f32;
-                if avg_sim < OUTLIER_AVG_THRESHOLD {
-                    to_prune.push((pe.face_ids[idx], avg_sim));
-                }
-            }
-            for (face_id, avg_sim) in &to_prune {
-                conn.execute(
-                    "UPDATE face_detections SET person_id = NULL WHERE id = ?1",
-                    params![face_id],
-                )?;
-                log::info!(
-                    "Pruned outlier face {face_id} from person {} (avg neighbor sim: {avg_sim:.3})",
-                    pe.person_id
-                );
+    let prune_total = people.len() as u64;
+    for (done, (pid, pe)) in people.iter().enumerate() {
+        if done % 50 == 0 {
+            on_step(ClusterStep { stage: "pruning", processed: done as u64, total: prune_total });
+        }
+        let n = pe.embeddings.len();
+        if n < 3 || !touched.contains(pid) || ignored_people.contains(pid) {
+            continue;
+        }
+        // With unit vectors, the sum of the similarities to the other faces is the dot
+        // product with the sum of all faces minus the face's own 1: O(n), not O(n²).
+        let mut total = vec![0.0f32; pe.embeddings[0].len()];
+        for emb in &pe.embeddings {
+            for (t, v) in total.iter_mut().zip(emb) {
+                *t += v;
             }
         }
+        let mut to_prune = Vec::new();
+        for (idx, emb) in pe.embeddings.iter().enumerate() {
+            let avg_sim = (dot(emb, &total) - dot(emb, emb)) / (n - 1) as f32;
+            if avg_sim < OUTLIER_AVG_THRESHOLD {
+                to_prune.push((pe.face_ids[idx], avg_sim));
+            }
+        }
+        for (face_id, avg_sim) in &to_prune {
+            conn.execute(
+                "UPDATE face_detections SET person_id = NULL WHERE id = ?1",
+                params![face_id],
+            )?;
+            log::info!(
+                "Pruned outlier face {face_id} from person {pid} (avg neighbor sim: {avg_sim:.3})"
+            );
+        }
     }
+
+    conn.execute_batch("COMMIT")?;
 
     // Update representative_face_id: prefer face with a crop, fall back to highest confidence
     conn.execute_batch(
@@ -5887,6 +6038,14 @@ fn is_default_person_name(name: &str) -> bool {
 /// that contributed most of its faces, and an old name is given to one group only (the
 /// one with the largest overlap), so a split never duplicates a name.
 pub fn recluster_faces(db_path: &Path, threshold: f32) -> AppResult<crate::models::ClusterResult> {
+    recluster_faces_with_progress(db_path, threshold, &|_| {})
+}
+
+pub fn recluster_faces_with_progress(
+    db_path: &Path,
+    threshold: f32,
+    on_step: &(dyn Fn(ClusterStep) + Sync),
+) -> AppResult<crate::models::ClusterResult> {
     let conn = open_conn(db_path)?;
 
     let named: std::collections::HashMap<i64, String> = {
@@ -5915,7 +6074,7 @@ pub fn recluster_faces(db_path: &Path, threshold: f32) -> AppResult<crate::model
     conn.execute("DELETE FROM people WHERE ignored_at IS NULL", [])?;
     drop(conn);
 
-    let result = cluster_faces(db_path, threshold)?;
+    let result = cluster_faces_with_progress(db_path, threshold, on_step)?;
 
     if !previous.is_empty() {
         let conn = open_conn(db_path)?;
@@ -10474,6 +10633,31 @@ mod tests {
         let visible = list_persons(&db_path, &[]).expect("list");
         assert_eq!(visible.len(), 2);
         assert!(visible.iter().all(|p| p.id != ids[0]));
+    }
+
+    #[test]
+    fn grouping_reports_every_step_with_counters() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/steps").expect("root");
+        for (n, axis) in ["a.jpg", "b.jpg", "c.jpg"].iter().zip(0..3) {
+            upsert_file_record(&db_path, &sample_record(root_id, n, &format!("fp-{n}"))).expect("file");
+            let fid = file_id_by_path(&db_path, root_id, n);
+            let emb: Vec<f32> = (0..512).map(|i| if i == axis { 1.0 } else { 0.0 }).collect();
+            insert_test_face(&db_path, fid, &emb);
+        }
+
+        let steps = std::sync::Mutex::new(Vec::new());
+        cluster_faces_with_progress(&db_path, 0.45, &|s| steps.lock().unwrap().push(s)).expect("cluster");
+        let steps = steps.into_inner().unwrap();
+
+        let stages: Vec<&str> = steps.iter().map(|s| s.stage).collect();
+        let first = |name: &str| stages.iter().position(|s| *s == name).expect(name);
+        assert!(first("assigning") < first("comparing") && first("comparing") < first("pruning"));
+        let assigning = steps.iter().find(|s| s.stage == "assigning").unwrap();
+        assert_eq!((assigning.processed, assigning.total), (0, 3));
+        let comparing = steps.iter().filter(|s| s.stage == "comparing").last().unwrap();
+        assert_eq!((comparing.processed, comparing.total), (3, 3));
     }
 
     #[test]

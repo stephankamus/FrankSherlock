@@ -263,3 +263,35 @@
 .context-menu-parent:focus-within > .context-menu-submenu {
   display: block;
 }
+
+.faces-progress-title {
+  color: var(--text-primary);
+}
+
+.faces-progress-detail {
+  margin-top: 2px;
+}
+
+.faces-progress-bar {
+  margin-top: 6px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border-primary);
+  overflow: hidden;
+}
+
+.faces-progress-fill {
+  height: 100%;
+  background: var(--accent, #4a9eff);
+  transition: width 0.4s ease;
+}
+
+.faces-progress-fill.indeterminate {
+  width: 35%;
+  animation: faces-progress-slide 1.2s ease-in-out infinite;
+}
+
+@keyframes faces-progress-slide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(300%); }
+}

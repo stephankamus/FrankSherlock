@@ -2,6 +2,7 @@ import { useEffect, useState, useRef, useCallback } from "react";
 
 import { useContextMenuClose } from "../hooks/useContextMenuClose";
 import { useSelection } from "../hooks/useSelection";
+import FacesProgress from "./FacesProgress";
 import type { FaceInfo, PersonInfo, ReclusterProgress } from "../types";
 import { useLibrary } from "../useLibrary";
 import "./tools.css";
@@ -73,6 +74,8 @@ export default function FacesView({
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editValue, setEditValue] = useState("");
   const [reclusterStatus, setReclusterStatus] = useState<ReclusterProgress | null>(null);
+  // Automatic grouping of new faces; shares the backend progress slot with the re-cluster.
+  const [groupingStatus, setGroupingStatus] = useState<ReclusterProgress | null>(null);
   const [selectedPerson, setSelectedPerson] = useState<PersonInfo | null>(null);
   const [faces, setFaces] = useState<FaceInfo[]>([]);
   const [facesLoading, setFacesLoading] = useState(false);
@@ -133,10 +136,20 @@ export default function FacesView({
   useEffect(() => {
     if (!canEdit || !actions) return;
     let cancelled = false;
+    let poll: ReturnType<typeof setInterval> | null = null;
     (async () => {
       try {
         const pending = Number(await actions.unclusteredCount());
         if (cancelled || !(pending > 0)) return;
+        setGroupingStatus({ phase: "clustering", stage: "assigning", total: 0, processed: 0, result: null });
+        poll = setInterval(async () => {
+          try {
+            const status = await actions.reclusterStatus();
+            if (status && !cancelled) setGroupingStatus(status);
+          } catch {
+            /* the next tick retries */
+          }
+        }, 500);
         const result = await actions.clusterNew();
         if (cancelled) return;
         if (result && result.assignedFaces > 0) {
@@ -148,10 +161,14 @@ export default function FacesView({
         }
       } catch {
         // Best effort: the gallery still shows everything that was grouped before.
+      } finally {
+        if (poll) clearInterval(poll);
+        if (!cancelled) setGroupingStatus(null);
       }
     })();
     return () => {
       cancelled = true;
+      if (poll) clearInterval(poll);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canEdit]);
@@ -270,7 +287,7 @@ export default function FacesView({
     );
     if (!ok) return;
     try {
-      setReclusterStatus({ phase: "crops", total: 0, processed: 0, result: null });
+      setReclusterStatus({ phase: "crops", stage: "", total: 0, processed: 0, result: null });
       await actions.recluster();
     } catch (err) {
       onError(String(err));
@@ -537,25 +554,8 @@ export default function FacesView({
   }
 
   function renderProgress() {
-    if (!reclusterStatus) return null;
-    const { phase, total, processed } = reclusterStatus;
-    if (phase === "crops" && total > 0) {
-      const pct = Math.round((processed / total) * 100);
-      return (
-        <div className="faces-progress">
-          Regenerating face crops... {processed}/{total} ({pct}%)
-        </div>
-      );
-    }
-    if (phase === "crops") {
-      return <div className="faces-progress">Preparing re-cluster...</div>;
-    }
-    if (phase === "clustering") {
-      return <div className="faces-progress">Clustering faces...</div>;
-    }
-    if (phase === "done") {
-      return <div className="faces-progress">Done! Reloading...</div>;
-    }
+    if (reclusterStatus) return <FacesProgress status={reclusterStatus} title="Re-clustering" />;
+    if (groupingStatus) return <FacesProgress status={groupingStatus} title="Grouping new faces" />;
     return null;
   }
 
