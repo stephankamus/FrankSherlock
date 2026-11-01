@@ -11,6 +11,9 @@ type Props = {
   /** True when every selected photo is already hidden, so the button reads "Unhide". */
   allHidden?: boolean;
   onAddDescription?: () => void;
+  /** Bulk "ignore" of the faces view; the label turns it into "Restore" there. */
+  onIgnore?: () => void;
+  ignoreLabel?: string;
 };
 
 /**
@@ -21,7 +24,7 @@ type Props = {
  */
 export default function SelectionBar({
   selectedCount, visibleCount, onSelectAll, onClear, onHide, allHidden = false,
-  onAddDescription,
+  onAddDescription, onIgnore, ignoreLabel = "Ignore",
 }: Props) {
   const hasSelection = selectedCount > 0;
   return (
@@ -42,6 +45,11 @@ export default function SelectionBar({
       {onHide && (
         <button type="button" onClick={onHide} disabled={!hasSelection}>
           {allHidden ? `Unhide ${selectedCount}` : `Hide ${selectedCount}`}
+        </button>
+      )}
+      {onIgnore && (
+        <button type="button" onClick={onIgnore} disabled={!hasSelection}>
+          {ignoreLabel} {selectedCount}
         </button>
       )}
       {onAddDescription && (

@@ -686,6 +686,33 @@ describe("FacesView", () => {
       });
     });
 
+    it("ignores several checked people at once", async () => {
+      mockedInvoke.mockImplementation(async (cmd: string) => {
+        if (cmd === "list_persons") return [mockPerson, mockPerson2];
+        if (cmd === "list_ignored_persons") return [];
+        return null;
+      });
+      render(<FacesView {...defaultProps} />);
+      await waitFor(() => expect(screen.getByText("Alice")).toBeInTheDocument());
+
+      const ignore = screen.getByRole("button", { name: "Ignore 0" });
+      expect(ignore).toBeDisabled();
+      await userEvent.click(screen.getByRole("checkbox", { name: "Select Person 1" }));
+      // Ctrl+click on a card toggles it without opening the person.
+      fireEvent.click(screen.getByText("Alice").closest(".faces-card")!, { ctrlKey: true });
+      expect(screen.getByText("2 selected")).toBeInTheDocument();
+
+      await userEvent.click(screen.getByRole("button", { name: "Ignore 2" }));
+
+      await waitFor(() => {
+        expect(mockedInvoke).toHaveBeenCalledWith("set_persons_ignored", {
+          personIds: [1, 2],
+          ignored: true,
+        });
+      });
+      expect(defaultProps.onNotice).toHaveBeenCalledWith("Ignored 2 people");
+    });
+
     it("hides every photo of a person after confirming", async () => {
       const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
       await openMenu([mockPerson]);

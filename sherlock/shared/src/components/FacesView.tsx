@@ -3,6 +3,7 @@ import { useEffect, useState, useRef, useCallback } from "react";
 import { useContextMenuClose } from "../hooks/useContextMenuClose";
 import { useSelection } from "../hooks/useSelection";
 import FacesProgress from "./FacesProgress";
+import SelectionBar from "./SelectionBar";
 import type { FaceInfo, PersonInfo, ReclusterProgress } from "../types";
 import { useLibrary } from "../useLibrary";
 import "./tools.css";
@@ -107,11 +108,22 @@ export default function FacesView({
     clearSelection: detailClearSelection,
   } = useSelection();
 
+  // Person grid selection (indices into `persons`)
+  const {
+    selectedIndices: personSelected,
+    anchorIndex: personAnchor,
+    toggleSelect: personToggle,
+    rangeSelect: personRange,
+    selectAll: personSelectAll,
+    clearSelection: personClear,
+  } = useSelection();
+
   // Detail context menu state
   const [detailContextMenu, setDetailContextMenu] = useState<DetailContextMenuState>(null);
 
   const loadPersons = useCallback(() => {
     setLoading(true);
+    personClear();
     scrubFacesCache.current.clear();
     const loader = showIgnored && actions ? actions.listIgnoredPeople() : library.listPeople();
     loader
@@ -124,7 +136,7 @@ export default function FacesView({
         .then((list) => setIgnoredCount(list.length))
         .catch(() => {});
     }
-  }, [library, actions, showIgnored]);
+  }, [library, actions, showIgnored, personClear]);
 
   useEffect(() => {
     loadPersons();
@@ -491,6 +503,30 @@ export default function FacesView({
     }
   }
 
+  function handleCardClick(e: React.MouseEvent, person: PersonInfo, index: number) {
+    if (canEdit && e.shiftKey && personAnchor !== null) {
+      personRange(personAnchor, index);
+    } else if (canEdit && (e.ctrlKey || e.metaKey)) {
+      personToggle(index);
+    } else {
+      handleSelectPerson(person);
+    }
+  }
+
+  async function handleBulkIgnore() {
+    if (!actions || personSelected.size === 0) return;
+    const chosen = persons.filter((_, i) => personSelected.has(i));
+    const ignored = !showIgnored;
+    try {
+      await actions.setPersonsIgnored(chosen.map((p) => p.id), ignored);
+      const n = chosen.length;
+      onNotice(`${ignored ? "Ignored" : "Restored"} ${n} ${n === 1 ? "person" : "people"}`);
+      loadPersons();
+    } catch (err) {
+      onError(String(err));
+    }
+  }
+
   function toggleIgnoredView() {
     setSelectedPerson(null);
     setShowIgnored((v) => !v);
@@ -776,6 +812,17 @@ export default function FacesView({
 
       {renderProgress()}
 
+      {canEdit && persons.length > 0 && (
+        <SelectionBar
+          selectedCount={personSelected.size}
+          visibleCount={persons.length}
+          onSelectAll={() => personSelectAll(persons.length)}
+          onClear={personClear}
+          onIgnore={handleBulkIgnore}
+          ignoreLabel={showIgnored ? "Restore" : "Ignore"}
+        />
+      )}
+
       <div className="tool-body">
         {loading && <div className="tool-loading">Loading...</div>}
         {!loading && persons.length === 0 && !isReclustering && (
@@ -789,14 +836,15 @@ export default function FacesView({
         )}
         {!loading && persons.length > 0 && (
           <div className="faces-grid">
-            {persons.map((person) => {
+            {persons.map((person, index) => {
+              const isChecked = personSelected.has(index);
               const isScrubbing = scrubPersonId === person.id && scrubCropUrl !== null;
               const displayCrop = isScrubbing ? scrubCropUrl : library.personCropUrl(person);
               return (
                 <div
                   key={person.id}
-                  className={`faces-card${isScrubbing ? " scrubbing" : ""}`}
-                  onClick={() => handleSelectPerson(person)}
+                  className={`faces-card${isScrubbing ? " scrubbing" : ""}${isChecked ? " selected" : ""}`}
+                  onClick={(e) => handleCardClick(e, person, index)}
                   onContextMenu={(e) => handleCardContextMenu(e, person)}
                   onMouseEnter={() => handleCardMouseEnter(person)}
                   onMouseLeave={handleCardMouseLeave}
@@ -804,6 +852,16 @@ export default function FacesView({
                   title={`${person.name} (${person.faceCount} face${person.faceCount !== 1 ? "s" : ""})`}
                 >
                   <div className="faces-card-crop">
+                    {canEdit && (
+                      <input
+                        type="checkbox"
+                        className="faces-card-check"
+                        aria-label={`Select ${person.name}`}
+                        checked={isChecked}
+                        onClick={(e) => e.stopPropagation()}
+                        onChange={() => personToggle(index)}
+                      />
+                    )}
                     {displayCrop ? (
                       <img src={displayCrop} alt="" loading="lazy" />
                     ) : (
