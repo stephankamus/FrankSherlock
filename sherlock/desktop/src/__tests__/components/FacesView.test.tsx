@@ -395,6 +395,38 @@ describe("FacesView", () => {
     confirmSpy.mockRestore();
   });
 
+  it("groups pending faces when the screen opens", async () => {
+    let grouped = false;
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_persons") return grouped ? [mockPerson] : [];
+      if (cmd === "get_unclustered_face_count") return 4;
+      if (cmd === "cluster_faces") {
+        grouped = true;
+        return { newPersons: 1, assignedFaces: 4 };
+      }
+      return null;
+    });
+
+    render(<FacesView {...defaultProps} />);
+
+    await waitFor(() => expect(mockedInvoke).toHaveBeenCalledWith("cluster_faces"));
+    await waitFor(() => expect(defaultProps.onNotice).toHaveBeenCalledWith(expect.stringContaining("Grouped 4")));
+    expect(await screen.findByText("Person 1")).toBeInTheDocument();
+  });
+
+  it("does not group when nothing is pending", async () => {
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_persons") return [mockPerson];
+      if (cmd === "get_unclustered_face_count") return 0;
+      return null;
+    });
+
+    render(<FacesView {...defaultProps} />);
+    await screen.findByText("Person 1");
+
+    expect(mockedInvoke).not.toHaveBeenCalledWith("cluster_faces");
+  });
+
   it("face selection via click", async () => {
     mockedInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === "list_persons") return [mockPerson];

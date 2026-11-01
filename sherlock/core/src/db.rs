@@ -450,6 +450,17 @@ fn run_migrations(conn: &mut Connection) -> AppResult<()> {
             CREATE INDEX IF NOT EXISTS idx_files_hidden_at ON files(hidden_at);
             "#,
         ),
+        // Faces the grouping pass has already looked at. A face left without a person
+        // (an outlier, or too small to qualify) stays `person_id IS NULL` forever, so
+        // that column alone cannot say "still waiting for a clustering pass". Rows that
+        // already belong to a person are marked as seen; the rest stay pending so the
+        // faces of an interrupted scan are picked up by the next pass.
+        M::up(
+            r#"
+            ALTER TABLE face_detections ADD COLUMN clustered_at INTEGER;
+            UPDATE face_detections SET clustered_at = created_at WHERE person_id IS NOT NULL;
+            "#,
+        ),
     ]);
 
     migrations
@@ -5682,22 +5693,108 @@ pub fn cluster_faces(db_path: &Path, threshold: f32) -> AppResult<crate::models:
         [],
     )?;
 
+    // Every qualifying face has now been considered, including the outliers that
+    // ended up without a person.
+    conn.execute(
+        "UPDATE face_detections SET clustered_at = ?1
+          WHERE clustered_at IS NULL AND confidence >= ?2 AND bbox_w >= ?3 AND bbox_h >= ?3",
+        params![now, MIN_CONFIDENCE, MIN_BBOX_DIM],
+    )?;
+
     Ok(crate::models::ClusterResult {
         new_persons,
         assigned_faces,
     })
 }
 
+fn is_default_person_name(name: &str) -> bool {
+    let name = name.trim();
+    if name.is_empty() {
+        return true;
+    }
+    name.strip_prefix("Person ")
+        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+}
+
 /// Reset all person assignments and re-cluster from scratch.
+///
+/// Names the user typed survive: each new group takes the name of the old named person
+/// that contributed most of its faces, and an old name is given to one group only (the
+/// one with the largest overlap), so a split never duplicates a name.
 pub fn recluster_faces(db_path: &Path, threshold: f32) -> AppResult<crate::models::ClusterResult> {
     let conn = open_conn(db_path)?;
-    // Clear all person assignments
-    conn.execute("UPDATE face_detections SET person_id = NULL", [])?;
-    // Delete all person records
+
+    let named: std::collections::HashMap<i64, String> = {
+        let mut stmt = conn.prepare("SELECT id, name FROM people")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
+        rows.filter_map(|r| r.ok())
+            .filter(|(_, name)| !is_default_person_name(name))
+            .collect()
+    };
+    let previous: Vec<(i64, i64)> = {
+        let mut stmt = conn
+            .prepare("SELECT id, person_id FROM face_detections WHERE person_id IS NOT NULL")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+        rows.filter_map(|r| r.ok())
+            .filter(|(_, pid)| named.contains_key(pid))
+            .collect()
+    };
+
+    conn.execute("UPDATE face_detections SET person_id = NULL, clustered_at = NULL", [])?;
     conn.execute("DELETE FROM people", [])?;
     drop(conn);
-    // Re-run clustering from scratch
-    cluster_faces(db_path, threshold)
+
+    let result = cluster_faces(db_path, threshold)?;
+
+    if !previous.is_empty() {
+        let conn = open_conn(db_path)?;
+        let mut overlap: std::collections::HashMap<(i64, i64), u64> =
+            std::collections::HashMap::new();
+        {
+            let mut stmt = conn.prepare("SELECT person_id FROM face_detections WHERE id = ?1")?;
+            for (face_id, old_pid) in &previous {
+                let new_pid: Option<i64> =
+                    stmt.query_row(params![face_id], |row| row.get(0)).ok().flatten();
+                if let Some(new_pid) = new_pid {
+                    *overlap.entry((*old_pid, new_pid)).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut ranked: Vec<((i64, i64), u64)> = overlap.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let mut used_old = std::collections::HashSet::new();
+        let mut used_new = std::collections::HashSet::new();
+        for ((old_pid, new_pid), _) in ranked {
+            if used_old.contains(&old_pid) || used_new.contains(&new_pid) {
+                continue;
+            }
+            if let Some(name) = named.get(&old_pid) {
+                conn.execute(
+                    "UPDATE people SET name = ?1 WHERE id = ?2",
+                    params![name, new_pid],
+                )?;
+                used_old.insert(old_pid);
+                used_new.insert(new_pid);
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Faces the next grouping pass would look at: good enough to cluster, no person yet,
+/// and not already tried. Hidden and deleted photos do not count.
+pub fn unclustered_face_count(db_path: &Path) -> AppResult<u64> {
+    let conn = open_conn(db_path)?;
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM face_detections fd
+           JOIN files f ON f.id = fd.file_id
+          WHERE fd.person_id IS NULL AND fd.clustered_at IS NULL
+            AND fd.confidence >= 0.65 AND fd.bbox_w >= 40 AND fd.bbox_h >= 40
+            AND f.deleted_at IS NULL AND f.hidden_at IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count as u64)
 }
 
 /// Compute the maximum face-to-face cosine similarity between two persons.
@@ -8045,11 +8142,11 @@ mod tests {
         init_database(&db_path).expect("init");
 
         let conn = open_conn(&db_path).expect("open");
-        // Verify user_version is set (21 migrations applied → version 21)
+        // Verify user_version is set (22 migrations applied → version 22)
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 21);
+        assert_eq!(version, 22);
 
         // Migration 19 records where a converted HEIC/NEF copy came from.
         let conversion_columns: Vec<String> = {
@@ -8141,8 +8238,8 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        // We have 21 migrations (indices 0..20), so user_version should be 21
-        assert_eq!(version, 21);
+        // We have 22 migrations (indices 0..21), so user_version should be 22
+        assert_eq!(version, 22);
     }
 
     /// A database written by a *newer* build is refused, never adopted silently.
@@ -9925,6 +10022,57 @@ mod tests {
         let result = cluster_faces(&db_path, 0.45).expect("cluster");
         assert_eq!(result.new_persons, 0);
         assert_eq!(result.assigned_faces, 0);
+    }
+
+    #[test]
+    fn unclustered_count_drops_after_clustering() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/pend").expect("root");
+        let record = sample_record(root_id, "a.jpg", "fp-a");
+        upsert_file_record(&db_path, &record).expect("file");
+        let file_id = file_id_by_path(&db_path, root_id, "a.jpg");
+        let mut emb: Vec<f32> = vec![0.0; 512];
+        emb[0] = 1.0;
+        insert_test_face(&db_path, file_id, &emb);
+
+        assert_eq!(unclustered_face_count(&db_path).expect("count"), 1);
+        cluster_faces(&db_path, 0.45).expect("cluster");
+        assert_eq!(unclustered_face_count(&db_path).expect("count"), 0);
+    }
+
+    #[test]
+    fn recluster_keeps_typed_names_and_drops_default_ones() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/keep").expect("root");
+        for (rel, fp) in [("a.jpg", "fa"), ("b.jpg", "fb")] {
+            upsert_file_record(&db_path, &sample_record(root_id, rel, fp)).expect("file");
+        }
+        let a = file_id_by_path(&db_path, root_id, "a.jpg");
+        let b = file_id_by_path(&db_path, root_id, "b.jpg");
+        let mut emb_a: Vec<f32> = vec![0.0; 512];
+        emb_a[0] = 1.0;
+        let mut emb_b: Vec<f32> = vec![0.0; 512];
+        emb_b[1] = 1.0;
+        insert_test_face(&db_path, a, &emb_a);
+        insert_test_face(&db_path, b, &emb_b);
+        cluster_faces(&db_path, 0.45).expect("cluster");
+
+        let people = list_persons(&db_path, &[]).expect("list");
+        assert_eq!(people.len(), 2);
+        let first = people[0].id;
+        rename_person(&db_path, first, "Maria").expect("rename");
+
+        recluster_faces(&db_path, 0.45).expect("recluster");
+        let mut names: Vec<String> = list_persons(&db_path, &[])
+            .expect("list")
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        names.sort();
+        assert_eq!(names.iter().filter(|n| n.as_str() == "Maria").count(), 1);
+        assert_eq!(names.len(), 2);
     }
 
     #[test]

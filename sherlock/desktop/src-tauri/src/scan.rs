@@ -976,6 +976,20 @@ fn run_scan_job_impl(
             outcome.face_failures
         );
 
+        // Faces read inside the scan have no person yet. Grouping is cheap (embeddings
+        // only, no model), and it must also run when the scan was cancelled: the faces
+        // stored so far are already in the index.
+        if outcome.faces > 0 {
+            match db::cluster_faces(db_path, crate::FACE_CLUSTER_THRESHOLD) {
+                Ok(result) => log::info!(
+                    "Scan job {job_id}: grouped faces — {} new person(s), {} face(s) assigned",
+                    result.new_persons,
+                    result.assigned_faces
+                ),
+                Err(e) => log::warn!("Scan job {job_id}: face grouping failed: {e}"),
+            }
+        }
+
         if cancel_flag.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             // Cancel means stop: no cleanup on the way out, so a half-processed folder
             // is never mistaken for a folder with missing files.

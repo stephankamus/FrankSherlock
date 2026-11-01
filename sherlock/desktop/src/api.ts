@@ -385,8 +385,8 @@ export async function renameFile(fileId: number, newName: string): Promise<Renam
  * report. Long libraries take a while on the first run because every thumbnail has to
  * cross the share; later runs only copy what changed.
  */
-export async function publishLibrary(): Promise<PublishReport> {
-  return invoke<PublishReport>("publish_library");
+export async function publishLibrary(databaseOnly = false): Promise<PublishReport> {
+  return invoke<PublishReport>("publish_library", { databaseOnly });
 }
 
 /** Live counters of a running publish, or `null` when nothing is running. */
@@ -552,6 +552,10 @@ export async function cancelFaceDetect(): Promise<boolean> {
 
 export async function clusterFaces(): Promise<ClusterResult> {
   return invoke<ClusterResult>("cluster_faces");
+}
+
+export async function getUnclusteredFaceCount(): Promise<number> {
+  return invoke<number>("get_unclustered_face_count");
 }
 
 export async function reclusterFaces(): Promise<void> {

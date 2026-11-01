@@ -1385,11 +1385,15 @@ fn list_subdirectories(
 /// is tens of thousands of small writes over SMB. The report is kept in the state as
 /// well, so closing the screen does not lose the outcome.
 #[tauri::command]
-async fn publish_library(state: State<'_, AppState>) -> Result<publish::PublishReport, String> {
+async fn publish_library(
+    database_only: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<publish::PublishReport, String> {
     require_writable(state.inner())?;
 
     let config = config::load_user_config().map_err(|e| e.to_string())?;
-    let options = publish_options_from_config(&config)?;
+    let mut options = publish_options_from_config(&config)?;
+    options.database_only = database_only.unwrap_or(false);
 
     let paths = state.paths.clone();
     let progress = state.publish_progress.clone();
@@ -1475,6 +1479,7 @@ fn publish_options_from_config(
             .and_then(|value| value.get("keepRevisions"))
             .and_then(|value| value.as_u64())
             .unwrap_or(2) as u32,
+        database_only: false,
     })
 }
 
@@ -2192,6 +2197,12 @@ fn get_face_stats(
 #[tauri::command]
 fn get_pending_face_count(root_scope: Vec<i64>, state: State<'_, AppState>) -> Result<u64, String> {
     db::pending_face_count(&state.paths.db_file, &root_scope).map_err(|e| e.to_string())
+}
+
+/// Faces waiting for a grouping pass (the "Group new faces" button shows this).
+#[tauri::command]
+fn get_unclustered_face_count(state: State<'_, AppState>) -> Result<u64, String> {
+    db::unclustered_face_count(&state.paths.db_file).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -3523,6 +3534,7 @@ pub fn run() {
             get_face_thread_plan,
             list_files_with_faces,
             cluster_faces,
+            get_unclustered_face_count,
             recluster_faces,
             get_recluster_status,
             person_similarity,

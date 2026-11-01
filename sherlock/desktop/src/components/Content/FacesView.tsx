@@ -6,7 +6,9 @@ import {
 import type { ComponentProps } from "react";
 
 import {
+  clusterFaces,
   getReclusterStatus,
+  getUnclusteredFaceCount,
   reassignFacesToPerson,
   reclusterFaces,
   renamePerson,
@@ -27,6 +29,8 @@ const desktopFacesActions: FacesActions = {
   renamePerson,
   recluster: reclusterFaces,
   reclusterStatus: getReclusterStatus,
+  unclusteredCount: getUnclusteredFaceCount,
+  clusterNew: clusterFaces,
   unassignFace: unassignFaceFromPerson,
   reassignFaces: reassignFacesToPerson,
   setRepresentativeFace,

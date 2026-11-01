@@ -57,6 +57,10 @@ pub struct PublishOptions {
     /// allowed to reopen immediately; 2 is the default so a reader that is mid-query
     /// during a publish is never the reason a file has to be deleted.
     pub keep_revisions: u32,
+    /// Publish only the database snapshot and move the pointer. Thumbnails and crops
+    /// already in the folder are left untouched, so hiding photos reaches the web
+    /// without walking the whole cache over the share.
+    pub database_only: bool,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -134,41 +138,43 @@ pub fn publish_library(
         return Ok(cancelled(report, &destination, started));
     }
 
-    let thumbs = sync_tree(
-        &paths.thumbnails_dir,
-        &options.dir.join(THUMBS_DIR),
-        "thumbs",
-        cancel,
-        on_progress,
-    )?;
-    report.thumbnails_copied = thumbs.copied;
-    report.thumbnails_unchanged = thumbs.unchanged;
-    report.thumbnails_removed = thumbs.removed;
-    report.thumbnails_bytes = thumbs.bytes;
-
-    if cancel.load(Ordering::Relaxed) {
-        return Ok(cancelled(report, &destination, started));
-    }
-
-    if options.include_face_crops {
-        let faces = sync_tree(
-            &paths.face_crops_dir,
-            &options.dir.join(FACE_CROPS_DIR),
-            "faces",
+    if !options.database_only {
+        let thumbs = sync_tree(
+            &paths.thumbnails_dir,
+            &options.dir.join(THUMBS_DIR),
+            "thumbs",
             cancel,
             on_progress,
         )?;
-        report.face_crops_copied = faces.copied;
-        report.face_crops_removed = faces.removed;
-        report.face_crops_bytes = faces.bytes;
-    } else {
-        // A folder left behind from an earlier publish with crops enabled would keep
-        // serving portraits the current configuration says not to publish.
-        let _ = fs::remove_dir_all(options.dir.join(FACE_CROPS_DIR));
-    }
+        report.thumbnails_copied = thumbs.copied;
+        report.thumbnails_unchanged = thumbs.unchanged;
+        report.thumbnails_removed = thumbs.removed;
+        report.thumbnails_bytes = thumbs.bytes;
 
-    if cancel.load(Ordering::Relaxed) {
-        return Ok(cancelled(report, &destination, started));
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(cancelled(report, &destination, started));
+        }
+
+        if options.include_face_crops {
+            let faces = sync_tree(
+                &paths.face_crops_dir,
+                &options.dir.join(FACE_CROPS_DIR),
+                "faces",
+                cancel,
+                on_progress,
+            )?;
+            report.face_crops_copied = faces.copied;
+            report.face_crops_removed = faces.removed;
+            report.face_crops_bytes = faces.bytes;
+        } else {
+            // A folder left behind from an earlier publish with crops enabled would keep
+            // serving portraits the current configuration says not to publish.
+            let _ = fs::remove_dir_all(options.dir.join(FACE_CROPS_DIR));
+        }
+
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(cancelled(report, &destination, started));
+        }
     }
 
     report_phase(on_progress, "pointer", 0, 1, CURRENT_POINTER.to_string());
@@ -772,7 +778,46 @@ mod tests {
             dir: dir.to_path_buf(),
             include_face_crops: true,
             keep_revisions: 2,
+            database_only: false,
         }
+    }
+
+    #[test]
+    fn database_only_publish_leaves_the_caches_untouched() {
+        let temp = tempfile::tempdir().expect("temp");
+        let paths = test_paths(temp.path());
+        let (_, last_id) = seed(&paths, &["a.jpg", "b.jpg"]);
+        let publish_dir = temp.path().join("share");
+        let cancel = AtomicBool::new(false);
+        publish_library(&paths, &options(&publish_dir), &cancel, &mut |_| {}).expect("full");
+
+        crate::db::set_files_hidden(&paths.db_file, &[last_id], true).expect("hide");
+        // Deleted from the destination on purpose: a full publish would put it back.
+        let thumb_key = crate::thumbnail::root_key("/tmp/photos");
+        let published = publish_dir.join(THUMBS_DIR).join(&thumb_key).join("b.jpg");
+        fs::remove_file(&published).expect("remove published thumb");
+
+        let mut db_only = options(&publish_dir);
+        db_only.database_only = true;
+        let report = publish_library(&paths, &db_only, &cancel, &mut |_| {}).expect("db only");
+
+        assert_eq!(report.thumbnails_copied, 0);
+        assert!(!published.exists(), "a database-only publish must not copy thumbnails");
+        let snapshot = publish_dir.join(snapshot_file_name(&report.revision));
+        let conn = Connection::open_with_flags(&snapshot, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open snapshot");
+        let hidden: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE hidden_at IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(hidden, 1, "the new snapshot carries the hidden flag");
+        let pointer: serde_json::Value =
+            serde_json::from_slice(&fs::read(publish_dir.join(CURRENT_POINTER)).expect("pointer"))
+                .expect("json");
+        assert_eq!(pointer["revision"], report.revision);
     }
 
     #[test]

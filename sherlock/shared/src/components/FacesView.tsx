@@ -18,6 +18,10 @@ export type FacesActions = {
   renamePerson(personId: number, name: string): Promise<void>;
   recluster(): Promise<void>;
   reclusterStatus(): Promise<ReclusterProgress | null>;
+  /** Faces read by a scan that no grouping pass has looked at yet. */
+  unclusteredCount(): Promise<number>;
+  /** Group the pending faces into the existing people; returns how many were assigned. */
+  clusterNew(): Promise<{ newPersons: number; assignedFaces: number }>;
   unassignFace(faceId: number): Promise<void>;
   reassignFaces(faceIds: number[], targetPersonId: number): Promise<void>;
   setRepresentativeFace(personId: number, faceId: number): Promise<void>;
@@ -107,6 +111,35 @@ export default function FacesView({
   useEffect(() => {
     loadPersons();
   }, [loadPersons]);
+
+  // A scan that was paused, closed or run with inline detection leaves faces without a
+  // person. Grouping them is cheap (embeddings only), so it happens when the screen
+  // opens instead of waiting for a button.
+  useEffect(() => {
+    if (!canEdit || !actions) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const pending = Number(await actions.unclusteredCount());
+        if (cancelled || !(pending > 0)) return;
+        const result = await actions.clusterNew();
+        if (cancelled) return;
+        if (result && result.assignedFaces > 0) {
+          onNotice(
+            `Grouped ${result.assignedFaces} new face${result.assignedFaces === 1 ? "" : "s"}` +
+              (result.newPersons > 0 ? ` (${result.newPersons} new)` : ""),
+          );
+          loadPersons();
+        }
+      } catch {
+        // Best effort: the gallery still shows everything that was grouped before.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canEdit]);
 
   // Poll recluster progress while running
   useEffect(() => {
@@ -216,8 +249,9 @@ export default function FacesView({
   async function handleRecluster() {
     if (!actions) return;
     const ok = window.confirm(
-      "Re-cluster will delete ALL existing person groups and manual corrections " +
-      "(renames, moves, removals). This cannot be undone.\n\nContinue?",
+      "Re-cluster rebuilds every person group from scratch. Names you gave people are " +
+      "kept, but manual moves and removals of single faces are lost. This cannot be undone." +
+      "\n\nNew faces are grouped automatically; use this only to fix bad groups.\n\nContinue?",
     );
     if (!ok) return;
     try {

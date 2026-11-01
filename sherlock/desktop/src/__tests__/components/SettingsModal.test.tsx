@@ -96,6 +96,18 @@ describe("SettingsModal", () => {
     expect(screen.getByText(/4 thumbnail\(s\) copied/)).toBeInTheDocument();
   });
 
+  it("publishes only the database when asked", async () => {
+    const user = userEvent.setup();
+    (loadUserConfig as ReturnType<typeof vi.fn>).mockResolvedValue({
+      publish: { dir: "/mnt/nas/frank-sherlock", auto: false, includeFaceCrops: true, keepRevisions: 2 },
+    });
+    render(<SettingsModal onClose={() => {}} />);
+
+    await user.click(await screen.findByRole("button", { name: "Publish database only" }));
+
+    expect(publishLibrary).toHaveBeenCalledWith(true);
+  });
+
   it("saves the publishing switches as soon as they change", async () => {
     const user = userEvent.setup();
     render(<SettingsModal onClose={() => {}} />);

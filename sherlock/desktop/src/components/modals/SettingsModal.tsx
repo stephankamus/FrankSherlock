@@ -283,7 +283,7 @@ export default function SettingsModal({ onClose, onSaved, onOpenLogs }: Props) {
     }
   }
 
-  async function runPublish() {
+  async function runPublish(databaseOnly = false) {
     if (!publish.dir.trim()) {
       setError("Choose a publish folder first.");
       return;
@@ -295,7 +295,7 @@ export default function SettingsModal({ onClose, onSaved, onOpenLogs }: Props) {
     setPublishing(true);
     setPublishJob(null);
     try {
-      const report = await publishLibrary();
+      const report = await publishLibrary(databaseOnly);
       setLastPublish(report);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
@@ -636,14 +636,25 @@ export default function SettingsModal({ onClose, onSaved, onOpenLogs }: Props) {
                   </button>
                 </div>
               ) : (
-                <button
-                  type="button"
-                  className="settings-logs-btn"
-                  onClick={() => void runPublish()}
-                  disabled={!publish.dir.trim()}
-                >
-                  Publish now
-                </button>
+                <div className="settings-publish-actions">
+                  <button
+                    type="button"
+                    className="settings-logs-btn"
+                    onClick={() => void runPublish()}
+                    disabled={!publish.dir.trim()}
+                  >
+                    Publish now
+                  </button>
+                  <button
+                    type="button"
+                    className="settings-logs-btn"
+                    onClick={() => void runPublish(true)}
+                    disabled={!publish.dir.trim()}
+                    title="Publishes only the database: hidden, renamed or edited photos update on the web without copying thumbnails or face crops. New photos appear without a thumbnail until a full publish."
+                  >
+                    Publish database only
+                  </button>
+                </div>
               )}
               {lastPublish && !publishing && (
                 <span className="settings-hint" role="status">
