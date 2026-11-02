@@ -661,14 +661,13 @@ export default function App() {
         root.rootPath,
         "backlog",
         `Reclassifying "${name}" in ${root.rootName}`,
-        { skipPrompt: true },
+        {
+          skipPrompt: true,
+          // Scoped to the folder: the backlog would otherwise also take every other
+          // pending row of the root. Faces are read in the same pass when asked for.
+          overrides: { folder: relPath, ...(resetFaces ? { faceDetection: true } : {}) },
+        },
       );
-      // With face detection on, the backlog reads the faces itself; running the
-      // standalone pass too would fight it for the engine.
-      if (resetFaces) {
-        const current = await getVisionSettings();
-        if (!current.faceDetection) await faces.onDetectFaces(root);
-      }
     } catch (err) {
       setError(errorMessage(err));
     }

@@ -3212,6 +3212,7 @@ fn build_scan_context(app_state: &AppState, app_handle: &tauri::AppHandle) -> mo
         model: model_selection.scan_model,
         image_max_side: vision.image_max_side,
         min_pixels: vision.min_pixels,
+        backlog_folder: String::new(),
         library_kind: vision.library_kind,
         prompt_profile: vision.prompt_profile,
         description_language: vision.description_language,

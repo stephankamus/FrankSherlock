@@ -1852,10 +1852,24 @@ pub fn list_backlog_rows_above(
     include_faces: bool,
     min_pixels: u32,
 ) -> AppResult<Vec<BacklogRow>> {
+    list_backlog_rows_in_folder(db_path, root_id, "", include_faces, min_pixels)
+}
+
+/// [`list_backlog_rows_above`] limited to a folder of the root (and its subfolders).
+/// An empty `folder` is the whole root. Used by "Reclassify" on a subfolder, so the
+/// pass does not also pick up every other pending row of the root.
+pub fn list_backlog_rows_in_folder(
+    db_path: &Path,
+    root_id: i64,
+    folder: &str,
+    include_faces: bool,
+    min_pixels: u32,
+) -> AppResult<Vec<BacklogRow>> {
     query_backlog_rows(
         db_path,
         root_id,
         None,
+        folder,
         "AND classify_state <> 'failed'",
         include_faces,
         min_pixels,
@@ -1872,6 +1886,7 @@ pub fn list_failed_rows(db_path: &Path, root_id: i64) -> AppResult<Vec<BacklogRo
         db_path,
         root_id,
         None,
+        "",
         "AND classify_state = 'failed'",
         false,
         0,
@@ -1910,6 +1925,7 @@ pub fn list_backlog_rows_for_scan_above(
         db_path,
         root_id,
         Some(scan_marker),
+        "",
         "AND classify_state <> 'failed'",
         include_faces,
         min_pixels,
@@ -1975,11 +1991,14 @@ fn query_backlog_rows(
     db_path: &Path,
     root_id: i64,
     scan_marker: Option<i64>,
+    folder: &str,
     filter: &str,
     include_faces: bool,
     min_pixels: u32,
 ) -> AppResult<Vec<BacklogRow>> {
     let conn = open_conn(db_path)?;
+    let folder = crate::paths::normalize_rel_path(folder).trim_matches('/').to_string();
+    let prefix_len = folder.chars().count() as i64 + 1;
     // `include_faces` is what the scan's face toggle turns on: with it off the
     // selection is exactly what it was before faces existed, so an index full of
     // rows without faces does not turn every pass into a face pass.
@@ -1998,6 +2017,7 @@ fn query_backlog_rows(
          FROM files
          WHERE deleted_at IS NULL AND root_id = ?1
            AND (?2 IS NULL OR scan_marker = ?2)
+           AND (?4 = '' OR substr(rel_path, 1, ?5) = ?4 || '/')
            AND ({PENDING_CLASSIFICATION_SQL} OR thumb_path IS NULL{face_clause})
            AND (?3 = 0 OR image_width IS NULL OR image_height IS NULL
                 OR image_width * image_height >= ?3)
@@ -2005,7 +2025,7 @@ fn query_backlog_rows(
          ORDER BY rel_path"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![root_id, scan_marker, min_pixels as i64], |row| {
+    let rows = stmt.query_map(params![root_id, scan_marker, min_pixels as i64, folder, prefix_len], |row| {
         Ok(BacklogRow {
             id: row.get(0)?,
             rel_path: row.get(1)?,
@@ -7472,6 +7492,23 @@ mod tests {
             score(doc),
             score(plain)
         );
+    }
+
+    #[test]
+    fn backlog_can_be_limited_to_a_folder() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/scoped").expect("root");
+        for (rel, fp) in [("a/b/in.jpg", "s1"), ("a/b/c/deep.jpg", "s2"), ("a/bc/out.jpg", "s3"), ("z.jpg", "s4")] {
+            upsert_file_record(&db_path, &sample_record(root_id, rel, fp)).expect("file");
+        }
+        reset_root_classifications(&db_path, root_id, false).expect("reset");
+
+        let all = list_backlog_rows_in_folder(&db_path, root_id, "", false, 0).expect("all");
+        assert_eq!(all.len(), 4);
+        let scoped = list_backlog_rows_in_folder(&db_path, root_id, "a/b", false, 0).expect("scoped");
+        let paths: Vec<&str> = scoped.iter().map(|r| r.rel_path.as_str()).collect();
+        assert_eq!(paths, vec!["a/b/c/deep.jpg", "a/b/in.jpg"]);
     }
 
     /// The resolution floor is a filter, not a state.

@@ -40,6 +40,8 @@ pub struct ScanContext {
     /// grid; only the vision request is skipped. Kept as a pixel count so the backlog
     /// can filter it in SQL (`image_width * image_height`) and stay comparable.
     pub min_pixels: u32,
+    /// Limits a backlog pass to this folder of the root (and below); empty = whole root.
+    pub backlog_folder: String,
     /// What the library mostly holds, which decides the anime enrichment policy.
     pub library_kind: crate::config::LibraryKind,
     pub prompt_profile: crate::config::PromptProfile,
@@ -140,6 +142,8 @@ pub struct ScanOverrides {
     /// Read faces during this scan. `None` keeps what `settings.toml` says, which is
     /// what the context menu toggle overrides for a single run.
     pub face_detection: Option<bool>,
+    /// Folder of the root a backlog pass is limited to (relative path).
+    pub folder: Option<String>,
 }
 
 impl ScanOverrides {
@@ -171,6 +175,9 @@ impl ScanOverrides {
         }
         if let Some(face_detection) = self.face_detection {
             ctx.face_detection = face_detection;
+        }
+        if let Some(folder) = self.folder.as_deref() {
+            ctx.backlog_folder = folder.to_string();
         }
     }
 }

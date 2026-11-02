@@ -19,6 +19,7 @@ import type {
   RuntimeStatus,
   ScanJobStatus,
   ScanMode,
+  ScanOverrides,
   SetupStatus,
 } from "../types";
 import { basename, errorMessage } from "../utils";
@@ -224,14 +225,14 @@ export function useScanManager(cb: ScanManagerCallbacks) {
     rootPath: string,
     mode: ScanMode,
     notice: string,
-    options: { skipPrompt?: boolean } = {},
+    options: { skipPrompt?: boolean; overrides?: ScanOverrides } = {},
   ) {
     if (mode !== "refresh" && !options.skipPrompt && cb.beforeScan && !(await cb.beforeScan(rootPath))) {
       return null;
     }
     try {
       setCompletedJobs([]);
-      const job = await startScan(rootPath, mode);
+      const job = await startScan(rootPath, mode, options.overrides);
       setTrackedJobIds((prev) => [...prev, job.id]);
       // Force the first poll to re-query even when the counters are all zero: the
       // rows may already exist from an earlier interrupted pass.

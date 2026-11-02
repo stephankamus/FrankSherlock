@@ -3049,7 +3049,13 @@ fn run_backlog_pipeline(
     let rows = if only_failed {
         db::list_failed_rows(db_path, job.root_id)?
     } else {
-        db::list_backlog_rows_above(db_path, job.root_id, ctx.face_detection, ctx.min_pixels)?
+        db::list_backlog_rows_in_folder(
+            db_path,
+            job.root_id,
+            &ctx.backlog_folder,
+            ctx.face_detection,
+            ctx.min_pixels,
+        )?
     };
     // The phase is what the sidebar uses to resume in the right mode, so a retry
     // must not be recorded as a backlog pass.
@@ -4048,6 +4054,7 @@ mod tests {
             model: "qwen2.5vl:7b".to_string(),
             image_max_side: vision.image_max_side,
             min_pixels: vision.min_pixels,
+            backlog_folder: String::new(),
             library_kind: vision.library_kind,
             prompt_profile: vision.prompt_profile,
             description_language: vision.description_language,

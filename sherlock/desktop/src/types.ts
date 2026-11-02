@@ -406,6 +406,8 @@ export type ScanOverrides = {
   ocrEngine?: string | null;
   /** Read faces during this scan, overriding `settings.toml` for one run. */
   faceDetection?: boolean | null;
+  /** Limits a backlog pass to this folder (relative path) of the root. */
+  folder?: string | null;
 };
 
 /** Startup behaviour for an already-indexed folder. */
