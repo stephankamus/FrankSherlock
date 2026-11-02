@@ -13,6 +13,8 @@ type DirectoryTreeProps = {
   includeHidden?: boolean;
   /** Write action; without it the tree has no context menu. */
   onSetFolderHidden?: (rootId: number, relPath: string, hidden: boolean) => Promise<void> | void;
+  /** Write action: classify the folder (and its subfolders) again. */
+  onReclassifyFolder?: (rootId: number, entry: SubdirEntry) => void;
 };
 
 type TreeNodeProps = {
@@ -78,7 +80,7 @@ function TreeNode({
 }
 
 export default function DirectoryTree({
-  rootId, selectedSubdir, onSelectSubdir, includeHidden = false, onSetFolderHidden,
+  rootId, selectedSubdir, onSelectSubdir, includeHidden = false, onSetFolderHidden, onReclassifyFolder,
 }: DirectoryTreeProps) {
   const library = useLibrary();
   const [topLevel, setTopLevel] = useState<SubdirEntry[]>([]);
@@ -148,6 +150,13 @@ export default function DirectoryTree({
     setReloadTick((n) => n + 1);
   }, [menu, onSetFolderHidden, rootId]);
 
+  const reclassify = useCallback(() => {
+    if (!menu || !onReclassifyFolder) return;
+    const { entry } = menu;
+    setMenu(null);
+    onReclassifyFolder(rootId, entry);
+  }, [menu, onReclassifyFolder, rootId]);
+
   const onSelect = useCallback((relPath: string) => {
     onSelectSubdir(selectedSubdir === relPath ? null : relPath);
   }, [selectedSubdir, onSelectSubdir]);
@@ -172,19 +181,26 @@ export default function DirectoryTree({
           childrenCache={childrenCache}
           onToggleExpand={onToggleExpand}
           onSelect={onSelect}
-          onContextMenu={onSetFolderHidden ? onContextMenu : undefined}
+          onContextMenu={onSetFolderHidden || onReclassifyFolder ? onContextMenu : undefined}
         />
       ))}
-      {menu && onSetFolderHidden && (
+      {menu && (onSetFolderHidden || onReclassifyFolder) && (
         <div
           className="root-card-context-menu"
           role="menu"
           style={{ left: menu.x, top: menu.y }}
           onMouseDown={(e) => e.stopPropagation()}
         >
-          <button type="button" role="menuitem" onClick={() => void toggleHidden()}>
-            {menu.entry.hidden ? "Unhide folder" : "Hide folder"}
-          </button>
+          {onSetFolderHidden && (
+            <button type="button" role="menuitem" onClick={() => void toggleHidden()}>
+              {menu.entry.hidden ? "Unhide folder" : "Hide folder"}
+            </button>
+          )}
+          {onReclassifyFolder && (
+            <button type="button" role="menuitem" onClick={reclassify}>
+              Reclassify…
+            </button>
+          )}
         </div>
       )}
     </div>

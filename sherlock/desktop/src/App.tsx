@@ -13,7 +13,7 @@ import {
   getCliFolderPath, getFailedClassifications, getFileMetadata, getFileProperties,
   getHiddenFileCount, getVisionSettings, listRoots,
   pendingScanSummary, relinkRoot, removeRoot, renameFile, reorderRoots,
-  resetRootClassifications, setFilesHidden, setFolderHidden, startScan, updateFileMetadata, updateSettings,
+  resetRootClassifications, resetFolderClassifications, setFilesHidden, setFolderHidden, startScan, updateFileMetadata, updateSettings,
   updateFileDescription, appendFilesDescription,
 } from "./api";
 import type {
@@ -116,6 +116,11 @@ export default function App() {
   const [showResumeModal, setShowResumeModal] = useState(false);
   const [confirmDeleteRoot, setConfirmDeleteRoot] = useState<RootInfo | null>(null);
   const [confirmReclassifyRoot, setConfirmReclassifyRoot] = useState<RootInfo | null>(null);
+  const [confirmReclassifyFolder, setConfirmReclassifyFolder] = useState<{
+    root: RootInfo;
+    relPath: string;
+    name: string;
+  } | null>(null);
   /** Root whose HEIC/NEF files are being converted into JPEG copies. */
   const [rawConvertRoot, setRawConvertRoot] = useState<RootInfo | null>(null);
   const [videoConvertRoot, setVideoConvertRoot] = useState<RootInfo | null>(null);
@@ -608,6 +613,62 @@ export default function App() {
       const stats = await ensureDatabase();
       setDbStats(stats);
       await runSearch(0, false);
+    } catch (err) {
+      setError(errorMessage(err));
+    }
+  }
+
+  /**
+   * Reclassify one folder: pick the model first (cancelling leaves everything as it
+   * was), then clear the folder, classify it again and, when asked, redo its faces.
+   */
+  async function onReclassifyFolder(
+    root: RootInfo,
+    relPath: string,
+    name: string,
+    dropThumbnails: boolean,
+    resetFaces: boolean,
+  ) {
+    if (readOnly) return;
+    setConfirmReclassifyFolder(null);
+    try {
+      const proceed = await new Promise<boolean>((resolve) =>
+        setVisionPicker({ rootPath: root.rootPath, resolve }),
+      );
+      if (!proceed) return;
+      const runningForRoot = scanManager.activeScans.filter(
+        (s) => s.rootId === root.id && s.status === "running",
+      );
+      for (const scan of runningForRoot) {
+        await cancelScan(scan.id);
+      }
+      if (runningForRoot.length > 0) {
+        await new Promise((r) => setTimeout(r, 300));
+      }
+      const result = await resetFolderClassifications(root.id, relPath, { dropThumbnails, resetFaces });
+      const extras = [
+        result.thumbnails > 0 ? `${result.thumbnails.toLocaleString()} thumbnail(s)` : "",
+        result.faces > 0 ? `${result.faces.toLocaleString()} face(s)` : "",
+      ].filter(Boolean);
+      setNotice(
+        `Reclassifying "${name}": cleared ${result.files.toLocaleString()} classification(s)` +
+          (extras.length ? ` and ${extras.join(", ")}` : ""),
+      );
+      const stats = await ensureDatabase();
+      setDbStats(stats);
+      await runSearch(0, false);
+      await scanManager.startScanWithMode(
+        root.rootPath,
+        "backlog",
+        `Reclassifying "${name}" in ${root.rootName}`,
+        { skipPrompt: true },
+      );
+      // With face detection on, the backlog reads the faces itself; running the
+      // standalone pass too would fight it for the engine.
+      if (resetFaces) {
+        const current = await getVisionSettings();
+        if (!current.faceDetection) await faces.onDetectFaces(root);
+      }
     } catch (err) {
       setError(errorMessage(err));
     }
@@ -1131,6 +1192,25 @@ export default function App() {
           }}
         />
       )}
+      {confirmReclassifyFolder && (
+        <ConfirmReclassifyModal
+          root={confirmReclassifyFolder.root}
+          folder={{ relPath: confirmReclassifyFolder.relPath, name: confirmReclassifyFolder.name }}
+          isScanning={scanManager.activeScans.some(
+            (s) => s.rootId === confirmReclassifyFolder.root.id && s.status === "running",
+          )}
+          onCancel={() => setConfirmReclassifyFolder(null)}
+          onConfirm={(root, dropThumbnails, resetFaces) =>
+            void onReclassifyFolder(
+              root,
+              confirmReclassifyFolder.relPath,
+              confirmReclassifyFolder.name,
+              dropThumbnails,
+              resetFaces ?? false,
+            )
+          }
+        />
+      )}
       {confirmReclassifyRoot && (
         <ConfirmReclassifyModal
           root={confirmReclassifyRoot}
@@ -1289,6 +1369,10 @@ export default function App() {
           selectedSubdir={selectedSubdir}
           includeHiddenFolders={showHidden}
           onSetFolderHidden={handleSetFolderHidden}
+          onReclassifyFolder={(rootId, entry) => {
+            const root = roots.find((r) => r.id === rootId);
+            if (root) setConfirmReclassifyFolder({ root, relPath: entry.relPath, name: entry.name });
+          }}
           onSelectSubdir={(subdir) => {
             setQuery((q) => {
               const cleaned = q.replace(/\bsubdir:(?:"[^"]*?"|\S+)\s*/i, "").trim();

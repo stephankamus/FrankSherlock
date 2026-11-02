@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef, useCallback } from "react";
+import { useEffect, useLayoutEffect, useState, useRef, useCallback, type ReactNode } from "react";
 
 import { useContextMenuClose } from "../hooks/useContextMenuClose";
 import { useSelection } from "../hooks/useSelection";
@@ -60,6 +60,82 @@ type DetailContextMenuState = {
   y: number;
 } | null;
 
+const PERSON_PAGE_SIZE = 50;
+const SUBMENU_WIDTH = 220;
+const MENU_TARGET_LIMIT = 20;
+
+// Lists the biggest people first (the list arrives sorted by size) and narrows by name
+// when searching, so the menu stays small with tens of thousands of people.
+function PersonTargetSubmenu({
+  label,
+  targets,
+  onPick,
+}: {
+  label: string;
+  targets: PersonInfo[];
+  onPick: (person: PersonInfo) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const needle = query.trim().toLowerCase();
+  const matches = needle ? targets.filter((p) => p.name.toLowerCase().includes(needle)) : targets;
+  const shown = matches.slice(0, MENU_TARGET_LIMIT);
+  return (
+    <div className="context-menu-parent">
+      <span>{label}</span>
+      <span className="context-menu-arrow">&#9654;</span>
+      <div className="context-menu-submenu">
+        <input
+          type="text"
+          className="context-menu-search"
+          placeholder="Search by name..."
+          aria-label="Search people"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => e.stopPropagation()}
+        />
+        {shown.map((p) => (
+          <button key={p.id} type="button" className="context-menu-item" onClick={() => onPick(p)}>
+            {p.name} ({p.faceCount})
+          </button>
+        ))}
+        {shown.length === 0 && <div className="context-menu-empty">No matches</div>}
+        {matches.length > shown.length && (
+          <div className="context-menu-empty">
+            Showing {shown.length} of {matches.length}; type to search
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+const MENU_MARGIN = 8;
+
+// Keeps a fixed-position menu inside the viewport; opens the submenu leftwards when
+// there is no room on the right.
+function ClampedMenu({ x, y, testId, children }: { x: number; y: number; testId: string; children: ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState({ left: x, top: y, flip: false });
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const { width, height } = el.getBoundingClientRect();
+    const left = Math.max(MENU_MARGIN, Math.min(x, window.innerWidth - width - MENU_MARGIN));
+    const top = Math.max(MENU_MARGIN, Math.min(y, window.innerHeight - height - MENU_MARGIN));
+    setPos({ left, top, flip: left + width + SUBMENU_WIDTH > window.innerWidth });
+  }, [x, y]);
+  return (
+    <div
+      ref={ref}
+      className={`context-menu${pos.flip ? " flip" : ""}`}
+      style={{ left: pos.left, top: pos.top }}
+      onMouseDown={(e) => e.stopPropagation()}
+      data-testid={testId}
+    >
+      {children}
+    </div>
+  );
+}
+
 export default function FacesView({
   onBack,
   onSelectPerson,
@@ -79,6 +155,9 @@ export default function FacesView({
   const [refineTargets, setRefineTargets] = useState<PersonInfo[] | null>(null);
   const [refining, setRefining] = useState(false);
   const [loading, setLoading] = useState(true);
+  // The grid renders in batches: tens of thousands of cards at once freeze the webview.
+  const [visibleCount, setVisibleCount] = useState(PERSON_PAGE_SIZE);
+  const personSentinelRef = useRef<HTMLDivElement>(null);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editValue, setEditValue] = useState("");
   const [reclusterStatus, setReclusterStatus] = useState<ReclusterProgress | null>(null);
@@ -128,8 +207,12 @@ export default function FacesView({
   // Detail context menu state
   const [detailContextMenu, setDetailContextMenu] = useState<DetailContextMenuState>(null);
 
-  const loadPersons = useCallback(() => {
-    setLoading(true);
+  // `quiet` refreshes the list in place (no spinner, same batch count) so the grid keeps its scroll position.
+  const loadPersons = useCallback((quiet = false) => {
+    if (!quiet) {
+      setLoading(true);
+      setVisibleCount(PERSON_PAGE_SIZE);
+    }
     personClear();
     scrubFacesCache.current.clear();
     const loader = showIgnored && actions ? actions.listIgnoredPeople() : library.listPeople();
@@ -151,6 +234,22 @@ export default function FacesView({
   useEffect(() => {
     loadPersons();
   }, [loadPersons]);
+
+  const hasMorePersons = visibleCount < persons.length;
+  useEffect(() => {
+    const el = personSentinelRef.current;
+    if (!el || !hasMorePersons) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting) {
+          setVisibleCount((n) => n + PERSON_PAGE_SIZE);
+        }
+      },
+      { rootMargin: "200px" },
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [hasMorePersons, visibleCount, loading]);
 
   // A scan that was paused, closed or run with inline detection leaves faces without a
   // person. Grouping them is cheap (embeddings only), so it happens when the screen
@@ -326,7 +425,7 @@ export default function FacesView({
     try {
       await actions.renamePerson(personId, trimmed);
       onNotice(`Renamed to "${trimmed}"`);
-      loadPersons();
+      loadPersons(true);
       // Update selectedPerson name if this is the currently viewed person
       if (selectedPerson && selectedPerson.id === personId) {
         setSelectedPerson({ ...selectedPerson, name: trimmed });
@@ -477,7 +576,7 @@ export default function FacesView({
     try {
       await actions.mergePersons(source.id, target.id);
       onNotice(`Merged "${source.name}" into "${target.name}"`);
-      loadPersons();
+      loadPersons(true);
     } catch (err) {
       onError(String(err));
     }
@@ -489,7 +588,7 @@ export default function FacesView({
     try {
       await actions.setPersonsIgnored([person.id], ignored);
       onNotice(ignored ? `Ignored "${person.name}"` : `Restored "${person.name}"`);
-      loadPersons();
+      loadPersons(true);
     } catch (err) {
       onError(String(err));
     }
@@ -555,7 +654,7 @@ export default function FacesView({
       await actions.setPersonsIgnored(chosen.map((p) => p.id), ignored);
       const n = chosen.length;
       onNotice(`${ignored ? "Ignored" : "Restored"} ${n} ${n === 1 ? "person" : "people"}`);
-      loadPersons();
+      loadPersons(true);
     } catch (err) {
       onError(String(err));
     }
@@ -633,12 +732,7 @@ export default function FacesView({
     if (!canEdit || !contextMenu) return null;
     const isScrubbing = scrubPersonId === contextMenu.person.id && scrubCropUrl !== null;
     return (
-      <div
-        className="context-menu"
-        style={{ left: contextMenu.x, top: contextMenu.y }}
-        onMouseDown={(e) => e.stopPropagation()}
-        data-testid="faces-context-menu"
-      >
+      <ClampedMenu x={contextMenu.x} y={contextMenu.y} testId="faces-context-menu">
         <button
           type="button"
           className="context-menu-item"
@@ -684,24 +778,11 @@ export default function FacesView({
               Shuffle
             </button>
             {persons.length > 1 && (
-              <div className="context-menu-parent">
-                <span>Merge into</span>
-                <span className="context-menu-arrow">&#9654;</span>
-                <div className="context-menu-submenu">
-                  {persons
-                    .filter((p) => p.id !== contextMenu.person.id)
-                    .map((p) => (
-                      <button
-                        key={p.id}
-                        type="button"
-                        className="context-menu-item"
-                        onClick={() => handleMerge(contextMenu.person, p)}
-                      >
-                        {p.name} ({p.faceCount})
-                      </button>
-                    ))}
-                </div>
-              </div>
+              <PersonTargetSubmenu
+                label="Merge into"
+                targets={persons.filter((p) => p.id !== contextMenu.person.id)}
+                onPick={(p) => handleMerge(contextMenu.person, p)}
+              />
             )}
             <button
               type="button"
@@ -719,7 +800,7 @@ export default function FacesView({
             </button>
           </>
         )}
-      </div>
+      </ClampedMenu>
     );
   }
 
@@ -728,12 +809,7 @@ export default function FacesView({
     const targets = showIgnored ? activePeople : persons;
     const otherPersons = targets.filter((p) => p.id !== selectedPerson.id);
     return (
-      <div
-        className="context-menu"
-        style={{ left: detailContextMenu.x, top: detailContextMenu.y }}
-        onMouseDown={(e) => e.stopPropagation()}
-        data-testid="detail-context-menu"
-      >
+      <ClampedMenu x={detailContextMenu.x} y={detailContextMenu.y} testId="detail-context-menu">
         <button
           type="button"
           className="context-menu-item"
@@ -745,24 +821,9 @@ export default function FacesView({
           Remove from Person
         </button>
         {otherPersons.length > 0 && (
-          <div className="context-menu-parent">
-            <span>Move to</span>
-            <span className="context-menu-arrow">&#9654;</span>
-            <div className="context-menu-submenu">
-              {otherPersons.map((p) => (
-                <button
-                  key={p.id}
-                  type="button"
-                  className="context-menu-item"
-                  onClick={() => handleReassignFaces(p.id)}
-                >
-                  {p.name} ({p.faceCount})
-                </button>
-              ))}
-            </div>
-          </div>
+          <PersonTargetSubmenu label="Move to" targets={otherPersons} onPick={(p) => handleReassignFaces(p.id)} />
         )}
-      </div>
+      </ClampedMenu>
     );
   }
 
@@ -897,7 +958,7 @@ export default function FacesView({
         )}
         {!loading && persons.length > 0 && (
           <div className="faces-grid">
-            {persons.map((person, index) => {
+            {persons.slice(0, visibleCount).map((person, index) => {
               const isChecked = personSelected.has(index);
               const isScrubbing = scrubPersonId === person.id && scrubCropUrl !== null;
               const displayCrop = isScrubbing ? scrubCropUrl : library.personCropUrl(person);
@@ -962,6 +1023,7 @@ export default function FacesView({
             })}
           </div>
         )}
+        {!loading && hasMorePersons && <div ref={personSentinelRef} style={{ height: 1 }} />}
       </div>
 
       {renderPersonGridContextMenu()}

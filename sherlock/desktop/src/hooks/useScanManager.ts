@@ -218,10 +218,15 @@ export function useScanManager(cb: ScanManagerCallbacks) {
   /**
    * Starts a scan in `mode`, running the pre-scan prompt (vision settings) for
    * scans that will classify files. Returns the job, or null when the user
-   * cancelled or the call failed.
+   * cancelled or the call failed. `skipPrompt` is for callers that already asked.
    */
-  async function startScanWithMode(rootPath: string, mode: ScanMode, notice: string) {
-    if (mode !== "refresh" && cb.beforeScan && !(await cb.beforeScan(rootPath))) {
+  async function startScanWithMode(
+    rootPath: string,
+    mode: ScanMode,
+    notice: string,
+    options: { skipPrompt?: boolean } = {},
+  ) {
+    if (mode !== "refresh" && !options.skipPrompt && cb.beforeScan && !(await cb.beforeScan(rootPath))) {
       return null;
     }
     try {

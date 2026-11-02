@@ -22,6 +22,24 @@ describe("ConfirmReclassifyModal", () => {
     expect(onConfirm).toHaveBeenCalledWith(root, true);
   });
 
+  it("offers to redo the faces only for a folder", async () => {
+    const user = userEvent.setup();
+    const onConfirm = vi.fn();
+    render(
+      <ConfirmReclassifyModal
+        root={root}
+        folder={{ relPath: "2018/Book", name: "Book" }}
+        onCancel={() => {}}
+        onConfirm={onConfirm}
+      />,
+    );
+    const boxes = screen.getAllByRole("checkbox");
+    expect(boxes).toHaveLength(2);
+    await user.click(boxes[1]);
+    await user.click(screen.getByRole("button", { name: "Reclassify" }));
+    expect(onConfirm).toHaveBeenCalledWith(root, false, true);
+  });
+
   it("warns when a scan is running", () => {
     render(
       <ConfirmReclassifyModal root={root} isScanning onCancel={() => {}} onConfirm={() => {}} />,

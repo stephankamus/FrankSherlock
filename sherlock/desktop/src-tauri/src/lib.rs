@@ -1131,6 +1131,27 @@ fn reset_root_classifications(
     .map_err(|e| e.to_string())
 }
 
+/// [`reset_root_classifications`] for one folder of a root, optionally also forgetting
+/// its faces so the face pass reads them again.
+#[tauri::command]
+fn reset_folder_classifications(
+    root_id: i64,
+    rel_path: String,
+    drop_thumbnails: Option<bool>,
+    reset_faces: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<models::ReclassifyResult, String> {
+    require_writable(state.inner())?;
+    db::reset_folder_classifications(
+        &state.paths.db_file,
+        root_id,
+        &rel_path,
+        drop_thumbnails.unwrap_or(false),
+        reset_faces.unwrap_or(false),
+    )
+    .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn list_roots(state: State<'_, AppState>) -> Result<Vec<RootInfo>, String> {
     db::list_roots(&state.paths.db_file).map_err(|e| e.to_string())
@@ -3698,6 +3719,7 @@ pub fn run() {
             list_raw_conversions,
             remove_root,
             reset_root_classifications,
+            reset_folder_classifications,
             list_roots,
             probe_roots,
             relink_root,

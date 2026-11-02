@@ -205,6 +205,21 @@ describe("DirectoryTree", () => {
     expect(screen.queryByText("Hide folder")).not.toBeInTheDocument();
   });
 
+  it("asks to reclassify a folder from its context menu", async () => {
+    const onReclassifyFolder = vi.fn();
+    mockListSubdirs.mockResolvedValue(topLevelDirs);
+    render(wrap(
+      <DirectoryTree rootId={7} selectedSubdir={null} onSelectSubdir={vi.fn()} onReclassifyFolder={onReclassifyFolder} />,
+    ));
+    await waitFor(() => expect(screen.getByText("Photos")).toBeInTheDocument());
+
+    await userEvent.pointer({ keys: "[MouseRight]", target: screen.getByText("Photos") });
+    expect(screen.queryByText("Hide folder")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByText("Reclassify…"));
+
+    expect(onReclassifyFolder).toHaveBeenCalledWith(7, expect.objectContaining({ name: "Photos" }));
+  });
+
   it("hides a folder from its context menu and reloads the tree", async () => {
     const onSetFolderHidden = vi.fn(async () => {});
     mockListSubdirs.mockResolvedValue(topLevelDirs);

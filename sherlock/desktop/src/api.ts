@@ -134,6 +134,20 @@ export async function resetRootClassifications(
   return invoke<ReclassifyResult>("reset_root_classifications", { rootId, dropThumbnails });
 }
 
+/** [`resetRootClassifications`] for one folder (and its subfolders) of a root. */
+export async function resetFolderClassifications(
+  rootId: number,
+  relPath: string,
+  options: { dropThumbnails?: boolean; resetFaces?: boolean } = {},
+): Promise<ReclassifyResult> {
+  return invoke<ReclassifyResult>("reset_folder_classifications", {
+    rootId,
+    relPath,
+    dropThumbnails: options.dropThumbnails ?? false,
+    resetFaces: options.resetFaces ?? false,
+  });
+}
+
 export async function setStartupScan(value: StartupScanSetting): Promise<VisionSettings> {
   return invoke<VisionSettings>("set_startup_scan", { value });
 }

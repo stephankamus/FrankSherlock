@@ -458,6 +458,8 @@ pub struct ReclassifyResult {
     pub files: u64,
     /// Thumbnail files deleted from the cache (0 unless asked for).
     pub thumbnails: u64,
+    /// Face detections deleted (0 unless asked for).
+    pub faces: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

@@ -80,6 +80,34 @@ describe("FacesView", () => {
     });
   });
 
+  it("renders people in batches of 50, keeping the order it was given", async () => {
+    const many: PersonInfo[] = Array.from({ length: 120 }, (_, i) => ({
+      ...mockPerson,
+      id: i + 1,
+      name: `Many ${i + 1}`,
+      faceCount: 200 - i,
+    }));
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_persons") return many;
+      return null;
+    });
+    vi.stubGlobal(
+      "IntersectionObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+
+    const { container } = render(<FacesView {...defaultProps} />);
+    await waitFor(() => {
+      expect(container.querySelectorAll(".faces-card")).toHaveLength(50);
+    });
+    vi.unstubAllGlobals();
+    expect(screen.getByText("Many 1")).toBeInTheDocument();
+    expect(screen.queryByText("Many 51")).not.toBeInTheDocument();
+  });
+
   it("shows stats in toolbar", async () => {
     mockedInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === "list_persons") return [mockPerson, mockPerson2];
@@ -316,6 +344,41 @@ describe("FacesView", () => {
       expect(screen.getByTestId("faces-context-menu")).toBeInTheDocument();
       expect(screen.getByText("Shuffle")).toBeInTheDocument();
     });
+  });
+
+  it("limits the merge targets to 20 and filters them by name", async () => {
+    const many: PersonInfo[] = Array.from({ length: 60 }, (_, i) => ({
+      ...mockPerson,
+      id: i + 1,
+      name: `Pessoa ${i + 1}`,
+      faceCount: 100 - i,
+    }));
+    many[44] = { ...many[44], name: "Zelda" };
+    vi.stubGlobal(
+      "IntersectionObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_persons") return many;
+      return null;
+    });
+
+    render(<FacesView {...defaultProps} />);
+    await waitFor(() => expect(screen.getByText("Pessoa 1")).toBeInTheDocument());
+    fireEvent.contextMenu(screen.getByText("Pessoa 1").closest(".faces-card")!);
+
+    const menu = await screen.findByTestId("faces-context-menu");
+    const submenu = menu.querySelector(".context-menu-submenu") as HTMLElement;
+    expect(submenu.querySelectorAll("button.context-menu-item")).toHaveLength(20);
+    expect(within(submenu).queryByText(/Zelda/)).not.toBeInTheDocument();
+
+    await userEvent.type(within(submenu).getByLabelText("Search people"), "zel");
+    expect(within(submenu).getByText(/Zelda/)).toBeInTheDocument();
+    expect(submenu.querySelectorAll("button.context-menu-item")).toHaveLength(1);
+    vi.unstubAllGlobals();
   });
 
   it("shuffle calls set_representative_face", async () => {

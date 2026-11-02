@@ -1,4 +1,4 @@
-import type { Album, BacklogProgress, DbStats, FaceDetectProgress, RootInfo, ScanJobStatus, SmartFolder, ThumbRepairProgress, UpdateInfo } from "../types";
+import type { Album, BacklogProgress, DbStats, FaceDetectProgress, RootInfo, ScanJobStatus, SmartFolder, SubdirEntry, ThumbRepairProgress, UpdateInfo } from "../types";
 import { formatBytes } from "../utils/format";
 import { useDragReorder } from "../hooks/useDragReorder";
 import { formatEta } from "../utils/scanEta";
@@ -26,6 +26,8 @@ type SidebarProps<TRoot extends RootInfo = RootInfo> = {
   includeHiddenFolders?: boolean;
   /** Hide or show a folder and everything below it; omitted where the app is read-only. */
   onSetFolderHidden?: (rootId: number, relPath: string, hidden: boolean) => Promise<void> | void;
+  /** Classify a folder of a root again; omitted where the app is read-only. */
+  onReclassifyFolder?: (rootId: number, entry: SubdirEntry) => void;
   onSelectRoot: (rootId: number | null) => void;
   onDeleteRoot: (root: TRoot) => void;
   onPickAndScan: () => void;
@@ -87,7 +89,7 @@ type SidebarProps<TRoot extends RootInfo = RootInfo> = {
 export default function Sidebar<TRoot extends RootInfo = RootInfo>({
   roots, selectedRootId, activeScans, dbStats, readOnly,
   setupReady, albums, smartFolders, activeAlbumName, activeSmartFolderId,
-  selectedSubdir, faceProgress, onSelectSubdir, includeHiddenFolders, onSetFolderHidden,
+  selectedSubdir, faceProgress, onSelectSubdir, includeHiddenFolders, onSetFolderHidden, onReclassifyFolder,
   onSelectRoot, onDeleteRoot, onRescanRoot, onRefreshRoot, onCopyRootPath, onPickAndScan,
   onRelinkRoot, onReclassifyRoot, onConvertRawRoot, onConvertVideosRoot, onCompactDatabase, compacting,
   thumbRepair, onRepairThumbnails, onCancelThumbRepair, onProcessBacklog,
@@ -210,6 +212,7 @@ export default function Sidebar<TRoot extends RootInfo = RootInfo>({
                     onSelectSubdir={onSelectSubdir}
                     includeHidden={includeHiddenFolders}
                     onSetFolderHidden={readOnly ? undefined : onSetFolderHidden}
+                    onReclassifyFolder={readOnly ? undefined : onReclassifyFolder}
                   />
                 )}
               </div>

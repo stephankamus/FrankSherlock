@@ -213,6 +213,8 @@ export type ReclassifyResult = {
   files: number;
   /** Thumbnail files deleted from the cache (0 unless asked for). */
   thumbnails: number;
+  /** Face detections deleted (0 unless asked for). */
+  faces: number;
 };
 
 export type PurgeResult = {

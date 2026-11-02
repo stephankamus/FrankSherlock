@@ -3242,34 +3242,100 @@ pub fn reset_root_classifications(
     root_id: i64,
     drop_thumbnails: bool,
 ) -> AppResult<crate::models::ReclassifyResult> {
+    reset_folder_classifications(db_path, root_id, "", drop_thumbnails, false)
+}
+
+/// [`reset_root_classifications`] limited to one folder (and its subfolders) of a root.
+///
+/// `rel_path` is the folder relative to the root; an empty path is the whole root.
+/// `reset_faces` also deletes the faces of those files and marks them as not yet
+/// scanned, so the face pass reads them again. People left without any face are
+/// removed, and the representative of the others is recomputed.
+pub fn reset_folder_classifications(
+    db_path: &Path,
+    root_id: i64,
+    rel_path: &str,
+    drop_thumbnails: bool,
+    reset_faces: bool,
+) -> AppResult<crate::models::ReclassifyResult> {
     let conn = open_conn(db_path)?;
     let tx = conn.unchecked_transaction()?;
     let now = now_epoch_secs();
+    let normalized = crate::paths::normalize_rel_path(rel_path);
+    let folder = normalized.trim_matches('/').to_string();
+    let prefix_len = folder.chars().count() as i64 + 1;
+    // Same folder test as `set_folder_hidden`: "a/b" must not match "a/bc/x.jpg".
+    const IN_FOLDER: &str = "(?2 = '' OR substr(rel_path, 1, ?3) = ?2 || '/')";
 
     let ids: Vec<i64> = {
         let mut stmt = tx.prepare(&format!(
             "SELECT id FROM files
-             WHERE root_id = ?1 AND deleted_at IS NULL AND NOT {PENDING_CLASSIFICATION_SQL}"
+             WHERE root_id = ?1 AND {IN_FOLDER} AND deleted_at IS NULL
+               AND NOT {PENDING_CLASSIFICATION_SQL}"
         ))?;
-        let rows = stmt.query_map(params![root_id], |row| row.get::<_, i64>(0))?;
+        let rows = stmt.query_map(params![root_id, folder, prefix_len], |row| {
+            row.get::<_, i64>(0)
+        })?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
     // Every row with a pointer, classified or not: the goal is the empty state.
     let thumb_paths: Vec<String> = if drop_thumbnails {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare(&format!(
             "SELECT thumb_path FROM files
-             WHERE root_id = ?1 AND deleted_at IS NULL AND thumb_path IS NOT NULL",
-        )?;
-        let rows = stmt.query_map(params![root_id], |row| row.get::<_, String>(0))?;
+             WHERE root_id = ?1 AND {IN_FOLDER} AND deleted_at IS NULL
+               AND thumb_path IS NOT NULL"
+        ))?;
+        let rows = stmt.query_map(params![root_id, folder, prefix_len], |row| {
+            row.get::<_, String>(0)
+        })?;
         rows.collect::<Result<Vec<_>, _>>()?
     } else {
         Vec::new()
     };
 
-    if ids.is_empty() && thumb_paths.is_empty() {
+    let mut face_crops: Vec<String> = Vec::new();
+    let mut faces_removed = 0u64;
+    if reset_faces {
+        let folder_files = format!(
+            "SELECT id FROM files WHERE root_id = ?1 AND {IN_FOLDER} AND deleted_at IS NULL"
+        );
+        let affected_people: Vec<i64> = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT DISTINCT person_id FROM face_detections
+                 WHERE person_id IS NOT NULL AND file_id IN ({folder_files})"
+            ))?;
+            let rows = stmt.query_map(params![root_id, folder, prefix_len], |r| r.get::<_, i64>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT crop_path FROM face_detections
+                 WHERE crop_path IS NOT NULL AND file_id IN ({folder_files})"
+            ))?;
+            let rows = stmt.query_map(params![root_id, folder, prefix_len], |r| r.get::<_, String>(0))?;
+            face_crops = rows.collect::<Result<Vec<_>, _>>()?;
+        }
+        faces_removed = tx.execute(
+            &format!("DELETE FROM face_detections WHERE file_id IN ({folder_files})"),
+            params![root_id, folder, prefix_len],
+        )? as u64;
+        tx.execute(
+            &format!(
+                "UPDATE files SET face_count = 0, faces_scanned_at = NULL, updated_at = ?4
+                 WHERE root_id = ?1 AND {IN_FOLDER} AND deleted_at IS NULL"
+            ),
+            params![root_id, folder, prefix_len, now],
+        )?;
+        for person_id in affected_people {
+            cleanup_person_after_face_removal(&tx, person_id)?;
+        }
+    }
+
+    if ids.is_empty() && thumb_paths.is_empty() && faces_removed == 0 {
         return Ok(crate::models::ReclassifyResult {
             files: 0,
             thumbnails: 0,
+            faces: 0,
         });
     }
 
@@ -3279,10 +3345,11 @@ pub fn reset_root_classifications(
                 "UPDATE files
                  SET description = '', description_lang = '', extracted_text = '',
                      canonical_mentions = '',
-                     confidence = 0, lang_hint = '', document_hint = '', updated_at = ?2
-                 WHERE root_id = ?1 AND deleted_at IS NULL AND NOT {PENDING_CLASSIFICATION_SQL}"
+                     confidence = 0, lang_hint = '', document_hint = '', updated_at = ?4
+                 WHERE root_id = ?1 AND {IN_FOLDER} AND deleted_at IS NULL
+                   AND NOT {PENDING_CLASSIFICATION_SQL}"
             ),
-            params![root_id, now],
+            params![root_id, folder, prefix_len, now],
         )?;
         for id in &ids {
             refresh_fts(&tx, *id)?;
@@ -3290,10 +3357,13 @@ pub fn reset_root_classifications(
     }
     if !thumb_paths.is_empty() {
         tx.execute(
-            "UPDATE files
-             SET thumb_path = NULL, updated_at = ?2
-             WHERE root_id = ?1 AND deleted_at IS NULL AND thumb_path IS NOT NULL",
-            params![root_id, now],
+            &format!(
+                "UPDATE files
+                 SET thumb_path = NULL, updated_at = ?4
+                 WHERE root_id = ?1 AND {IN_FOLDER} AND deleted_at IS NULL
+                   AND thumb_path IS NOT NULL"
+            ),
+            params![root_id, folder, prefix_len, now],
         )?;
     }
     tx.commit()?;
@@ -3305,16 +3375,22 @@ pub fn reset_root_classifications(
             thumbnails += 1;
         }
     }
+    for path in &face_crops {
+        let _ = std::fs::remove_file(path);
+    }
 
     log::info!(
-        "reset_root_classifications: root {} lost {} classification(s) and {} thumbnail(s)",
+        "reset_folder_classifications: root {} folder '{}' lost {} classification(s), {} thumbnail(s), {} face(s)",
         root_id,
+        folder,
         ids.len(),
-        thumbnails
+        thumbnails,
+        faces_removed
     );
     Ok(crate::models::ReclassifyResult {
         files: ids.len() as u64,
         thumbnails,
+        faces: faces_removed,
     })
 }
 
@@ -5447,7 +5523,7 @@ fn list_persons_filtered(
          WHERE fil.deleted_at IS NULL AND fil.hidden_at IS NULL AND {ignored_clause} {scope_clause}
          GROUP BY p.id
          HAVING face_count > 0
-         ORDER BY face_count DESC"
+         ORDER BY face_count DESC, p.id"
     );
 
     let mut stmt = conn.prepare(&sql)?;
@@ -5503,6 +5579,14 @@ fn list_persons_filtered(
             thumbnail_path,
         });
     }
+
+    // Named people first, then the auto-named ones; each group by face count, biggest first.
+    persons.sort_by(|a, b| {
+        is_default_person_name(&a.name)
+            .cmp(&is_default_person_name(&b.name))
+            .then(b.face_count.cmp(&a.face_count))
+            .then(a.id.cmp(&b.id))
+    });
 
     Ok(persons)
 }
@@ -10192,6 +10276,60 @@ mod tests {
     }
 
     #[test]
+    fn reset_folder_classifications_only_touches_that_folder_and_can_reset_faces() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/folder-reset").expect("root");
+        let inside = upsert_file_record(&db_path, &sample_record(root_id, "a/b/in.jpg", "f1")).expect("in");
+        let nested = upsert_file_record(&db_path, &sample_record(root_id, "a/b/c/deep.jpg", "f2")).expect("deep");
+        let sibling = upsert_file_record(&db_path, &sample_record(root_id, "a/bc/out.jpg", "f3")).expect("sib");
+        let other = upsert_file_record(&db_path, &sample_record(root_id, "z/out.jpg", "f4")).expect("other");
+
+        let mut emb: Vec<f32> = vec![0.0; 512];
+        emb[0] = 1.0;
+        insert_test_face(&db_path, inside, &emb);
+        let mut emb2: Vec<f32> = vec![0.0; 512];
+        emb2[1] = 1.0;
+        insert_test_face(&db_path, other, &emb2);
+        cluster_faces(&db_path, 0.45).expect("cluster");
+        assert_eq!(list_persons(&db_path, &[]).expect("list").len(), 2);
+
+        let conn = open_conn(&db_path).expect("conn");
+        update_file_thumb_path_by_id_conn(&conn, inside, "/tmp/thumbs/in.jpg").expect("thumb");
+        drop(conn);
+
+        let outcome =
+            reset_folder_classifications(&db_path, root_id, "a/b", false, true).expect("reset");
+        assert_eq!(outcome.files, 2, "'a/b' and 'a/b/c' only; 'a/bc' is another folder");
+        assert_eq!(outcome.faces, 1);
+
+        let conn = open_conn(&db_path).expect("conn");
+        let described = |id: i64| -> bool {
+            let d: String = conn
+                .query_row("SELECT description FROM files WHERE id = ?1", [id], |r| r.get(0))
+                .expect("row");
+            !d.is_empty()
+        };
+        assert!(!described(inside));
+        assert!(!described(nested));
+        assert!(described(sibling));
+        assert!(described(other));
+        let (count, scanned): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT face_count, faces_scanned_at FROM files WHERE id = ?1",
+                [inside],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(count, 0);
+        assert!(scanned.is_none(), "the face pass must pick the file up again");
+        drop(conn);
+
+        let people = list_persons(&db_path, &[]).expect("list");
+        assert_eq!(people.len(), 1, "the person whose only face was reset is gone");
+    }
+
+    #[test]
     fn reset_root_classifications_can_also_drop_the_thumbnails() {
         let (dir, db_path) = test_db_path();
         init_database(&db_path).expect("init");
@@ -11086,6 +11224,31 @@ mod tests {
         names.sort();
         assert_eq!(names.iter().filter(|n| n.as_str() == "Maria").count(), 1);
         assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn list_persons_puts_named_people_first() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/order").expect("root");
+        for (rel, fp) in [("a.jpg", "oa"), ("b.jpg", "ob"), ("c.jpg", "oc")] {
+            upsert_file_record(&db_path, &sample_record(root_id, rel, fp)).expect("file");
+        }
+        for (i, rel) in ["a.jpg", "b.jpg", "c.jpg"].iter().enumerate() {
+            let f = file_id_by_path(&db_path, root_id, rel);
+            let mut emb: Vec<f32> = vec![0.0; 512];
+            emb[i] = 1.0;
+            insert_test_face(&db_path, f, &emb);
+        }
+        cluster_faces(&db_path, 0.45).expect("cluster");
+        let people = list_persons(&db_path, &[]).expect("list");
+        assert_eq!(people.len(), 3);
+        let last = people[2].id;
+        rename_person(&db_path, last, "Ana").expect("rename");
+
+        let after = list_persons(&db_path, &[]).expect("list");
+        assert_eq!(after[0].name, "Ana");
+        assert!(after[1].name.starts_with("Person "));
     }
 
     #[test]
