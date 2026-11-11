@@ -8,6 +8,7 @@
 
 pub mod api;
 pub mod assets;
+pub mod auth;
 pub mod config;
 pub mod library;
 pub mod media;
@@ -22,6 +23,9 @@ pub use media::MediaMap;
 pub struct AppState {
     pub config: Config,
     pub library: Library,
+    /// Sessions and the revision-keyed user directory. Kept out of `Library` because
+    /// it is an authentication concern, not part of the published snapshot.
+    pub auth: auth::AuthState,
 }
 
 impl AppState {
@@ -29,6 +33,7 @@ impl AppState {
         Arc::new(Self {
             library: Library::new(config.library_dir.clone()),
             config,
+            auth: auth::AuthState::new(),
         })
     }
 }

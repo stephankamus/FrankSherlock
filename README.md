@@ -147,15 +147,15 @@ O cliente web é uma visão somente leitura de uma biblioteca publicada pelo des
 
 ```bash
 cd sherlock/web
-cp .env.example .env       # defina AUTH_TOKEN e os caminhos do host
+cp .env.example .env       # defina os caminhos do host; AUTH_TOKEN é opcional
 docker compose up -d --build
 ```
 
-4. **Entre pelo navegador:** abra a URL do serviço e informe o mesmo `AUTH_TOKEN` na tela de login. O token é guardado no `localStorage` do dispositivo. Um link com `?token=...` continua funcionando para o primeiro acesso e é removido da barra de endereços depois de armazenado.
+4. **Crie a conta e entre:** no desktop, abra **Web users** na sidebar, crie pelo menos uma conta e publique a biblioteca. Depois abra a URL do serviço e entre com login e senha. O `AUTH_TOKEN` continua opcional, como token de API somente leitura para scripts; um link com `?token=...` ainda entra uma vez e é removido da barra de endereços.
 
 O cliente web inclui busca com filtros e ordenação, grade com scroll infinito, sidebar de raízes, subdiretórios, álbuns e smart folders, visualização de rostos, duplicados informativos, preview de imagem/vídeo/PDF, layout responsivo com drawer, manifest PWA e service worker do app shell. A API é sempre network-only; não existe biblioteca offline.
 
-O token do aplicativo é uma segunda barreira, não a principal: coloque um reverse proxy na frente (Caddy, Traefik, nginx) com Basic Auth ou Authentik e TLS. Sem isso, qualquer dispositivo da LAN lê a biblioteca inteira. `AUTH_TOKEN` vazio desabilita a checagem e registra um `WARN` no log; use apenas para depuração.
+As contas ficam na tabela `users` do snapshot publicado; a senha é guardada como hash Argon2id. O login cria uma sessão em memória com cookie `HttpOnly`/`SameSite=Strict`. Reiniciar o container encerra as sessões, e publicar uma revisão que apaga um usuário ou muda a senha invalida a sessão antiga. O `AUTH_TOKEN` é opcional e somente leitura: aceito como `Authorization: Bearer …` ou `?token=…`, útil para scripts e para o primeiro acesso antes de publicar uma conta. Coloque um reverse proxy na frente (Caddy, Traefik, nginx) com Basic Auth ou Authentik e TLS; defina `COOKIE_SECURE=1` se o proxy não enviar `X-Forwarded-Proto: https`.
 
 Veja [docs/web-deploy.md](docs/web-deploy.md) para o passo a passo completo, incluindo SMB/CIFS, GVFS, diagnóstico de 401/503 e instalação no celular.
 
@@ -503,15 +503,15 @@ The web app is a read-only view of a library published by the desktop. The deskt
 
 ```bash
 cd sherlock/web
-cp .env.example .env       # set AUTH_TOKEN and the host paths inside
+cp .env.example .env       # set the host paths; AUTH_TOKEN is optional
 docker compose up -d --build
 ```
 
-4. **Sign in from the browser:** open the service URL and enter the same `AUTH_TOKEN` in the login screen. The token is stored in the device's `localStorage`. A link with `?token=...` still works for the first visit and is removed from the address bar after it is stored.
+4. **Create the account and sign in:** in the desktop app, open **Web users** in the sidebar, create at least one account and publish the library. Then open the service URL and sign in with login and password. `AUTH_TOKEN` remains optional as a read-only API token for scripts; a link with `?token=...` still signs in once and is removed from the address bar.
 
 The web client includes search with filters and sorting, an infinite-scroll grid, a sidebar with roots, subdirectories, albums and smart folders, face browsing, informative duplicates, image/video/PDF preview, a responsive layout with a drawer, a PWA manifest and an app-shell service worker. The API is always network-only; there is no offline library.
 
-The app token is a second barrier, not the primary one: put a reverse proxy in front (Caddy, Traefik, nginx) with Basic Auth or Authentik and TLS. Without it, any device on the LAN can read the whole library. An empty `AUTH_TOKEN` disables the check and logs a `WARN`; use it for debugging only.
+Accounts live in the `users` table of the published snapshot, and passwords are stored as Argon2id hashes. A successful login creates an in-memory session with an `HttpOnly`/`SameSite=Strict` cookie. Restarting the container ends all sessions, and publishing a revision that deletes a user or changes a password invalidates that user's old session. `AUTH_TOKEN` is optional and read-only: accepted as `Authorization: Bearer …` or `?token=…`, useful for scripts and for entering before an account is published. Put a reverse proxy in front (Caddy, Traefik, nginx) with Basic Auth or Authentik and TLS; set `COOKIE_SECURE=1` if the proxy does not send `X-Forwarded-Proto: https`.
 
 See [docs/web-deploy.md](docs/web-deploy.md) for the full walkthrough, including SMB/CIFS, GVFS, 401/503 troubleshooting and installing on a phone.
 

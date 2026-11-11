@@ -14,10 +14,13 @@ use sherlock_web::{api, AppState, Config, MediaMap};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
+use sherlock_core::auth;
 use sherlock_core::db;
 use sherlock_core::models::FileRecordUpsert;
 
 const TOKEN: &str = "test-token";
+const USER_LOGIN: &str = "ana";
+const USER_PASSWORD: &str = "secret123";
 
 struct Fixture {
     _temp: TempDir,
@@ -66,6 +69,8 @@ fn build() -> Fixture {
 
     let db_file = library.join("index.rev-001.sqlite");
     db::init_database(&db_file).expect("init");
+    let hash = auth::hash_password(USER_PASSWORD).expect("hash");
+    db::create_user(&db_file, "Ana", USER_LOGIN, &hash).expect("user");
 
     let stored_root = db::upsert_root(&db_file, "/stored").expect("root");
     let other_root = db::upsert_root(&db_file, "/elsewhere").expect("root");
@@ -125,6 +130,7 @@ fn build() -> Fixture {
         library_dir: library.clone(),
         media_map,
         auth_token: Some(TOKEN.to_string()),
+        cookie_secure: false,
         cache_dir: cache.clone(),
         port: 0,
     };
@@ -141,18 +147,7 @@ fn build() -> Fixture {
     }
 }
 
-async fn get_with_headers(
-    state: &Arc<AppState>,
-    uri: &str,
-    extra: &[(&str, &str)],
-) -> (StatusCode, HeaderMap, Vec<u8>) {
-    let mut builder = Request::builder()
-        .uri(uri)
-        .header("Authorization", format!("Bearer {TOKEN}"));
-    for (name, value) in extra {
-        builder = builder.header(*name, *value);
-    }
-    let request = builder.body(Body::empty()).expect("request");
+async fn send(state: &Arc<AppState>, request: Request<Body>) -> (StatusCode, HeaderMap, Vec<u8>) {
     let response = api::app(Arc::clone(state))
         .oneshot(request)
         .await
@@ -169,9 +164,90 @@ async fn get_with_headers(
     (status, headers, body)
 }
 
+async fn get_with_headers(
+    state: &Arc<AppState>,
+    uri: &str,
+    extra: &[(&str, &str)],
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let mut builder = Request::builder()
+        .uri(uri)
+        .header("Authorization", format!("Bearer {TOKEN}"));
+    for (name, value) in extra {
+        builder = builder.header(*name, *value);
+    }
+    let request = builder.body(Body::empty()).expect("request");
+    send(state, request).await
+}
+
 async fn get(state: &Arc<AppState>, uri: &str) -> (StatusCode, Vec<u8>) {
     let (status, _, body) = get_with_headers(state, uri, &[]).await;
     (status, body)
+}
+
+async fn get_with_cookie(
+    state: &Arc<AppState>,
+    uri: &str,
+    cookie: &str,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let request = Request::builder()
+        .uri(uri)
+        .header("Cookie", cookie)
+        .body(Body::empty())
+        .expect("request");
+    send(state, request).await
+}
+
+async fn post_json(
+    state: &Arc<AppState>,
+    uri: &str,
+    body: serde_json::Value,
+    extra: &[(&str, &str)],
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("Content-Type", "application/json");
+    for (name, value) in extra {
+        builder = builder.header(*name, *value);
+    }
+    let request = builder
+        .body(Body::from(serde_json::to_vec(&body).expect("json")))
+        .expect("request");
+    send(state, request).await
+}
+
+/// Log in as the fixture user and return the `Cookie` header the browser would send.
+async fn user_session(fixture: &Fixture) -> String {
+    let (status, headers, _) = post_json(
+        &fixture.state,
+        "/api/auth/login",
+        serde_json::json!({ "login": USER_LOGIN, "password": USER_PASSWORD }),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let set_cookie = headers["set-cookie"].to_str().expect("set-cookie");
+    set_cookie
+        .split(';')
+        .next()
+        .expect("cookie pair")
+        .to_string()
+}
+
+fn write_pointer(fixture: &Fixture, revision: &str, database: &str) -> std::io::Result<()> {
+    let pointer = serde_json::json!({
+        "format": 1,
+        "revision": revision,
+        "schemaVersion": 26,
+        "database": { "file": database, "bytes": 1, "sha256": "00" },
+        "library": { "files": 4, "roots": 2, "hiddenFiles": 1 },
+        "thumbnails": { "dir": "thumbs" },
+        "faceCrops": { "dir": "" },
+    });
+    std::fs::write(
+        fixture.library.join("current.json"),
+        serde_json::to_vec(&pointer).expect("pointer"),
+    )
 }
 
 fn json(body: &[u8]) -> serde_json::Value {
@@ -210,6 +286,203 @@ async fn the_token_is_also_accepted_as_a_query_parameter() {
     let fixture = build();
     let (status, _) = get(&fixture.state, &format!("/api/search?token={TOKEN}")).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn user_login_sets_an_httponly_cookie_and_me_returns_the_user() {
+    let fixture = build();
+    let (status, headers, body) = post_json(
+        &fixture.state,
+        "/api/auth/login",
+        serde_json::json!({ "login": USER_LOGIN, "password": USER_PASSWORD }),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let me = json(&body);
+    assert_eq!(me["kind"], "user");
+    assert_eq!(me["name"], "Ana");
+    assert_eq!(me["login"], USER_LOGIN);
+
+    let set_cookie = headers["set-cookie"].to_str().expect("set-cookie");
+    assert!(set_cookie.starts_with("fs_session="));
+    assert!(set_cookie.contains("HttpOnly"));
+    assert!(set_cookie.contains("SameSite=Strict"));
+    assert!(set_cookie.contains("Max-Age="));
+    // The cookie is the session, not a copy of the password.
+    assert!(!set_cookie.contains(USER_PASSWORD));
+
+    let cookie = set_cookie
+        .split(';')
+        .next()
+        .expect("cookie pair")
+        .to_string();
+    let (status, _, body) = get_with_cookie(&fixture.state, "/api/auth/me", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&body)["login"], USER_LOGIN);
+}
+
+#[tokio::test]
+async fn a_wrong_password_is_401_and_sets_no_cookie() {
+    let fixture = build();
+    let (status, headers, body) = post_json(
+        &fixture.state,
+        "/api/auth/login",
+        serde_json::json!({ "login": USER_LOGIN, "password": "wrong-password" }),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(!headers.contains_key("set-cookie"));
+    assert_eq!(json(&body)["error"], "invalid credentials");
+}
+
+#[tokio::test]
+async fn an_unknown_login_gets_the_same_generic_401() {
+    let fixture = build();
+    let (status, _, body) = post_json(
+        &fixture.state,
+        "/api/auth/login",
+        serde_json::json!({ "login": "nobody", "password": "whatever123" }),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(json(&body)["error"], "invalid credentials");
+}
+
+#[tokio::test]
+async fn a_session_cookie_authorizes_search_and_media() {
+    let fixture = build();
+    let cookie = user_session(&fixture).await;
+
+    let (status, _, body) = get_with_cookie(&fixture.state, "/api/search", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&body)["total"], 3);
+
+    let (status, _, body) = get_with_cookie(
+        &fixture.state,
+        &format!("/api/thumb/{}", fixture.visible_id),
+        &cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"jpeg-bytes");
+}
+
+#[tokio::test]
+async fn the_optional_token_still_identifies_itself_as_a_token() {
+    let fixture = build();
+    let (status, body) = get(&fixture.state, "/api/auth/me").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&body)["kind"], "token");
+    assert_eq!(json(&body)["name"], "Access token");
+}
+
+#[tokio::test]
+async fn logout_invalidates_the_session() {
+    let fixture = build();
+    let cookie = user_session(&fixture).await;
+
+    let (status, headers, _) = post_json(
+        &fixture.state,
+        "/api/auth/logout",
+        serde_json::json!({}),
+        &[("Cookie", cookie.as_str())],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(headers["set-cookie"]
+        .to_str()
+        .expect("clear cookie")
+        .contains("Max-Age=0"));
+
+    let (status, _, _) = get_with_cookie(&fixture.state, "/api/auth/me", &cookie).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_password_change_in_a_new_revision_invalidates_the_session() {
+    let fixture = build();
+    let cookie = user_session(&fixture).await;
+
+    let db_file = fixture.library.join("index.rev-001.sqlite");
+    let user = db::find_user_credentials_by_login(&db_file, USER_LOGIN)
+        .expect("lookup")
+        .expect("user");
+    let new_hash = auth::hash_password("new-secret-456").expect("hash");
+    db::set_user_password(&db_file, user.id, &new_hash).expect("password");
+
+    // What a publish does: a new immutable snapshot, then an atomically replaced
+    // pointer. The auth directory is keyed by revision, so the old session must be
+    // checked against the new hash instead of staying valid until expiry.
+    std::fs::copy(&db_file, fixture.library.join("index.rev-002.sqlite")).expect("copy");
+    write_pointer(&fixture, "rev-002", "index.rev-002.sqlite").expect("pointer");
+
+    let (status, _, _) = get_with_cookie(&fixture.state, "/api/auth/me", &cookie).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, _, _) = post_json(
+        &fixture.state,
+        "/api/auth/login",
+        serde_json::json!({ "login": USER_LOGIN, "password": "new-secret-456" }),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_missing_users_table_answers_a_clear_503() {
+    let fixture = build();
+    // An old snapshot has no `users` table. The login must explain how to fix it
+    // instead of surfacing a raw SQLite error as a 500.
+    std::fs::write(fixture.library.join("index.rev-003.sqlite"), b"").expect("empty db");
+    write_pointer(&fixture, "rev-003", "index.rev-003.sqlite").expect("pointer");
+
+    let (status, _, body) = post_json(
+        &fixture.state,
+        "/api/auth/login",
+        serde_json::json!({ "login": USER_LOGIN, "password": USER_PASSWORD }),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        json(&body)["error"]
+            .as_str()
+            .expect("error")
+            .contains("users table"),
+        "{body:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_users_table_explains_that_an_account_must_be_published() {
+    let fixture = build();
+    let db_file = fixture.library.join("index.rev-001.sqlite");
+    let user = db::find_user_credentials_by_login(&db_file, USER_LOGIN)
+        .expect("lookup")
+        .expect("user");
+    db::delete_user(&db_file, user.id).expect("delete");
+    std::fs::copy(&db_file, fixture.library.join("index.rev-004.sqlite")).expect("copy");
+    write_pointer(&fixture, "rev-004", "index.rev-004.sqlite").expect("pointer");
+
+    let (status, _, body) = post_json(
+        &fixture.state,
+        "/api/auth/login",
+        serde_json::json!({ "login": USER_LOGIN, "password": USER_PASSWORD }),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        json(&body)["error"]
+            .as_str()
+            .expect("error")
+            .contains("create one in the desktop app"),
+        "{body:?}"
+    );
 }
 
 #[tokio::test]

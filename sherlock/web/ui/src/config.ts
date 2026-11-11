@@ -42,9 +42,15 @@ export function clearToken(storage: Storage = window.localStorage): void {
   }
 }
 
-/** Same-origin client: the binary that served this bundle also serves `/api`. */
+/**
+ * Same-origin client: the binary that served this bundle also serves `/api`.
+ *
+ * An empty token means user-session mode: the HttpOnly cookie is sent by the browser
+ * and the media URLs stay clean. Token mode passes the optional `AUTH_TOKEN`, which
+ * also adds `?token=` to media URLs.
+ */
 export function createWebClient(
-  token: string = resolveToken(),
+  token = "",
   onUnauthorized?: () => void,
 ): ReturnType<typeof createHttpLibraryClient> {
   return createHttpLibraryClient({ token, onUnauthorized });

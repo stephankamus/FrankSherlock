@@ -10,6 +10,7 @@
 //! re-export in the desktop crate — the modules themselves are already stateless
 //! (`fn(db_path: &Path)` everywhere), so nothing here ever learned about Tauri.
 
+pub mod auth;
 pub mod classify;
 pub mod db;
 pub mod error;

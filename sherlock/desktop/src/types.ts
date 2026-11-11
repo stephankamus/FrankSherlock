@@ -45,6 +45,15 @@ export type ParsedQuery = SharedParsedQuery;
 export type SearchItem = SharedSearchItem & { absPath: string };
 export type SearchResponse = SharedSearchResponse<SearchItem>;
 
+/** A web account managed by the desktop. The password hash never leaves the backend. */
+export type User = {
+  id: number;
+  name: string;
+  login: string;
+  createdAt: number;
+  updatedAt: number;
+};
+
 /** One directory that has convertible files, as reported before a job starts. */
 export type RawDirCount = {
   relPath: string;

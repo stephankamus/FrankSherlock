@@ -108,14 +108,16 @@ reboot — which is why the cifs mount is the recommendation.
 
 ```bash
 cd sherlock/web
-cp .env.example .env       # set AUTH_TOKEN and the host paths inside
+cp .env.example .env       # set the host paths; AUTH_TOKEN is optional
 docker compose up -d --build
 ```
 
-`.env` holds the bearer token, so it is git-ignored; `.env.example` documents every
-variable compose consumes. Inline overrides still work when you do not want a file:
+`.env` holds the optional API token and the `COOKIE_SECURE` switch, so it is git-ignored;
+`.env.example` documents every variable compose consumes. Inline overrides still work
+when you do not want a file:
 
 ```bash
+# Only needed for script/API access, or before the first user is published.
 AUTH_TOKEN="$(openssl rand -hex 24)" \
 PUBLISH_DIR=/mnt/publish \
 PHOTOS_DIR=/mnt/fotos \
@@ -129,6 +131,7 @@ docker run -d --name sherlock-web \
   --read-only --tmpfs /tmp \
   -p 8080:8080 \
   -e AUTH_TOKEN=... \
+  -e COOKIE_SECURE=1 \
   -v /mnt/publish:/library:ro \
   -v /mnt/fotos:/mnt/fotos:ro \
   -v "$PWD/config:/config:ro" \
@@ -139,7 +142,8 @@ docker run -d --name sherlock-web \
 |---|---|
 | `LIBRARY_DIR` | mount of the publish folder (`/library`) |
 | `MEDIA_MAP` | JSON mapping stored root paths to container mounts |
-| `AUTH_TOKEN` | bearer token for `/api`; empty disables auth and logs a warning |
+| `AUTH_TOKEN` | optional read-only API token; empty means only published user accounts can enter |
+| `COOKIE_SECURE` | mark the session cookie `Secure`; also inferred from `X-Forwarded-Proto: https` |
 | `CACHE_DIR` | writable dir for `?w=` derivatives (tmpfs, disposable) |
 | `PORT` | listener port (default 8080) |
 | `LIBRARY_COPY_TO_LOCAL` | reserved for slow shares (not implemented yet) |
@@ -147,14 +151,32 @@ docker run -d --name sherlock-web \
 The container runs as a non-root user, with a read-only root filesystem; only `/tmp`
 is writable.
 
-## 4. Auth and TLS
+## 4. Accounts, tokens and TLS
 
-The app token is a second barrier, not the primary one: put a reverse proxy in front
-(Caddy, Traefik, nginx) with Basic Auth or Authentik and TLS. The token can be passed as
-`Authorization: Bearer …` or `?token=…` (the query form is what makes `<img>` and
-`<video>` work without custom headers). Open the app once as
-`https://photos.example.com/?token=…`; the client stores it in `localStorage` and removes
-it from the address bar.
+Create the web accounts in the desktop app: open **Web users** in the sidebar, create at
+least one account and then publish (**Settings → Publicação**). The users table travels
+inside the same snapshot as the index, so a user change reaches the browser only after
+the next publish. The web server never writes users and never receives a plaintext
+password.
+
+The login screen accepts a **login and password**. Passwords are stored as Argon2id
+hashes. A successful login creates an in-memory session and sets an `HttpOnly`,
+`SameSite=Strict` cookie; the browser sends it automatically for JSON and media requests,
+so user sessions do not put a secret in a URL. Sessions are lost when the container
+restarts. A publish that deletes a user or changes a password invalidates that user's
+session on the next request.
+
+`AUTH_TOKEN` remains optional and **read-only**. It is accepted as
+`Authorization: Bearer …` or `?token=…` and is useful for scripts and for entering the
+site before the first user is published. It does not grant any account-management or
+write capability. The `?token=` link still signs in once, is stored in `localStorage` and
+is removed from the address bar; token mode appends the token to media URLs, so those
+URLs end up in proxy logs.
+
+The user session cookie is an additional barrier, not the primary one: put a reverse
+proxy in front (Caddy, Traefik, nginx) with Basic Auth or Authentik and TLS. Set
+`COOKIE_SECURE=1` when the proxy does not send `X-Forwarded-Proto: https`. Without TLS,
+traffic on the LAN can be read by anyone on the path.
 
 ## 5. Install on the phone
 
@@ -169,7 +191,10 @@ offline library.
 | 503 on every request | `current.json` missing: has the desktop published at least once? |
 | 503 with `No such file or directory`, or `/library` empty inside the container, right after a successful publish | The container was created before the host share was mounted: bind sources are resolved at create time. Run `docker compose up -d --force-recreate` after the `mount -t cifs` (Docker Desktop keeps an empty placeholder until then) |
 | Banner lists a root | Add it to `media.map.json` and mount it in compose |
-| 401 | `AUTH_TOKEN` differs from the one the client stored, or the client has none yet; reopen with `?token=`, which also replaces a stale value |
+| 401 | Sign in again. If the account was just created, publish the snapshot; if using `AUTH_TOKEN`, it differs from the stored value or a stale `?token=` is still in the browser |
 | Videos do not seek | The share must allow byte ranges end to end (SMB/NFS both do) |
 | Stale thumbnails | Publish again; the derivative cache is namespaced by revision |
+| Login says no users are published | Create an account in **Web users** and publish the library |
+| Login says the revision has no users table | The desktop build that published it predates accounts; update the desktop and publish again |
+| A newly created user cannot log in | Publish the snapshot after creating or changing the account |
 | `--health` fails | The container cannot read `LIBRARY_DIR` or its pointer |

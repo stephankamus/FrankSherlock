@@ -49,6 +49,7 @@ import type {
   ThumbRepairProgress,
   SearchRequest,
   SearchResponse,
+  User,
   VenvProvisionStatus,
   VisionEstimate,
   VisionModelOption,
@@ -370,6 +371,32 @@ export async function loadUserConfig(): Promise<Record<string, unknown>> {
 
 export async function saveUserConfig(config: Record<string, unknown>): Promise<void> {
   return invoke<void>("save_user_config", { config });
+}
+
+// ── Web accounts ─────────────────────────────────────────────────────
+
+export async function listUsers(): Promise<User[]> {
+  return invoke<User[]>("list_users");
+}
+
+export async function createUser(name: string, login: string, password: string): Promise<User> {
+  return invoke<User>("create_user", { name, login, password });
+}
+
+export async function updateUser(
+  userId: number,
+  name: string,
+  login: string,
+): Promise<User> {
+  return invoke<User>("update_user", { userId, name, login });
+}
+
+export async function setUserPassword(userId: number, password: string): Promise<void> {
+  return invoke<void>("set_user_password", { userId, password });
+}
+
+export async function deleteUser(userId: number): Promise<void> {
+  return invoke<void>("delete_user", { userId });
 }
 
 export async function copyFilesToClipboard(paths: string[]): Promise<void> {

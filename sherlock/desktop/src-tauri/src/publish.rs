@@ -1177,4 +1177,42 @@ mod tests {
             .expect("count");
         assert_eq!(hidden, 1);
     }
+
+    #[test]
+    fn publishes_web_accounts_in_the_snapshot() {
+        let temp = tempfile::tempdir().expect("temp");
+        let paths = test_paths(temp.path());
+        seed(&paths, &["a.jpg"]);
+        let publish_dir = temp.path().join("share");
+        let hash = crate::auth::hash_password("secret123").expect("hash");
+        crate::db::create_user(&paths.db_file, "Ana", "ana", &hash).expect("user");
+
+        let report = publish_library(
+            &paths,
+            &options(&publish_dir),
+            &AtomicBool::new(false),
+            &mut |_| {},
+        )
+        .expect("publish");
+
+        // The web login reads this table from the snapshot, so it must travel with the
+        // same VACUUM INTO that carries the files. If a future publish starts selecting
+        // tables explicitly, this fails before users are locked out.
+        let conn = Connection::open_with_flags(
+            publish_dir.join(snapshot_file_name(&report.revision)),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open snapshot");
+        let (name, login, stored_hash): (String, String, String) = conn
+            .query_row(
+                "SELECT name, login, password_hash FROM users WHERE login = 'ana'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("user row");
+        assert_eq!(name, "Ana");
+        assert_eq!(login, "ana");
+        assert_eq!(stored_hash, hash);
+        assert!(crate::auth::verify_password("secret123", &stored_hash));
+    }
 }

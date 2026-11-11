@@ -22,7 +22,7 @@ mod vision_prep;
 // EXIF reader, one set of path rules and — the point of the exercise — one `db` module,
 // so both sides run the same SQL. Re-exported under the old paths so no call site had to
 // change.
-pub use sherlock_core::{db, error, exif, query_parser, similarity};
+pub use sherlock_core::{auth, db, error, exif, query_parser, similarity};
 
 #[cfg(test)]
 mod bench_cost;
@@ -38,7 +38,7 @@ use models::{
     Album, CompactResult, DeleteFilesResult, DuplicatesResponse, HealthCheckOutcome, HealthStatus,
     PdfPassword, ProtectedPdfInfo, PurgeResult, RenameFileResult, RetryProtectedPdfsResult,
     RootInfo, RuntimeStatus, ScanJobStatus, SearchRequest, SearchResponse, SetupDownloadStatus,
-    SetupStatus, SmartFolder, SubdirEntry, VenvProvisionStatus,
+    SetupStatus, SmartFolder, SubdirEntry, User, VenvProvisionStatus,
 };
 use tauri::Manager;
 use tauri::State;
@@ -2038,6 +2038,71 @@ fn save_user_config(config: serde_json::Value, state: State<'_, AppState>) -> Re
     config::save_user_config(&config).map_err(|e| e.to_string())
 }
 
+// ── Web account commands ─────────────────────────────────────────────
+//
+// The web server is read-only and reads the users that travel inside the published
+// snapshot. The desktop is the only writer, and the hash never leaves this boundary:
+// every command below returns `User`, which has no password field.
+
+#[tauri::command]
+fn list_users(state: State<'_, AppState>) -> Result<Vec<User>, String> {
+    db::list_users(&state.paths.db_file).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn create_user(
+    name: String,
+    login: String,
+    password: String,
+    state: State<'_, AppState>,
+) -> Result<User, String> {
+    require_writable(state.inner())?;
+    let name = auth::validate_name(&name)?;
+    let login = auth::validate_login(&login)?;
+    auth::validate_password(&password)?;
+    let db_path = state.paths.db_file.clone();
+    let hash = tauri::async_runtime::spawn_blocking(move || auth::hash_password(&password))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    db::create_user(&db_path, &name, &login, &hash).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn update_user(
+    user_id: i64,
+    name: String,
+    login: String,
+    state: State<'_, AppState>,
+) -> Result<User, String> {
+    require_writable(state.inner())?;
+    let name = auth::validate_name(&name)?;
+    let login = auth::validate_login(&login)?;
+    db::update_user(&state.paths.db_file, user_id, &name, &login).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_user_password(
+    user_id: i64,
+    password: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    require_writable(state.inner())?;
+    auth::validate_password(&password)?;
+    let db_path = state.paths.db_file.clone();
+    let hash = tauri::async_runtime::spawn_blocking(move || auth::hash_password(&password))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    db::set_user_password(&db_path, user_id, &hash).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_user(user_id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    require_writable(state.inner())?;
+    db::delete_user(&state.paths.db_file, user_id).map_err(|e| e.to_string())
+}
+
 // ── PDF Password commands ────────────────────────────────────────────
 
 #[tauri::command]
@@ -3749,6 +3814,11 @@ pub fn run() {
             cancel_publish,
             load_user_config,
             save_user_config,
+            list_users,
+            create_user,
+            update_user,
+            set_user_password,
+            delete_user,
             copy_files_to_clipboard,
             delete_files,
             rename_file,

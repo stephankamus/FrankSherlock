@@ -68,6 +68,8 @@ type SidebarProps<TRoot extends RootInfo = RootInfo> = {
   onResumeScan: (scan: ScanJobStatus) => void;
   /** Opens the settings modal (model, resize, OCR, dedupe, startup, chaining). */
   onOpenSettings?: () => void;
+  /** Opens the web-account management modal. Desktop-only. */
+  onOpenUsers?: () => void;
   onSelectAlbum: (album: Album) => void;
   onDeleteAlbum: (album: Album) => void;
   onSelectSmartFolder: (folder: SmartFolder) => void;
@@ -100,7 +102,7 @@ export default function Sidebar<TRoot extends RootInfo = RootInfo>({
   backlog, onCancelBacklog, failedCount, onRetryFailed,
   onDetectFaces, onCancelFaceDetect,
   faceDetection, onToggleFaceDetection,
-  onCancelScan, onResumeScan, onOpenSettings,
+  onCancelScan, onResumeScan, onOpenSettings, onOpenUsers,
   onSelectAlbum, onDeleteAlbum, onSelectSmartFolder, onDeleteSmartFolder,
   onReorderRoots, onReorderAlbums, onReorderSmartFolders, onFindDuplicates,
   onOpenPdfPasswords, onOpenFaces, onOpenPortraitMode, portraitModeActive,
@@ -481,6 +483,16 @@ export default function Sidebar<TRoot extends RootInfo = RootInfo>({
               title="Model, resize filter, OCR engine, duplicate distance, startup and backlog chaining"
             >
               Settings
+            </button>
+          )}
+          {onOpenUsers && (
+            <button
+              type="button"
+              className="sidebar-compact-btn"
+              onClick={onOpenUsers}
+              title="Accounts that can sign in to the web app"
+            >
+              Web users
             </button>
           )}
         </div>

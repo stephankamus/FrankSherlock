@@ -57,6 +57,7 @@ import PropertiesModal from "./components/modals/PropertiesModal";
 import ModelInfoModal from "./components/modals/ModelInfoModal";
 import ModelPickerModal from "./components/modals/ModelPickerModal";
 import SettingsModal, { toSettingsPayload } from "./components/modals/SettingsModal";
+import UsersModal from "./components/modals/UsersModal";
 import LogsModal from "./components/modals/LogsModal";
 import CreateAlbumModal from "./components/modals/CreateAlbumModal";
 import CreateSmartFolderModal from "./components/modals/CreateSmartFolderModal";
@@ -137,6 +138,8 @@ export default function App() {
    * scan start; without it the modal is just a settings screen.
    */
   const [showSettings, setShowSettings] = useState(false);
+  /** Web accounts: created and edited here, published with the next snapshot. */
+  const [showUsers, setShowUsers] = useState(false);
   /**
    * Live log viewer. Opened from the "Scanning..." indicator or from Settings,
    * and stacked over the settings modal when it comes from there.
@@ -1204,6 +1207,9 @@ export default function App() {
           onOpenLogs={() => setShowLogs(true)}
         />
       )}
+      {showUsers && (
+        <UsersModal onClose={() => setShowUsers(false)} readOnly={readOnly} />
+      )}
       {/* Rendered after Settings so it stacks on top when opened from there. */}
       {showLogs && <LogsModal onClose={() => setShowLogs(false)} />}
       {visionPicker && (
@@ -1425,6 +1431,7 @@ export default function App() {
           onConvertRawRoot={(root) => setRawConvertRoot(root)}
           onConvertVideosRoot={(root) => setVideoConvertRoot(root)}
           onOpenSettings={() => setShowSettings(true)}
+          onOpenUsers={() => setShowUsers(true)}
           onRescanRoot={(root) => scanManager.onRescanRoot(root, setup, readOnly)}
           onRefreshRoot={(root) => scanManager.onRefreshRoot(root, readOnly)}
           onCopyRootPath={(root) => {

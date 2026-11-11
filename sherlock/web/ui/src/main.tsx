@@ -2,11 +2,11 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import "@frank-sherlock/shared/theme.css";
 import "./app.css";
-import TokenGate from "./TokenGate";
+import AuthGate from "./AuthGate";
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <TokenGate />
+    <AuthGate />
   </React.StrictMode>,
 );
 

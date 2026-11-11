@@ -77,6 +77,22 @@ describe("createHttpLibraryClient", () => {
     expect(calls[0].url).toBe("https://lib.example/api/search?q=dog");
     const headers = calls[0].init?.headers as Record<string, string>;
     expect(headers.Authorization).toBe("Bearer t0k");
+    expect(calls[0].init?.credentials).toBe("same-origin");
+  });
+
+  it("can send the session cookie with a different credentials mode", async () => {
+    const calls: FakeCall[] = [];
+    const client = createHttpLibraryClient({
+      baseUrl: "https://lib.example",
+      credentials: "include",
+      fetchImpl: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        calls.push({ url: String(input), init });
+        return fakeJson({ total: 0, limit: 0, offset: 0, items: [], parsedQuery: {} });
+      }) as typeof fetch,
+    });
+
+    await client.search({ query: "" });
+    expect(calls[0].init?.credentials).toBe("include");
   });
 
   it("turns `?token=` into the URL of media requests", () => {

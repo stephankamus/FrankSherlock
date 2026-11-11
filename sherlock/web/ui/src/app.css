@@ -19,7 +19,7 @@ body {
   color: var(--text-primary);
 }
 
-/* ── Token sign-in ─────────────────────────────────────────── */
+/* ── Sign-in ───────────────────────────────────────────────── */
 .auth-screen {
   height: 100%;
   display: grid;
@@ -91,6 +91,21 @@ body {
   color: var(--danger) !important;
 }
 
+/* Secondary action: the token path is deliberately quieter than the account form. */
+.auth-switch {
+  margin-top: 0 !important;
+  padding: 4px 0 !important;
+  border: none !important;
+  background: transparent !important;
+  color: var(--text-secondary) !important;
+  text-decoration: underline;
+  font-size: 0.75rem !important;
+}
+
+.auth-switch:hover {
+  color: var(--text-primary) !important;
+}
+
 .auth-hint {
   font-size: 0.75rem !important;
 }
@@ -130,6 +145,31 @@ body {
   color: var(--text-secondary);
   font-size: 0.7rem;
   font-variant-numeric: tabular-nums;
+}
+
+.web-user {
+  max-width: 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+  font-size: 0.72rem;
+}
+
+.web-signout {
+  padding: 4px 9px;
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 0.72rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.web-signout:hover {
+  border-color: var(--border-focus);
 }
 
 .web-menu {

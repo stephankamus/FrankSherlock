@@ -28,6 +28,9 @@ embed-ui = ["dep:rust-embed", "dep:mime_guess"]
 [dependencies]
 axum = "0.8"
 env_logger = "0.11"
+# Opaque in-memory session ids. The cookie is HttpOnly; this value never reaches the
+# client except as the cookie itself.
+uuid = { version = "1", features = ["v4"] }
 # `?w=` derivatives: decode the original, downscale it, encode a JPEG. Same version
 # `sherlock_core` already compiles, so the container does not build two copies.
 image = "0.25"

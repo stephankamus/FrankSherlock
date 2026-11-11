@@ -3,12 +3,14 @@
  *
  * The translation is deliberately thin: the server already returns the camelCase
  * row shapes (including `thumbUrl`/`mediaUrl`), and this module only builds the
- * query strings and adds the token. Two rules come from the server contract:
+ * query strings and adds the token when one is configured. Two rules come from the
+ * server contract:
  *
  * 1. `includeHidden` is never sent. The server does not parse it and hard-codes
  *    `false`; sending it would be a lie about what the client asked for.
- * 2. Media URLs carry `?token=` because `<img src>` and `<video src>` cannot send
- *    an `Authorization` header. JSON requests use the header instead.
+ * 2. Token mode carries `?token=` on media URLs because `<img src>` and `<video src>`
+ *    cannot send an `Authorization` header. User-session mode uses the HttpOnly
+ *    cookie, so its media URLs stay clean and the browser attaches the session.
  */
 
 import {
@@ -36,8 +38,15 @@ import type {
 export type HttpLibraryClientOptions = {
   /** Origin of the server, e.g. `https://photos.example.com`. Empty = same origin. */
   baseUrl?: string;
-  /** `AUTH_TOKEN` of the container; also appended to media URLs. */
+  /** Optional read-only API token; also appended to media URLs in token mode. */
   token?: string;
+  /**
+   * Credentials mode for `fetch`.
+   *
+   * `same-origin` is what makes the HttpOnly session cookie travel with JSON and
+   * media requests. Tests and a cross-origin deployment can override it.
+   */
+  credentials?: RequestCredentials;
   /** Injected by tests. Defaults to the global `fetch`. */
   fetchImpl?: typeof fetch;
   /**
@@ -75,6 +84,7 @@ export function searchQueryString(request: SearchRequest): string {
 export function createHttpLibraryClient(options: HttpLibraryClientOptions = {}): LibraryClient {
   const baseUrl = (options.baseUrl ?? "").replace(/\/+$/, "");
   const token = options.token ?? "";
+  const credentials = options.credentials ?? "same-origin";
   const doFetch: typeof fetch =
     options.fetchImpl ?? ((input, init) => globalThis.fetch(input, init));
   const onUnauthorized = options.onUnauthorized;
@@ -94,7 +104,7 @@ export function createHttpLibraryClient(options: HttpLibraryClientOptions = {}):
   async function getJson<T>(path: string): Promise<T> {
     const headers: Record<string, string> = { Accept: "application/json" };
     if (token) headers.Authorization = `Bearer ${token}`;
-    const response = await doFetch(absolute(`/api${path}`), { headers });
+    const response = await doFetch(absolute(`/api${path}`), { headers, credentials });
     if (!response.ok) {
       if (response.status === 401) onUnauthorized?.();
       let body: unknown;

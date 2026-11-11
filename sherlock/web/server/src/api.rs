@@ -16,7 +16,7 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tower::ServiceExt;
@@ -24,6 +24,7 @@ use tower::ServiceExt;
 use sherlock_core::db;
 use sherlock_core::models::{SearchItem, SearchRequest, SortField, SortOrder};
 
+use crate::auth;
 use crate::media::MediaError;
 use crate::AppState;
 
@@ -32,6 +33,8 @@ use crate::AppState;
 #[derive(Debug)]
 pub enum ApiError {
     NotFound,
+    /// No valid API token and no live user session.
+    Unauthorized(String),
     /// The row exists but its root has no mount configured in `MEDIA_MAP`.
     UnmappedRoot(String),
     BadRequest(String),
@@ -44,6 +47,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
+            ApiError::Unauthorized(message) => (StatusCode::UNAUTHORIZED, message),
             ApiError::UnmappedRoot(root) => (StatusCode::CONFLICT, root),
             ApiError::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
             ApiError::Unavailable(message) => (StatusCode::SERVICE_UNAVAILABLE, message),
@@ -74,7 +78,15 @@ fn internal(error: impl std::fmt::Display) -> ApiError {
 // ── Router ──────────────────────────────────────────────────────────
 
 pub fn app(state: Arc<AppState>) -> Router {
-    let mut api = Router::new()
+    // Login and logout are the only routes outside the auth middleware: a stale cookie
+    // must still be clearable, and the login form obviously has no session yet.
+    let public = Router::new()
+        .route("/auth/login", post(auth::login))
+        .route("/auth/logout", post(auth::logout))
+        .with_state(state.clone());
+
+    let protected = Router::new()
+        .route("/auth/me", get(auth::me))
         .route("/health", get(health))
         .route("/library", get(library))
         .route("/roots", get(roots))
@@ -92,14 +104,14 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/people", get(people))
         .route("/faces/{person_id}", get(faces_for_person))
         .route("/duplicates", get(duplicates))
-        .with_state(state.clone());
-
-    if let Some(token) = state.config.auth_token.clone() {
-        api = api.layer(axum::middleware::from_fn_with_state(token, require_token));
-    }
+        .with_state(state.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ));
 
     Router::new()
-        .nest("/api", api)
+        .nest("/api", public.merge(protected))
         .route("/", get(index))
         .route("/healthz", get(|| async { "ok" }))
         // Client-side routes of the SPA; a build without the UI answers 404 here.
@@ -140,41 +152,6 @@ async fn index() -> Response {
 /// Any path that is not `/api`, `/healthz` or `/`: SPA route or 404.
 async fn fallback(uri: axum::http::Uri) -> Response {
     crate::assets::serve(uri.path())
-}
-
-/// Bearer token, or `?token=` for the requests a browser cannot add headers to.
-///
-/// `<img src>` and `<video src>` cannot send an `Authorization` header, so the query form
-/// is what makes the grid work behind nothing but this token. It is a weaker secret — URLs
-/// end up in logs — which is why the plan puts an authenticating proxy in front.
-async fn require_token(State(token): State<String>, request: Request, next: Next) -> Response {
-    let header_ok = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|value| value == token);
-    let query_ok = request
-        .uri()
-        .query()
-        .map(|query| {
-            query.split('&').any(|pair| {
-                pair.strip_prefix("token=")
-                    .map(|value| value == token)
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false);
-
-    if header_ok || query_ok {
-        next.run(request).await
-    } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({ "error": "unauthorized" })),
-        )
-            .into_response()
-    }
 }
 
 // ── Handlers ────────────────────────────────────────────────────────

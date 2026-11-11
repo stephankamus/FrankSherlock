@@ -522,6 +522,32 @@ pub struct PdfPassword {
     pub created_at: i64,
 }
 
+/// A web account, as the desktop's management screen sees it.
+///
+/// The password hash is deliberately absent: it never leaves the database except
+/// through [`UserCredential`], which only the web server reads for verification.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct User {
+    pub id: i64,
+    pub name: String,
+    pub login: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// The row the web login needs: identity plus the PHC hash to verify.
+///
+/// Not serializable on purpose. The web server builds its own response shape, and the
+/// desktop never has a reason to send this over IPC.
+#[derive(Debug, Clone)]
+pub struct UserCredential {
+    pub id: i64,
+    pub name: String,
+    pub login: String,
+    pub password_hash: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProtectedPdfInfo {

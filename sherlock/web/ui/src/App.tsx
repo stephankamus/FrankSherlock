@@ -22,6 +22,7 @@ import {
   type SortField,
   type SortOrder,
 } from "@frank-sherlock/shared";
+import type { WebSession } from "./auth";
 import { useSearch } from "./useSearch";
 
 const PAGE_MEDIA_TYPES = ["", "photo", "video", "document", "anime"];
@@ -40,6 +41,13 @@ type ViewMode = "portrait" | "library" | "faces" | "duplicates";
  */
 type PreviewState = { items: SearchItem[]; index: number | null };
 
+type Props = {
+  /** Who the gate signed in, for the top-bar label. Absent in tests and bare use. */
+  session?: WebSession | null;
+  /** Clears the session and returns to the login form. */
+  onSignOut?: () => void;
+};
+
 /**
  * The read-only client.
  *
@@ -47,7 +55,7 @@ type PreviewState = { items: SearchItem[]; index: number | null };
  * capability set of the HTTP client hides the write controls inside the shared
  * views, so this file only composes them.
  */
-export default function App() {
+export default function App({ session = null, onSignOut }: Props = {}) {
   const library = useLibrary();
 
   const [health, setHealth] = useState<LibraryHealth | null>(null);
@@ -241,6 +249,19 @@ export default function App() {
         <span className="web-revision">
           {info ? `rev ${info.revision}` : health ? `rev ${health.revision}` : ""}
         </span>
+        {session && (
+          <span
+            className="web-user"
+            title={session.kind === "user" ? `Signed in as ${session.login}` : "Read-only API token"}
+          >
+            {session.kind === "user" ? session.name : "API token"}
+          </span>
+        )}
+        {onSignOut && (
+          <button type="button" className="web-signout" onClick={onSignOut}>
+            Sign out
+          </button>
+        )}
       </header>
 
       <div className="web-body">

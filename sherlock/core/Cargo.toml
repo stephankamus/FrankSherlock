@@ -16,6 +16,12 @@ rust-version = "1.85"
 # `target/` the CI caches. The price is compiling this crate twice; the sources and
 # the tests are still written once.
 [dependencies]
+# Password storage for the web accounts. Argon2id is the only hashing format written;
+# the PHC string carries its own parameters, so the web server can verify without a
+# shared configuration file. `getrandom` supplies the salt; without it the list of
+# hashing features compiles but `OsRng` is absent.
+argon2 = "0.5"
+rand_core = { version = "0.6", features = ["getrandom"] }
 chrono = { version = "0.4", features = ["clock"] }
 # `exif` needs both: `image` to apply the orientation to a decoded picture, and
 # `reverse_geocoder` to turn GPS coordinates into a place name.

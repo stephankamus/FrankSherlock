@@ -13,6 +13,7 @@ use crate::models::{
     FileMetadata, FileProperties, FileRecordUpsert, HealthCheckOutcome, ParsedQuery, PdfPassword,
     ProtectedPdfInfo, PurgeResult, RawConversion, RootInfo, ScanJobState, ScanJobStatus,
     SearchItem, SearchRequest, SearchResponse, SmartFolder, SortField, SortOrder, SubdirEntry,
+    User, UserCredential,
 };
 use crate::query_parser::parse_query;
 
@@ -502,6 +503,29 @@ fn run_migrations(conn: &mut Connection) -> AppResult<()> {
                 created_at INTEGER NOT NULL,
                 FOREIGN KEY (root_id) REFERENCES roots(id) ON DELETE CASCADE,
                 FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+            );
+            "#,
+        ),
+        // Migration 26: web accounts.
+        //
+        // The desktop is the only writer. The table travels inside the published
+        // snapshot, so the read-only web server can verify a login without ever writing
+        // to the library mount. `password_hash` is an Argon2id PHC string; the schema
+        // never stores plaintext. `NOCASE` makes the login case-insensitive while
+        // preserving the spelling the user typed.
+        //
+        // No `is_admin` yet: permissions are a product decision that needs its own
+        // migration and query work, and an unused column would imply a feature that does
+        // not exist.
+        M::up(
+            r#"
+            CREATE TABLE IF NOT EXISTS users (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                name          TEXT NOT NULL,
+                login         TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                password_hash TEXT NOT NULL,
+                created_at    INTEGER NOT NULL,
+                updated_at    INTEGER NOT NULL
             );
             "#,
         ),
@@ -5145,6 +5169,159 @@ pub fn get_all_pdf_password_strings(db_path: &Path) -> AppResult<Vec<String>> {
     Ok(passwords)
 }
 
+// ── Web accounts ────────────────────────────────────────────────────
+//
+// The desktop writes these rows; the web server only reads a published snapshot. The
+// hash never appears in [`User`], so the management screen cannot accidentally display
+// or log it.
+
+const USER_COLUMNS: &str = "id, name, login, created_at, updated_at";
+
+fn user_from_row(row: &Row<'_>) -> rusqlite::Result<User> {
+    Ok(User {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        login: row.get(2)?,
+        created_at: row.get(3)?,
+        updated_at: row.get(4)?,
+    })
+}
+
+fn user_by_id(conn: &Connection, user_id: i64) -> AppResult<User> {
+    let sql = format!("SELECT {USER_COLUMNS} FROM users WHERE id = ?1");
+    conn.query_row(&sql, params![user_id], user_from_row)
+        .optional()?
+        .ok_or_else(|| AppError::Config(format!("user {user_id} does not exist")))
+}
+
+pub fn list_users(db_path: &Path) -> AppResult<Vec<User>> {
+    let conn = open_conn(db_path)?;
+    let sql = format!("SELECT {USER_COLUMNS} FROM users ORDER BY name COLLATE NOCASE, id");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], user_from_row)?;
+    let mut users = Vec::new();
+    for row in rows {
+        users.push(row?);
+    }
+    Ok(users)
+}
+
+pub fn user_count(db_path: &Path) -> AppResult<u64> {
+    let conn = open_conn(db_path)?;
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
+    Ok(count.max(0) as u64)
+}
+
+pub fn create_user(
+    db_path: &Path,
+    name: &str,
+    login: &str,
+    password_hash: &str,
+) -> AppResult<User> {
+    let conn = open_conn(db_path)?;
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE login = ?1)",
+        params![login],
+        |row| row.get(0),
+    )?;
+    if exists {
+        return Err(AppError::Config("login is already in use".to_string()));
+    }
+
+    let now = now_epoch_secs();
+    conn.execute(
+        "INSERT INTO users (name, login, password_hash, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?4)",
+        params![name, login, password_hash, now],
+    )?;
+    user_by_id(&conn, conn.last_insert_rowid())
+}
+
+pub fn update_user(db_path: &Path, user_id: i64, name: &str, login: &str) -> AppResult<User> {
+    let conn = open_conn(db_path)?;
+    let duplicate: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE login = ?1 AND id != ?2)",
+        params![login, user_id],
+        |row| row.get(0),
+    )?;
+    if duplicate {
+        return Err(AppError::Config("login is already in use".to_string()));
+    }
+
+    let changed = conn.execute(
+        "UPDATE users SET name = ?2, login = ?3, updated_at = ?4 WHERE id = ?1",
+        params![user_id, name, login, now_epoch_secs()],
+    )?;
+    if changed == 0 {
+        return Err(AppError::Config(format!("user {user_id} does not exist")));
+    }
+    user_by_id(&conn, user_id)
+}
+
+pub fn set_user_password(db_path: &Path, user_id: i64, password_hash: &str) -> AppResult<()> {
+    let conn = open_conn(db_path)?;
+    let changed = conn.execute(
+        "UPDATE users SET password_hash = ?2, updated_at = ?3 WHERE id = ?1",
+        params![user_id, password_hash, now_epoch_secs()],
+    )?;
+    if changed == 0 {
+        return Err(AppError::Config(format!("user {user_id} does not exist")));
+    }
+    Ok(())
+}
+
+pub fn delete_user(db_path: &Path, user_id: i64) -> AppResult<()> {
+    let conn = open_conn(db_path)?;
+    let changed = conn.execute("DELETE FROM users WHERE id = ?1", params![user_id])?;
+    if changed == 0 {
+        return Err(AppError::Config(format!("user {user_id} does not exist")));
+    }
+    Ok(())
+}
+
+/// The credential row a web login needs. Kept separate from [`User`] on purpose.
+pub fn find_user_credentials_by_login(
+    db_path: &Path,
+    login: &str,
+) -> AppResult<Option<UserCredential>> {
+    let conn = open_conn(db_path)?;
+    conn.query_row(
+        "SELECT id, name, login, password_hash FROM users WHERE login = ?1",
+        params![login],
+        |row| {
+            Ok(UserCredential {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                login: row.get(2)?,
+                password_hash: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(AppError::from)
+}
+
+/// Every account, for the web server's revision-keyed session validation.
+pub fn list_user_credentials(db_path: &Path) -> AppResult<Vec<UserCredential>> {
+    let conn = open_conn(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, name, login, password_hash FROM users ORDER BY name COLLATE NOCASE, id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(UserCredential {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            login: row.get(2)?,
+            password_hash: row.get(3)?,
+        })
+    })?;
+    let mut users = Vec::new();
+    for row in rows {
+        users.push(row?);
+    }
+    Ok(users)
+}
+
 pub fn list_protected_pdfs(db_path: &Path) -> AppResult<Vec<ProtectedPdfInfo>> {
     let conn = open_conn(db_path)?;
     let mut stmt = conn.prepare(
@@ -9353,11 +9530,11 @@ mod tests {
         init_database(&db_path).expect("init");
 
         let conn = open_conn(&db_path).expect("open");
-        // Verify user_version is set (25 migrations applied → version 25)
+        // Verify user_version is set (26 migrations applied → version 26)
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 25);
+        assert_eq!(version, 26);
 
         // Migration 19 records where a converted HEIC/NEF copy came from.
         let conversion_columns: Vec<String> = {
@@ -9425,6 +9602,7 @@ mod tests {
         assert!(tables.contains(&"album_files".to_string()));
         assert!(tables.contains(&"smart_folders".to_string()));
         assert!(tables.contains(&"pdf_passwords".to_string()));
+        assert!(tables.contains(&"users".to_string()));
         assert!(tables.contains(&"face_detections".to_string()));
         assert!(tables.contains(&"people".to_string()));
     }
@@ -9449,8 +9627,8 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        // We have 25 migrations (indices 0..24), so user_version should be 25
-        assert_eq!(version, 25);
+        // We have 26 migrations (indices 0..25), so user_version should be 26
+        assert_eq!(version, 26);
     }
 
     /// A database written by a *newer* build is refused, never adopted silently.
@@ -12625,6 +12803,65 @@ mod tests {
         // Should fail: face_a doesn't belong to other_person
         let result = set_representative_face(&db_path, other_person.id, face_a);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn users_crud_round_trip() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+
+        let alice = create_user(&db_path, "Alice", "alice", "hash-a").expect("create alice");
+        assert_eq!(alice.name, "Alice");
+        assert_eq!(alice.login, "alice");
+        assert_eq!(list_users(&db_path).expect("list").len(), 1);
+        assert_eq!(user_count(&db_path).expect("count"), 1);
+
+        let renamed =
+            update_user(&db_path, alice.id, "Alice Silva", "alice.silva").expect("update");
+        assert_eq!(renamed.name, "Alice Silva");
+        assert_eq!(renamed.login, "alice.silva");
+        assert_eq!(renamed.created_at, alice.created_at);
+
+        set_user_password(&db_path, alice.id, "hash-b").expect("password");
+        let credential = find_user_credentials_by_login(&db_path, "ALICE.SILVA")
+            .expect("lookup")
+            .expect("credential");
+        assert_eq!(credential.password_hash, "hash-b");
+        assert_eq!(credential.name, "Alice Silva");
+
+        delete_user(&db_path, alice.id).expect("delete");
+        assert!(list_users(&db_path).expect("list").is_empty());
+        assert!(find_user_credentials_by_login(&db_path, "alice.silva")
+            .expect("lookup")
+            .is_none());
+    }
+
+    #[test]
+    fn user_logins_are_case_insensitive_and_unique() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+
+        create_user(&db_path, "Alice", "Alice", "hash-a").expect("create");
+        let duplicate = create_user(&db_path, "Other", "alice", "hash-b");
+        assert!(
+            duplicate.is_err(),
+            "the NOCASE unique index must reject this"
+        );
+
+        let cred = find_user_credentials_by_login(&db_path, "ALICE")
+            .expect("lookup")
+            .expect("credential");
+        assert_eq!(cred.id, 1);
+    }
+
+    #[test]
+    fn user_mutations_report_a_missing_row() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+
+        assert!(update_user(&db_path, 99, "Nobody", "nobody").is_err());
+        assert!(set_user_password(&db_path, 99, "hash").is_err());
+        assert!(delete_user(&db_path, 99).is_err());
     }
 
     fn file_id_by_path(db_path: &std::path::Path, root_id: i64, rel_path: &str) -> i64 {

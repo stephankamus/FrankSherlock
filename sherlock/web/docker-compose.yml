@@ -16,7 +16,11 @@ services:
     environment:
       LIBRARY_DIR: /library
       MEDIA_MAP: /config/media.map.json
-      AUTH_TOKEN: ${AUTH_TOKEN:?set AUTH_TOKEN before starting}
+      # Optional read-only API token, accepted next to the user accounts published in
+      # the snapshot. Empty means only user logins can enter.
+      AUTH_TOKEN: ${AUTH_TOKEN:-}
+      # Mark the session cookie Secure. The server also honours X-Forwarded-Proto.
+      COOKIE_SECURE: ${COOKIE_SECURE:-0}
       CACHE_DIR: /tmp/fs-web-cache
       RUST_LOG: info
     volumes:

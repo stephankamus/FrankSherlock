@@ -21,9 +21,13 @@ pub struct Config {
     pub library_dir: PathBuf,
     /// `root_path` as recorded by the desktop → path inside this container.
     pub media_map: MediaMap,
-    /// Bearer token every `/api` call must present. Empty disables the check (see
-    /// `main`), which is only acceptable behind an authenticating reverse proxy.
+    /// Optional read-only API token. It is accepted next to the published user accounts
+    /// and is useful for scripts and for the first deployment before a user is
+    /// published.
     pub auth_token: Option<String>,
+    /// Mark the session cookie `Secure`. Also inferred from `X-Forwarded-Proto: https`
+    /// so a TLS-terminating proxy works without a second setting.
+    pub cookie_secure: bool,
     /// Writable directory for resized previews (`<CACHE_DIR>/<revision>/<id>_<w>.jpg`).
     pub cache_dir: PathBuf,
     pub port: u16,
@@ -58,10 +62,23 @@ impl Config {
             .filter(|value| !value.is_empty());
         if auth_token.is_none() {
             log::warn!(
-                "AUTH_TOKEN is empty: the API is open to anyone who can reach this port. \
-                 Put it behind an authenticating proxy or set a token."
+                "AUTH_TOKEN is empty: only published user accounts can sign in. Create a \
+                 user in the desktop app and publish, or set AUTH_TOKEN for API access."
             );
         }
+
+        // Secure cookies need TLS in the browser. The reverse proxy usually terminates
+        // TLS, so `X-Forwarded-Proto` is also honoured per request; this flag is for
+        // deployments that want to force it regardless of the header.
+        let cookie_secure = std::env::var("COOKIE_SECURE")
+            .ok()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
 
         let cache_dir =
             std::env::var("CACHE_DIR").unwrap_or_else(|_| DEFAULT_CACHE_DIR.to_string());
@@ -85,6 +102,7 @@ impl Config {
             library_dir,
             media_map,
             auth_token,
+            cookie_secure,
             cache_dir,
             port,
         })
