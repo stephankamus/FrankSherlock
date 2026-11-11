@@ -25,6 +25,10 @@ export { estimateRemainingSeconds, formatDuration } from "./components/FacesProg
 export { default as PreviewModal } from "./components/PreviewModal";
 export { default as RootCard } from "./components/RootCard";
 export { default as Sidebar } from "./components/Sidebar";
+export {
+  default as SlideshowView,
+  DEFAULT_SLIDESHOW_SECONDS,
+} from "./components/SlideshowView";
 export { useSelection } from "./hooks/useSelection";
 export { useContextMenuClose } from "./hooks/useContextMenuClose";
 export { useDragReorder } from "./hooks/useDragReorder";

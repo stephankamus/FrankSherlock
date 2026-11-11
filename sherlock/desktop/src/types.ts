@@ -461,6 +461,13 @@ export type VisionSettings = {
   ocrEngine: VisionOcrEngine;
   startupScan: StartupScanSetting;
   /**
+   * Seconds each photo stays on screen in Portrait Mode.
+   *
+   * The same value is written to `current.json` when the library is published, so
+   * the web client uses the desktop setting instead of a second preference.
+   */
+  slideshowSeconds: number;
+  /**
    * Hamming distance under which two photos are treated as the same picture.
    * `0` disables the near-duplicate dedupe.
    */
@@ -509,6 +516,8 @@ export type SettingsUpdatePayload = {
   imageFilter: ImageFilterSetting;
   ocrEngine: VisionOcrEngine;
   startupScan: StartupScanSetting;
+  /** Seconds per photo in Portrait Mode; older callers may omit it. */
+  slideshowSeconds?: number;
   dedupeDhashDistance: number;
   chainBacklog: boolean;
   faceDetection: boolean;

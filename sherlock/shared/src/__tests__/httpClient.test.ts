@@ -49,12 +49,17 @@ describe("searchQueryString", () => {
       minConfidence: 0.4,
       sortBy: "dateModified",
       sortOrder: "desc",
+      imagesOnly: true,
       limit: 80,
       offset: 40,
     });
     expect(query).toBe(
-      "q=dog&rootId=3&mediaType=photo&minConfidence=0.4&sortBy=dateModified&sortOrder=desc&limit=80&offset=40",
+      "q=dog&rootId=3&mediaType=photo&minConfidence=0.4&sortBy=dateModified&sortOrder=desc&imagesOnly=true&limit=80&offset=40",
     );
+  });
+
+  it("does not send imagesOnly when the caller leaves it off", () => {
+    expect(searchQueryString({ query: "" })).toBe("");
   });
 
   it("never serializes includeHidden", () => {

@@ -78,6 +78,12 @@ pub enum SortField {
     DateModified,
     Name,
     Type,
+    /// An unordered sample, used by the portrait slideshow.
+    ///
+    /// The SQL becomes `ORDER BY RANDOM()`; callers asking for it should keep the
+    /// limit small and treat the result as a batch, because the sort has to visit
+    /// every candidate row.
+    Random,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, PartialEq, Default)]
@@ -111,6 +117,13 @@ pub struct SearchRequest {
     pub sort_by: SortField,
     #[serde(default)]
     pub sort_order: SortOrder,
+    /// Keep only rows that can be rendered as a still picture.
+    ///
+    /// `media_types` cannot express this: it only accepts the classification
+    /// categories, so `video` and `pdf` would be dropped by the normalizer. The
+    /// slideshow uses this flag to ask for the image rows directly.
+    #[serde(default)]
+    pub images_only: bool,
     /// Include rows the user hid. This is the desktop's "show hidden" filter and
     /// nothing else: the web server forces it to `false` instead of forwarding what
     /// the client asked for, because ids are enumerable and a hidden photo must not

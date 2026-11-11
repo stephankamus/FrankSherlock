@@ -15,6 +15,13 @@ pub const CURRENT_POINTER: &str = "current.json";
 pub const THUMBS_DIR: &str = "thumbs";
 pub const FACE_CROPS_DIR: &str = "face_crops";
 
+/// Fallback for a pointer published before the portrait interval existed.
+pub const DEFAULT_SLIDESHOW_SECONDS: u32 = 30;
+
+fn default_slideshow_seconds() -> u32 {
+    DEFAULT_SLIDESHOW_SECONDS
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Pointer {
@@ -28,6 +35,9 @@ pub struct Pointer {
     pub database: DatabasePointer,
     #[serde(default)]
     pub library: LibraryCounts,
+    /// Seconds per photo in the web Portrait Mode; defaults to 30 when absent.
+    #[serde(default = "default_slideshow_seconds")]
+    pub slideshow_seconds: u32,
     #[serde(default)]
     pub thumbnails: DirPointer,
     #[serde(default)]
@@ -224,6 +234,11 @@ mod tests {
         let snapshot = library.snapshot().expect("snapshot");
         assert_eq!(snapshot.pointer.revision, "rev-001");
         assert_eq!(snapshot.pointer.library.hidden_files, 1);
+        assert_eq!(
+            snapshot.pointer.slideshow_seconds,
+            DEFAULT_SLIDESHOW_SECONDS,
+            "an older pointer falls back to the default interval"
+        );
         assert_eq!(snapshot.db_path, temp.path().join("index.rev-001.sqlite"));
         assert_eq!(snapshot.thumbnails_dir, temp.path().join("thumbs"));
         assert_eq!(
@@ -231,6 +246,27 @@ mod tests {
             "an empty dir means crops were not published"
         );
         assert_eq!(snapshot.root(1).expect("root").root_key, "abc");
+    }
+
+    #[test]
+    fn reads_the_published_slideshow_interval() {
+        let temp = tempfile::tempdir().expect("temp");
+        std::fs::write(temp.path().join("index.rev-001.sqlite"), b"sqlite").expect("db");
+        let pointer = serde_json::json!({
+            "revision": "rev-001",
+            "database": { "file": "index.rev-001.sqlite" },
+            "slideshowSeconds": 42,
+        });
+        std::fs::write(
+            temp.path().join(CURRENT_POINTER),
+            serde_json::to_vec(&pointer).expect("json"),
+        )
+        .expect("pointer");
+
+        let snapshot = Library::new(temp.path().to_path_buf())
+            .snapshot()
+            .expect("snapshot");
+        assert_eq!(snapshot.pointer.slideshow_seconds, 42);
     }
 
     #[test]

@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  DEFAULT_SLIDESHOW_SECONDS,
   DuplicatesView,
   FacesView,
   ImageGrid,
   PreviewModal,
   ResultsMeta,
   Sidebar,
+  SlideshowView,
   ToastContainer,
   Toolbar,
   errorMessage,
@@ -31,7 +33,7 @@ const EMPTY_DUPLICATES: DuplicatesResponse = {
   groups: [],
 };
 
-type ViewMode = "library" | "faces" | "duplicates";
+type ViewMode = "portrait" | "library" | "faces" | "duplicates";
 /**
  * `index === null` means a comparison view: the whole array is a set to browse (the
  * duplicates "Compare" and a person's photos), not a single item with navigation.
@@ -62,7 +64,9 @@ export default function App() {
   const [selectedRootId, setSelectedRootId] = useState<number | null>(null);
   const [activeSmartFolderId, setActiveSmartFolderId] = useState<number | null>(null);
 
-  const [mode, setMode] = useState<ViewMode>("library");
+  // The published library opens as the portrait frame; folders and search are one
+  // click away in the sidebar.
+  const [mode, setMode] = useState<ViewMode>("portrait");
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [preview, setPreview] = useState<PreviewState | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -144,7 +148,18 @@ export default function App() {
     setActiveSmartFolderId(null);
   }
 
+  function enterPortraitMode() {
+    setQuery("");
+    setMediaType("");
+    setSelectedRootId(null);
+    setActiveSmartFolderId(null);
+    setPreview(null);
+    setMode("portrait");
+    setDrawerOpen(false);
+  }
+
   function handleSelectSubdir(subdir: string | null) {
+    setMode("library");
     setQuery((current) => {
       const cleaned = current.replace(/\bsubdir:(?:"[^"]*?"|\S+)\s*/i, "").trim();
       if (!subdir) return cleaned;
@@ -249,6 +264,8 @@ export default function App() {
               setMode("library");
               setDrawerOpen(false);
             }}
+            onOpenPortraitMode={enterPortraitMode}
+            portraitModeActive={mode === "portrait"}
             onDeleteRoot={noop}
             onPickAndScan={noop}
             onRescanRoot={noop}
@@ -276,6 +293,12 @@ export default function App() {
         )}
 
         <main className="web-main">
+          {mode === "portrait" && (
+            <SlideshowView
+              intervalSeconds={info?.slideshowSeconds ?? DEFAULT_SLIDESHOW_SECONDS}
+            />
+          )}
+
           {mode === "library" && (
             <>
               <Toolbar

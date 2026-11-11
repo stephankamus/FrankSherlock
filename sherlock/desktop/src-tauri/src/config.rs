@@ -220,6 +220,11 @@ ocr_engine = "llm"
 # - none          just open the existing index
 startup_scan = "ask"
 
+# Seconds each photo stays on screen in Portrait Mode (the home slideshow).
+# 30 is the default; accepted range is 5..=3600. The same value is published to
+# the web app with `current.json`, so both clients show photos for the same time.
+slideshow_seconds = 30
+
 # Maximum Hamming distance between two dHash values (0-64 bits) for the images to
 # be treated as the same picture. Near-duplicates inherit the classification of the
 # first one instead of paying for another vision request.
@@ -264,6 +269,16 @@ face_match_threshold = 30
 pub const DEFAULT_IMAGE_MAX_SIDE: u32 = 1024;
 /// Default Hamming distance used to fold near-duplicate photos (`0` = off).
 pub const DEFAULT_DEDUPE_DHASH_DISTANCE: u32 = 6;
+/// Default seconds per photo in the portrait slideshow.
+pub const DEFAULT_SLIDESHOW_SECONDS: u32 = 30;
+/// Below this the slideshow changes faster than the eye can register the photo.
+pub const MIN_SLIDESHOW_SECONDS: u32 = 5;
+/// Above this the "random every N seconds" promise stops feeling like a slideshow.
+pub const MAX_SLIDESHOW_SECONDS: u32 = 3600;
+
+fn default_slideshow_seconds() -> u32 {
+    DEFAULT_SLIDESHOW_SECONDS
+}
 
 /// Default, floor and ceiling of `face_match_threshold` (percent).
 pub const DEFAULT_FACE_MATCH_THRESHOLD: u32 = 30;
@@ -526,6 +541,8 @@ pub struct RuntimeSettings {
     pub library_kind: LibraryKind,
     /// Behaviour when opening a folder that is already indexed.
     pub startup_scan: StartupScan,
+    /// Seconds each photo stays on screen in Portrait Mode.
+    pub slideshow_seconds: u32,
     /// Hamming distance under which two photos are considered the same picture.
     /// `0` disables the near-duplicate dedupe.
     pub dedupe_dhash_distance: u32,
@@ -566,6 +583,7 @@ impl Default for RuntimeSettings {
             ocr_engine: OcrEngine::Llm,
             library_kind: LibraryKind::Auto,
             startup_scan: StartupScan::Ask,
+            slideshow_seconds: DEFAULT_SLIDESHOW_SECONDS,
             dedupe_dhash_distance: DEFAULT_DEDUPE_DHASH_DISTANCE,
             chain_backlog: true,
             face_detection: false,
@@ -600,6 +618,9 @@ pub struct SettingsUpdate {
     #[serde(default)]
     pub library_kind: String,
     pub startup_scan: String,
+    /// Seconds per photo in Portrait Mode. Defaulted so an older frontend keeps working.
+    #[serde(default = "default_slideshow_seconds")]
+    pub slideshow_seconds: u32,
     pub dedupe_dhash_distance: u32,
     pub chain_backlog: bool,
     pub face_detection: bool,
@@ -657,6 +678,7 @@ impl RuntimeSettings {
         self.ocr_engine = ocr_engine;
         self.library_kind = library_kind;
         self.startup_scan = startup_scan;
+        self.slideshow_seconds = Self::normalize_slideshow_seconds(update.slideshow_seconds);
         self.dedupe_dhash_distance = Self::normalize_dedupe_distance(update.dedupe_dhash_distance);
         self.chain_backlog = update.chain_backlog;
         self.face_detection = update.face_detection;
@@ -667,6 +689,11 @@ impl RuntimeSettings {
 
     pub fn normalize_face_match_threshold(value: u32) -> u32 {
         value.clamp(MIN_FACE_MATCH_THRESHOLD, MAX_FACE_MATCH_THRESHOLD)
+    }
+
+    /// Keep the slideshow in a range where it still reads as a photo frame.
+    pub fn normalize_slideshow_seconds(value: u32) -> u32 {
+        value.clamp(MIN_SLIDESHOW_SECONDS, MAX_SLIDESHOW_SECONDS)
     }
 
     /// The cosine similarity the face grouping works with.
@@ -827,6 +854,15 @@ fn parse_runtime_settings(data: &str) -> AppResult<RuntimeSettings> {
                     ),
                 }
             }
+            "slideshow_seconds" => {
+                let parsed = parse_settings_string(value.trim())?;
+                match parsed.trim().parse::<u32>() {
+                    Ok(v) => settings.slideshow_seconds = RuntimeSettings::normalize_slideshow_seconds(v),
+                    Err(_) => log::warn!(
+                        "settings.toml: ignoring slideshow_seconds '{parsed}' (expected: {MIN_SLIDESHOW_SECONDS}..={MAX_SLIDESHOW_SECONDS})"
+                    ),
+                }
+            }
             "dedupe_dhash_distance" => {
                 let parsed = parse_settings_string(value.trim())?;
                 match parsed.trim().parse::<u32>() {
@@ -908,6 +944,7 @@ pub fn save_runtime_settings(settings: &RuntimeSettings) -> AppResult<()> {
         "ocr_engine",
         "library_kind",
         "startup_scan",
+        "slideshow_seconds",
         "dedupe_dhash_distance",
         "chain_backlog",
         "face_detection",
@@ -972,6 +1009,13 @@ pub fn save_runtime_settings(settings: &RuntimeSettings) -> AppResult<()> {
         format!(
             "startup_scan = {}",
             serde_json::json!(settings.startup_scan.as_str())
+        ),
+    );
+    replacements.insert(
+        "slideshow_seconds",
+        format!(
+            "slideshow_seconds = {}",
+            RuntimeSettings::normalize_slideshow_seconds(settings.slideshow_seconds)
         ),
     );
     replacements.insert(
@@ -1353,6 +1397,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_runtime_settings_slideshow_seconds_defaults_and_clamps() {
+        let default_value = RuntimeSettings::default();
+        assert_eq!(default_value.slideshow_seconds, DEFAULT_SLIDESHOW_SECONDS);
+
+        let small = parse_runtime_settings("slideshow_seconds = 1").expect("settings");
+        assert_eq!(small.slideshow_seconds, MIN_SLIDESHOW_SECONDS);
+
+        let large = parse_runtime_settings("slideshow_seconds = 999999").expect("settings");
+        assert_eq!(large.slideshow_seconds, MAX_SLIDESHOW_SECONDS);
+
+        let invalid = parse_runtime_settings("slideshow_seconds = soon").expect("settings");
+        assert_eq!(invalid.slideshow_seconds, DEFAULT_SLIDESHOW_SECONDS);
+    }
+
+    #[test]
     fn parse_runtime_settings_ignores_unknown_values() {
         let settings = parse_runtime_settings(
             r#"
@@ -1378,6 +1437,7 @@ mod tests {
             image_filter: "box".to_string(),
             ocr_engine: "surya".to_string(),
             startup_scan: "classify_only".to_string(),
+            slideshow_seconds: 45,
             dedupe_dhash_distance: 4,
             chain_backlog: false,
             face_detection: true,
@@ -1404,6 +1464,7 @@ mod tests {
         assert_eq!(settings.image_filter, ImageFilter::Box);
         assert_eq!(settings.ocr_engine, OcrEngine::Surya);
         assert_eq!(settings.startup_scan, StartupScan::ClassifyOnly);
+        assert_eq!(settings.slideshow_seconds, 45);
         assert_eq!(settings.dedupe_dhash_distance, MAX_DEDUPE_DHASH_DISTANCE);
         assert!(!settings.chain_backlog);
 
@@ -1449,6 +1510,7 @@ mod tests {
             image_filter: ImageFilter::Box,
             ocr_engine: OcrEngine::Off,
             startup_scan: StartupScan::ClassifyOnly,
+            slideshow_seconds: 45,
             dedupe_dhash_distance: 4,
             chain_backlog: false,
             face_detection: true,
@@ -1467,6 +1529,7 @@ mod tests {
         assert!(text.contains("image_filter = \"box\""));
         assert!(text.contains("ocr_engine = \"off\""));
         assert!(text.contains("startup_scan = \"classify_only\""));
+        assert!(text.contains("slideshow_seconds = 45"));
 
         let loaded = parse_runtime_settings(&text).expect("parse");
         assert_eq!(loaded, settings);

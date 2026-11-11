@@ -4171,6 +4171,13 @@ fn search_images_normalized(
         where_clauses.push("f.hidden_at IS NULL".to_string());
     }
 
+    // The portrait slideshow asks for pictures only. Video and PDF rows have no
+    // still image to fill the frame with, and the regular media-type filter cannot
+    // exclude them because it only accepts classification categories.
+    if request.images_only {
+        where_clauses.push("f.media_type NOT IN ('video', 'pdf')".to_string());
+    }
+
     if has_query {
         from_sql.push_str(" JOIN files_fts ON files_fts.rowid = f.id ");
         where_clauses.push("files_fts MATCH ?".to_string());
@@ -4324,6 +4331,10 @@ fn search_like_fallback(
         where_clauses.push("f.hidden_at IS NULL".to_string());
     }
 
+    if request.images_only {
+        where_clauses.push("f.media_type NOT IN ('video', 'pdf')".to_string());
+    }
+
     // LIKE across searchable text columns
     where_clauses.push(
         "(LOWER(f.description) LIKE ? OR LOWER(f.extracted_text) LIKE ? \
@@ -4469,6 +4480,10 @@ fn build_order_clause(has_query: bool, sort_by: &SortField, sort_order: &SortOrd
         SortField::DateModified => format!("f.mtime_ns {dir}"),
         SortField::Name => format!("f.filename {dir}"),
         SortField::Type => format!("f.media_type {dir}"),
+        // A random sample is the whole point: appending a stable tie-breaker
+        // would still return the same rows for the same offset, so the ORDER BY
+        // is complete on its own.
+        SortField::Random => return " ORDER BY RANDOM() ".to_string(),
     };
     format!(" ORDER BY {primary}, f.updated_at DESC, f.id DESC ")
 }
@@ -9264,6 +9279,68 @@ mod tests {
         let res = search_images(&db_path, &req).expect("search");
         let types: Vec<&str> = res.items.iter().map(|i| i.media_type.as_str()).collect();
         assert_eq!(types, vec!["anime", "document", "photo"]);
+    }
+
+    #[test]
+    fn images_only_random_search_excludes_video_pdf_and_hidden() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/slideshow").expect("root");
+
+        let files = [
+            ("photo.jpg", "photo"),
+            ("clip.mp4", "video"),
+            ("document.pdf", "pdf"),
+            ("hidden.jpg", "photo"),
+        ];
+        let mut ids = Vec::new();
+        for (name, media) in files {
+            let rec = FileRecordUpsert {
+                root_id,
+                rel_path: name.to_string(),
+                abs_path: format!("/tmp/slideshow/{name}"),
+                filename: name.to_string(),
+                media_type: media.to_string(),
+                description: String::new(),
+                extracted_text: String::new(),
+                canonical_mentions: String::new(),
+                confidence: 0.0,
+                lang_hint: "en".to_string(),
+                mtime_ns: 1,
+                size_bytes: 1,
+                fingerprint: format!("fp-slideshow-{name}"),
+                scan_marker: 1,
+                location_text: String::new(),
+                dhash: None,
+                duration_secs: None,
+                video_width: None,
+                video_height: None,
+                video_codec: None,
+                audio_codec: None,
+            };
+            ids.push(upsert_file_record(&db_path, &rec).expect("upsert"));
+        }
+        // The last photo exists in the index but must never reach the slideshow.
+        set_files_hidden(&db_path, &[ids[3]], true).expect("hide");
+
+        let req = SearchRequest {
+            sort_by: SortField::Random,
+            images_only: true,
+            ..SearchRequest::default()
+        };
+        let res = search_images(&db_path, &req).expect("search");
+        let names: Vec<&str> = res.items.iter().map(|i| i.rel_path.as_str()).collect();
+        assert_eq!(names, vec!["photo.jpg"]);
+        assert_eq!(res.total, 1);
+
+        // Without the flag the video and the PDF are still part of the listing, so
+        // the new filter is what the slideshow depends on.
+        let all_req = SearchRequest {
+            sort_by: SortField::Random,
+            ..SearchRequest::default()
+        };
+        let all = search_images(&db_path, &all_req).expect("search all");
+        assert_eq!(all.total, 3, "video and pdf are visible, the hidden row is not");
     }
 
     // -----------------------------------------------------------------------

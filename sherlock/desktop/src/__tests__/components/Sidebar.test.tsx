@@ -51,6 +51,28 @@ describe("Sidebar", () => {
     expect(screen.getByText("42 files")).toBeInTheDocument();
   });
 
+  it("shows the Portrait Mode entry above the folders and reports clicks", async () => {
+    const onOpenPortraitMode = vi.fn();
+    render(
+      <Sidebar
+        {...defaultProps}
+        roots={[sampleRoot]}
+        onOpenPortraitMode={onOpenPortraitMode}
+        portraitModeActive
+      />,
+    );
+
+    const button = screen.getByRole("button", { name: /Portrait Mode/ });
+    expect(button).toHaveAttribute("aria-pressed", "true");
+    await userEvent.click(button);
+    expect(onOpenPortraitMode).toHaveBeenCalled();
+  });
+
+  it("does not show the Portrait Mode entry when the host has no such view", () => {
+    render(<Sidebar {...defaultProps} roots={[sampleRoot]} />);
+    expect(screen.queryByRole("button", { name: /Portrait Mode/ })).toBeNull();
+  });
+
   it("calls onSelectRoot when root card clicked", async () => {
     const onSelectRoot = vi.fn();
     render(<Sidebar {...defaultProps} roots={[sampleRoot]} onSelectRoot={onSelectRoot} />);

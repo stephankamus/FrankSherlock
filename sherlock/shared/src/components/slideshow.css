@@ -1,0 +1,162 @@
+/*
+ * The portrait frame.
+ *
+ * It is intentionally self-contained: the desktop puts it in a grid cell and the
+ * web puts it in a flex column, so the component fills whatever box it is given.
+ * The image uses `contain`, never `cover`: a digital frame must not crop faces.
+ */
+
+.slideshow {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  background: #050505;
+  color: #fff;
+  user-select: none;
+}
+
+.slideshow-image {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  animation: slideshow-fade 500ms ease;
+}
+
+@keyframes slideshow-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.slideshow-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 24px;
+  text-align: center;
+  color: rgba(255, 255, 255, 0.82);
+  font-size: var(--font-size-sm, 0.85rem);
+}
+
+.slideshow-state button {
+  padding: 6px 14px;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: var(--radius-sm, 4px);
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+  font: inherit;
+  cursor: pointer;
+}
+
+.slideshow-state button:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.slideshow-nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 46px;
+  height: 46px;
+  display: grid;
+  place-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.45);
+  color: #fff;
+  font-size: 1.6rem;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s ease, background 0.15s ease;
+}
+
+.slideshow:hover .slideshow-nav,
+.slideshow-nav:focus-visible {
+  opacity: 1;
+}
+
+.slideshow-nav:hover,
+.slideshow-nav:focus-visible {
+  background: rgba(0, 0, 0, 0.72);
+  outline: none;
+}
+
+.slideshow-nav-prev {
+  left: 18px;
+}
+
+.slideshow-nav-next {
+  right: 18px;
+}
+
+.slideshow-caption {
+  position: absolute;
+  left: 18px;
+  right: 18px;
+  bottom: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm, 4px);
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.55), rgba(0, 0, 0, 0));
+  color: rgba(255, 255, 255, 0.82);
+  font-size: 0.72rem;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  pointer-events: none;
+}
+
+.slideshow:hover .slideshow-caption,
+.slideshow:focus-within .slideshow-caption {
+  opacity: 1;
+}
+
+.slideshow-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.slideshow-counter {
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 720px) {
+  .slideshow-nav {
+    width: 38px;
+    height: 38px;
+    font-size: 1.35rem;
+  }
+
+  .slideshow-nav-prev {
+    left: 8px;
+  }
+
+  .slideshow-nav-next {
+    right: 8px;
+  }
+
+  .slideshow-caption {
+    left: 8px;
+    right: 8px;
+    bottom: 8px;
+  }
+}

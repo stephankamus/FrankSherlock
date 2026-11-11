@@ -22,6 +22,13 @@
   overflow: hidden;
 }
 
+/* The shared portrait frame stretches to the grid cell; the min-* resets keep a
+   large photo from forcing the row taller than the window. */
+.main-area > .slideshow {
+  min-width: 0;
+  min-height: 0;
+}
+
 @media (max-width: 960px) {
   .main-area {
     grid-template-columns: 0px 1fr;

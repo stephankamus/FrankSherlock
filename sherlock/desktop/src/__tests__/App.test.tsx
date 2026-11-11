@@ -306,7 +306,7 @@ describe("App", () => {
 
   it("renders the titlebar with app name", () => {
     renderApp();
-    expect(screen.getByText("Frank Sherlock")).toBeInTheDocument();
+    expect(screen.getByText(/Frank Sherlock/)).toBeInTheDocument();
   });
 
   it("renders the sidebar with empty message", () => {
@@ -314,19 +314,14 @@ describe("App", () => {
     expect(screen.getByText("No folders scanned yet")).toBeInTheDocument();
   });
 
-  it("renders the content area with search query input", () => {
+  it("opens in Portrait Mode instead of the grid", () => {
     renderApp();
-    expect(screen.getByLabelText("Search query")).toBeInTheDocument();
-  });
-
-  it("renders the media type filter", () => {
-    renderApp();
-    expect(screen.getByLabelText("Media type filter")).toBeInTheDocument();
-  });
-
-  it("renders sort controls", () => {
-    renderApp();
-    expect(screen.getByLabelText("Sort field")).toBeInTheDocument();
+    expect(
+      screen.getByRole("region", { name: "Portrait mode slideshow" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText("Search query")).toBeNull();
+    expect(screen.queryByLabelText("Media type filter")).toBeNull();
+    expect(screen.queryByLabelText("Sort field")).toBeNull();
   });
 
   it("renders the status bar", () => {
@@ -462,6 +457,7 @@ describe("App - API integration on init", () => {
       ocrEngine: "llm",
       startupScan: "ask",
       imageFilter: "auto",
+      slideshowSeconds: 30,
       dedupeDhashDistance: 6,
       chainBacklog: true,
       faceDetection: false,
@@ -495,6 +491,7 @@ describe("App - API integration on init", () => {
       ocrEngine: "llm",
       startupScan: "classify_only",
       imageFilter: "auto",
+      slideshowSeconds: 30,
       dedupeDhashDistance: 6,
       chainBacklog: true,
       faceDetection: false,
@@ -529,6 +526,7 @@ describe("App - API integration on init", () => {
       ocrEngine: "llm",
       startupScan: "ask",
       imageFilter: "auto",
+      slideshowSeconds: 30,
       dedupeDhashDistance: 6,
       chainBacklog: true,
       faceDetection: false,
@@ -620,10 +618,16 @@ describe("App - API integration on init", () => {
 });
 
 describe("App - default view mode", () => {
-  it("renders Content view by default with toolbar, not Faces/Duplicates/PDF Passwords views", () => {
+  it("starts on the Portrait Mode entry of the sidebar", () => {
     renderApp();
-    expect(screen.getByLabelText("Search query")).toBeInTheDocument();
-    expect(screen.getByLabelText("Media type filter")).toBeInTheDocument();
+
+    expect(
+      screen.getByRole("region", { name: "Portrait mode slideshow" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Portrait Mode/ })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
   });
 
   it("shows Find Duplicates, Faces, and PDF Passwords tool buttons in sidebar", () => {

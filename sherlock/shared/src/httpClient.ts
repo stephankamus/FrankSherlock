@@ -66,6 +66,7 @@ export function searchQueryString(request: SearchRequest): string {
   if (request.dateTo) params.set("dateTo", request.dateTo);
   if (request.sortBy) params.set("sortBy", request.sortBy);
   if (request.sortOrder) params.set("sortOrder", request.sortOrder);
+  if (request.imagesOnly) params.set("imagesOnly", "true");
   if (request.limit != null) params.set("limit", String(request.limit));
   if (request.offset != null) params.set("offset", String(request.offset));
   return params.toString();

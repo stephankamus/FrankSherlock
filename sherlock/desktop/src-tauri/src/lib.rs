@@ -1609,6 +1609,11 @@ fn publish_options_from_config(
             .and_then(|value| value.as_u64())
             .unwrap_or(2) as u32,
         database_only: false,
+        // Portrait Mode is a desktop preference stored in settings.toml; the
+        // pointer carries it so the web does not need a second setting.
+        slideshow_seconds: config::load_runtime_settings()
+            .map(|settings| settings.slideshow_seconds)
+            .unwrap_or(config::DEFAULT_SLIDESHOW_SECONDS),
     })
 }
 

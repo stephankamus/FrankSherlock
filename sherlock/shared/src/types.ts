@@ -17,7 +17,11 @@
  * branching on the platform.
  */
 
-export type SortField = "relevance" | "dateModified" | "name" | "type";
+/**
+ * `random` is only used by the portrait slideshow: it asks the backend for an
+ * unordered sample instead of a page of the normal listing.
+ */
+export type SortField = "relevance" | "dateModified" | "name" | "type" | "random";
 export type SortOrder = "asc" | "desc";
 
 /** What the natural-language query parser understood from the search box. */
@@ -53,6 +57,14 @@ export type SearchRequest = {
   dateTo?: string;
   sortBy?: SortField;
   sortOrder?: SortOrder;
+  /**
+   * Keep only rows that can be rendered as a still picture.
+   *
+   * The slideshow uses it to exclude video and PDF rows, which the media-type
+   * filter cannot express because `normalize_media_types` only accepts the
+   * classification categories (photo, anime, document, …).
+   */
+  imagesOnly?: boolean;
   /** Desktop only. Never serialized by the HTTP client. */
   includeHidden?: boolean;
 };
@@ -401,4 +413,6 @@ export type LibraryInfo = {
   databaseBytes: number;
   files: number;
   hiddenFiles: number;
+  /** Portrait Mode interval published by the desktop; absent on older snapshots. */
+  slideshowSeconds?: number;
 };

@@ -131,6 +131,7 @@ export function toSettingsPayload(settings: VisionSettings): SettingsUpdatePaylo
     imageFilter: settings.imageFilter,
     ocrEngine: settings.ocrEngine,
     startupScan: settings.startupScan,
+    slideshowSeconds: settings.slideshowSeconds ?? 30,
     dedupeDhashDistance: settings.dedupeDhashDistance,
     chainBacklog: settings.chainBacklog,
     faceDetection: settings.faceDetection,
@@ -503,6 +504,22 @@ export default function SettingsModal({ onClose, onSaved, onOpenLogs }: Props) {
                   <option key={option.value} value={option.value}>{option.label}</option>
                 ))}
               </select>
+            </div>
+
+            <div className="settings-field">
+              <label htmlFor="settings-slideshow">Portrait Mode interval</label>
+              <input
+                id="settings-slideshow"
+                type="number"
+                min={5}
+                max={3600}
+                value={settings.slideshowSeconds ?? 30}
+                onChange={(e) => patch({ slideshowSeconds: Number(e.target.value) })}
+              />
+              <span className="settings-hint">
+                Seconds each photo stays on screen in Portrait Mode. The same value is
+                published to the web app.
+              </span>
             </div>
 
             <div className="settings-field">

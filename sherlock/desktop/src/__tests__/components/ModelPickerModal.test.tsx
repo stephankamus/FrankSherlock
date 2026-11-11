@@ -28,6 +28,7 @@ const settings: VisionSettings = {
   ocrEngine: "llm",
   startupScan: "ask",
   imageFilter: "auto",
+  slideshowSeconds: 30,
   dedupeDhashDistance: 6,
   chainBacklog: true,
   faceDetection: false,

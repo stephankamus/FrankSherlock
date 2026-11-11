@@ -81,12 +81,18 @@ function renderApp(client: LibraryClient) {
 }
 
 describe("web App", () => {
-  it("renders the library shell with the mapped roots", async () => {
-    renderApp(makeClient());
+  it("opens in Portrait Mode and still shows the mapped roots", async () => {
+    const client = makeClient();
+    renderApp(client);
 
     expect(screen.getByText("Frank Sherlock")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("region", { name: "Portrait mode slideshow" }),
+    ).toBeInTheDocument();
     expect(await screen.findByText("Fotos")).toBeInTheDocument();
-    expect(screen.getByText("0 of 0 results")).toBeInTheDocument();
+    expect(client.search).toHaveBeenCalledWith(
+      expect.objectContaining({ sortBy: "random", imagesOnly: true }),
+    );
   });
 
   it("warns about roots this deployment cannot mount", async () => {
@@ -100,7 +106,7 @@ describe("web App", () => {
     expect(screen.getByText(/\/elsewhere/)).toBeInTheDocument();
   });
 
-  it("shows the API error instead of an empty grid", async () => {
+  it("shows the API error instead of an empty frame", async () => {
     renderApp(
       makeClient({
         search: vi.fn(async () => {
@@ -109,6 +115,6 @@ describe("web App", () => {
       }),
     );
 
-    expect(await screen.findByText("MEDIA_MAP is not set")).toBeInTheDocument();
+    expect(await screen.findByText(/MEDIA_MAP is not set/)).toBeInTheDocument();
   });
 });

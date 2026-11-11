@@ -203,6 +203,49 @@
   min-height: 0;
 }
 
+.sidebar-portrait {
+  padding: 8px 8px 2px;
+}
+
+.sidebar-portrait-btn {
+  all: unset;
+  box-sizing: border-box;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.sidebar-portrait-btn:hover {
+  background: var(--bg-hover);
+}
+
+.sidebar-portrait-btn.active {
+  background: var(--bg-hover);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.sidebar-portrait-btn:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.sidebar-portrait-icon {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  font-size: 0.9rem;
+  line-height: 1;
+}
+
 .sidebar-tools-fixed {
   flex-shrink: 0;
   border-top: 1px solid var(--border-primary);

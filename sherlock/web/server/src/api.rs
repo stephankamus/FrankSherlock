@@ -223,6 +223,7 @@ async fn library(State(state): State<Arc<AppState>>) -> Result<Json<LibraryInfo>
         database_bytes: snapshot.pointer.database.bytes,
         files: snapshot.pointer.library.files,
         hidden_files: snapshot.pointer.library.hidden_files,
+        slideshow_seconds: snapshot.pointer.slideshow_seconds,
     }))
 }
 
@@ -236,6 +237,8 @@ struct LibraryInfo {
     database_bytes: u64,
     files: u64,
     hidden_files: u64,
+    /// Portrait Mode interval published by the desktop.
+    slideshow_seconds: u32,
 }
 
 async fn roots(State(state): State<Arc<AppState>>) -> Result<Json<Vec<WebRoot>>, ApiError> {
@@ -294,6 +297,9 @@ struct SearchParams {
     sort_by: Option<SortField>,
     #[serde(default)]
     sort_order: Option<SortOrder>,
+    /// Keep only still pictures; the portrait slideshow sends this.
+    #[serde(default)]
+    images_only: Option<bool>,
     #[serde(default)]
     limit: Option<u32>,
     #[serde(default)]
@@ -316,6 +322,7 @@ async fn search(
         date_to: params.date_to,
         sort_by: params.sort_by.unwrap_or_default(),
         sort_order: params.sort_order.unwrap_or_default(),
+        images_only: params.images_only.unwrap_or(false),
         include_hidden: false,
     };
 

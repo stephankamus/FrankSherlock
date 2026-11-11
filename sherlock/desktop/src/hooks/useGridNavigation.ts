@@ -3,6 +3,8 @@ import { copyFilesToClipboard } from "../api";
 import type { SearchItem, SetupStatus, RootInfo } from "../types";
 
 type GridNavParams = {
+  /** False while Portrait Mode owns the screen and handles its own arrows. */
+  enabled?: boolean;
   items: SearchItem[];
   selectedIndices: Set<number>;
   focusIndex: number | null;
@@ -72,6 +74,10 @@ export function useGridNavigation(p: GridNavParams) {
       }
 
       if (p.showResumeModal || p.confirmDeleteRoot || p.showHelp || p.hasModalOpen || (p.setup && !p.setup.isReady)) return;
+
+      // Portrait Mode listens to ArrowLeft/ArrowRight itself; the grid must not
+      // also move a hidden selection or open a preview.
+      if (p.enabled === false) return;
 
       if (e.key === "Delete") {
         e.preventDefault();
@@ -157,7 +163,7 @@ export function useGridNavigation(p: GridNavParams) {
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [
-    p.focusIndex, p.anchorIndex, p.selectedIndices, p.previewOpen,
+    p.enabled, p.focusIndex, p.anchorIndex, p.selectedIndices, p.previewOpen,
     p.items.length, p.showSummary, p.showResumeModal, p.confirmDeleteRoot,
     p.showHelp, p.hasModalOpen, p.setup?.isReady, p.canLoadMore, p.forceShowSetup,
   ]);

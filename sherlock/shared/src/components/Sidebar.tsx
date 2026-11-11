@@ -78,6 +78,10 @@ type SidebarProps<TRoot extends RootInfo = RootInfo> = {
   onFindDuplicates?: () => void;
   onOpenPdfPasswords?: () => void;
   onOpenFaces?: () => void;
+  /** Switch to the random-photo portrait frame (the app's home view). */
+  onOpenPortraitMode?: () => void;
+  /** Highlight the Portrait Mode entry while that view is showing. */
+  portraitModeActive?: boolean;
   updateInfo?: UpdateInfo | null;
   updateChecking?: boolean;
   updateDownloading?: boolean;
@@ -99,7 +103,7 @@ export default function Sidebar<TRoot extends RootInfo = RootInfo>({
   onCancelScan, onResumeScan, onOpenSettings,
   onSelectAlbum, onDeleteAlbum, onSelectSmartFolder, onDeleteSmartFolder,
   onReorderRoots, onReorderAlbums, onReorderSmartFolders, onFindDuplicates,
-  onOpenPdfPasswords, onOpenFaces,
+  onOpenPdfPasswords, onOpenFaces, onOpenPortraitMode, portraitModeActive,
   updateInfo, updateChecking, updateDownloading, updateProgress,
   onCheckUpdates, onInstallUpdate,
 }: SidebarProps<TRoot>) {
@@ -141,6 +145,23 @@ export default function Sidebar<TRoot extends RootInfo = RootInfo>({
   return (
     <aside className="sidebar">
       <div className="sidebar-scroll">
+        {onOpenPortraitMode && (
+          <div className="sidebar-portrait">
+            <button
+              type="button"
+              className={`sidebar-portrait-btn${portraitModeActive ? " active" : ""}`}
+              onClick={onOpenPortraitMode}
+              aria-pressed={portraitModeActive}
+              title="Show random photos in a full-screen portrait frame"
+            >
+              <span className="sidebar-portrait-icon" aria-hidden="true">
+                &#9635;
+              </span>
+              Portrait Mode
+            </button>
+          </div>
+        )}
+
         <div className="sidebar-section">
           <span>Folders</span>
           {!readOnly && (

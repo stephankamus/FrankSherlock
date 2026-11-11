@@ -61,6 +61,9 @@ pub struct PublishOptions {
     /// already in the folder are left untouched, so hiding photos reaches the web
     /// without walking the whole cache over the share.
     pub database_only: bool,
+    /// Seconds per photo in Portrait Mode, mirrored into `current.json` so the web
+    /// client reads the same preference as the desktop.
+    pub slideshow_seconds: u32,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -634,6 +637,9 @@ fn build_pointer(
             "roots": stats.roots,
             "hiddenFiles": hidden,
         },
+        // Read by `/api/library`; the web falls back to 30s when an older
+        // pointer has no such field.
+        "slideshowSeconds": options.slideshow_seconds,
         "thumbnails": {
             "dir": THUMBS_DIR,
             "copied": report.thumbnails_copied,
@@ -779,6 +785,7 @@ mod tests {
             include_face_crops: true,
             keep_revisions: 2,
             database_only: false,
+            slideshow_seconds: 30,
         }
     }
 
@@ -862,6 +869,10 @@ mod tests {
         let pointer: serde_json::Value =
             serde_json::from_slice(&fs::read(publish_dir.join(CURRENT_POINTER)).expect("pointer"))
                 .expect("json");
+        assert_eq!(
+            pointer["slideshowSeconds"], 30,
+            "the pointer must carry the desktop portrait interval"
+        );
         assert_eq!(pointer["revision"], report.revision);
         assert_eq!(
             pointer["database"]["file"],

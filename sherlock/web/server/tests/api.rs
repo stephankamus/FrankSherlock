@@ -100,6 +100,7 @@ fn build() -> Fixture {
         "schemaVersion": 21,
         "database": { "file": "index.rev-001.sqlite", "bytes": 4096, "sha256": "00" },
         "library": { "files": 4, "roots": 2, "hiddenFiles": 1 },
+        "slideshowSeconds": 42,
         "thumbnails": { "dir": "thumbs" },
         "faceCrops": { "dir": "" },
         "roots": [
@@ -350,6 +351,10 @@ async fn the_library_endpoint_matches_the_pointer() {
     assert_eq!(library["revision"], "rev-001");
     assert_eq!(library["databaseFile"], "index.rev-001.sqlite");
     assert_eq!(library["hiddenFiles"], 1);
+    assert_eq!(
+        library["slideshowSeconds"], 42,
+        "the web Portrait Mode interval comes from the published pointer"
+    );
     assert!(
         Path::new(&library["databaseFile"].as_str().expect("file")).is_relative(),
         "the pointer must only ever name a file inside the library"

@@ -78,6 +78,7 @@ import { useAlbumManager } from "./hooks/useAlbumManager";
 import { useSmartFolderManager } from "./hooks/useSmartFolderManager";
 import { useDuplicatesManager } from "./hooks/useDuplicatesManager";
 import "./app.css";
+import ImagesShuffleView from "./components/Content/ImagesShuffleView";
 
 const POLL_MS = 1200;
 
@@ -170,6 +171,9 @@ export default function App() {
   const [forceShowSetup, setForceShowSetup] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [pdfPasswordsMode, setPdfPasswordsMode] = useState(false);
+
+  //Images Shuffle Mode:
+  const [imagesShuffleMode, setImagesShuffleMode] = useState(true);
 
   /* ── Directory tree: derived from query ── */
   const selectedSubdir = useMemo(() => {
@@ -462,6 +466,7 @@ export default function App() {
   }, [selectedIndices, items]);
 
   useGridNavigation({
+    enabled: !imagesShuffleMode,
     items,
     selectedIndices,
     focusIndex,
@@ -515,6 +520,7 @@ export default function App() {
   }, [query]);
 
   const subtitle = useMemo(() => {
+    if (imagesShuffleMode) return "Portrait Mode";
     if (faces.facesMode) return "Faces";
     if (pdfPasswordsMode) return "PDF Passwords";
     if (duplicates.duplicatesMode) return "Find Duplicates";
@@ -528,22 +534,44 @@ export default function App() {
       }
     }
     return null;
-  }, [faces.facesMode, duplicates.duplicatesMode, activeAlbumName, smartFolderManager.activeSmartFolderId, smartFolderManager.smartFolders, selectedRootId, roots, selectedSubdir, pdfPasswordsMode]);
+  }, [imagesShuffleMode, faces.facesMode, duplicates.duplicatesMode, activeAlbumName, smartFolderManager.activeSmartFolderId, smartFolderManager.smartFolders, selectedRootId, roots, selectedSubdir, pdfPasswordsMode]);
 
   /* ── Mode switching coordination ── */
+  /**
+   * The portrait frame is the app's home view: one random photo at a time across
+   * the whole visible library. It owns the screen, so the selection, the folder
+   * scope and the search box are cleared and every other mode yields.
+   */
+  function enterPortraitMode() {
+    setImagesShuffleMode(true);
+    duplicates.setDuplicatesMode(false);
+    faces.setFacesMode(false);
+    setPdfPasswordsMode(false);
+    smartFolderManager.setActiveSmartFolderId(null);
+    setQuery("");
+    setSelectedRootId(null);
+    setSelectedMediaType("");
+    setPreviewOpen(false);
+    setContextMenu(null);
+    clearSelection();
+  }
+
   function enterDuplicatesMode(threshold?: number | null) {
+    setImagesShuffleMode(false);
     setPdfPasswordsMode(false);
     faces.setFacesMode(false);
     duplicates.onFindDuplicates(threshold);
   }
 
   function enterFacesMode() {
+    setImagesShuffleMode(false);
     faces.setFacesMode(true);
     duplicates.setDuplicatesMode(false);
     setPdfPasswordsMode(false);
   }
 
   function enterPdfPasswordsMode() {
+    setImagesShuffleMode(false);
     setPdfPasswordsMode(true);
     duplicates.setDuplicatesMode(false);
     faces.setFacesMode(false);
@@ -1013,6 +1041,7 @@ export default function App() {
   function handleSelectAlbum(album: typeof albumManager.albums[number]) {
     const { query: q } = albumManager.onSelectAlbum(album);
     setQuery(q);
+    setImagesShuffleMode(false);
     smartFolderManager.setActiveSmartFolderId(null);
     duplicates.setDuplicatesMode(false);
     setPdfPasswordsMode(false);
@@ -1039,6 +1068,7 @@ export default function App() {
   function handleSelectSmartFolder(folder: typeof smartFolderManager.smartFolders[number]) {
     const { query: q } = smartFolderManager.onSelectSmartFolder(folder);
     setQuery(q);
+    setImagesShuffleMode(false);
     duplicates.setDuplicatesMode(false);
     setPdfPasswordsMode(false);
     faces.setFacesMode(false);
@@ -1373,6 +1403,7 @@ export default function App() {
             if (root) setConfirmReclassifyFolder({ root, relPath: entry.relPath, name: entry.name });
           }}
           onSelectSubdir={(subdir) => {
+            setImagesShuffleMode(false);
             setQuery((q) => {
               const cleaned = q.replace(/\bsubdir:(?:"[^"]*?"|\S+)\s*/i, "").trim();
               if (!subdir) return cleaned;
@@ -1382,6 +1413,7 @@ export default function App() {
             smartFolderManager.setActiveSmartFolderId(null);
           }}
           onSelectRoot={(id) => {
+            setImagesShuffleMode(false);
             setSelectedRootId(id);
             setQuery((q) => q.replace(/\bsubdir:(?:"[^"]*?"|\S+)\s*/i, "").trim());
             duplicates.setDuplicatesMode(false);
@@ -1450,6 +1482,8 @@ export default function App() {
           onFindDuplicates={enterDuplicatesMode}
           onOpenPdfPasswords={enterPdfPasswordsMode}
           onOpenFaces={enterFacesMode}
+          onOpenPortraitMode={enterPortraitMode}
+          portraitModeActive={imagesShuffleMode}
           updateInfo={SHOW_UPDATE_CONTROLS ? autoUpdate.updateInfo : null}
           updateChecking={SHOW_UPDATE_CONTROLS ? autoUpdate.updateChecking : false}
           updateDownloading={SHOW_UPDATE_CONTROLS ? autoUpdate.updateDownloading : false}
@@ -1516,6 +1550,8 @@ export default function App() {
             onSelectGroupDuplicates={duplicates.onSelectGroupDuplicates}
             onPreviewGroup={handleDuplicatesPreviewGroup}
           />
+        ) : imagesShuffleMode ? (
+          <ImagesShuffleView intervalSeconds={visionSettings?.slideshowSeconds ?? 30} />
         ) : (
           <Content
             query={query}

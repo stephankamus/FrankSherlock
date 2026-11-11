@@ -53,6 +53,8 @@ as thumbs **não** podem ser achatadas porque `rel_path` colide entre roots.
   "generatedAtUnix": 1793156520,
   "schemaVersion": 20,
   "database": { "file": "index.20261027T190200Z.sqlite", "bytes": 314572800, "sha256": "…" },
+  "library": { "files": 40000, "roots": 1, "hiddenFiles": 12 },
+  "slideshowSeconds": 30,
   "thumbnails": { "dir": "thumbs", "files": 55120, "bytes": 1234567890 },
   "faceCrops": { "dir": "face_crops", "files": 4210, "bytes": 98765432 },
   "roots": [
@@ -61,6 +63,10 @@ as thumbs **não** podem ser achatadas porque `rel_path` colide entre roots.
   "publisher": { "app": "frank-sherlock", "version": "0.8.2", "host": "desktop" }
 }
 ```
+
+`slideshowSeconds` is the Portrait Mode interval configured in the desktop
+`settings.toml` (`slideshow_seconds`, default 30). The web client reads it from
+`/api/library` and falls back to 30 when an older pointer does not have it.
 
 `roots` existe para o web detectar root não mapeado **sem** abrir o banco (health e banner
 da UI). `schemaVersion` é o `PRAGMA user_version` do snapshot: o web recusa revisão mais nova
@@ -144,7 +150,7 @@ root.
 | Rota | Função |
 |------|--------|
 | `GET /api/health` | revisão ativa, schema, roots mapeados/não mapeados, contagens |
-| `GET /api/library` | metadados do `current.json` + stats |
+| `GET /api/library` | metadados do `current.json` + stats, incluindo `slideshowSeconds` |
 | `GET /api/roots` | roots com contagem, disponibilidade e `mapped: bool` |
 | `GET /api/subdirs?rootId&prefix` | árvore de diretórios |
 | `GET /api/search` | mesmo `SearchRequest` do desktop |
@@ -365,9 +371,11 @@ um publish obrigatório — fica para depois, se o espaço incomodar.
 
 ## 8. Escopo
 
-**v1:** busca com filtros e ordenação, grade com scroll infinito, sidebar de roots +
-subdiretórios + álbuns + smart folders, visualização de rostos, duplicados informativos,
-preview de imagem/vídeo (Range)/PDF (download), responsivo com drawer, PWA, Docker + CI.
+**v1:** página inicial em Portrait Mode (uma foto aleatória por vez, intervalo vindo de
+`current.json`, botões anterior/próximo e setas do teclado), busca com filtros e ordenação,
+grade com scroll infinito, sidebar de roots + subdiretórios + álbuns + smart folders,
+visualização de rostos, duplicados informativos, preview de imagem/vídeo (Range)/PDF
+(download), responsivo com drawer, PWA, Docker + CI.
 
 **Depois:** escrita a partir do web (overlay de anotações que sobrevive à publicação),
 transcodificação on-the-fly, cache local de thumbs, múltiplos usuários com permissões.
