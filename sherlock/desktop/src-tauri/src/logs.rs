@@ -43,10 +43,13 @@ const MAX_ARCHIVES: usize = 3;
 /// whole; `path` is `None` until the first line is written.
 #[tauri::command]
 pub fn read_logs(app: tauri::AppHandle, max_lines: Option<usize>) -> Result<LogSnapshot, String> {
-    let dir = app
-        .path()
-        .app_log_dir()
-        .map_err(|e| format!("cannot resolve the log directory: {e}"))?;
+    let dir = match crate::config::log_dir_override() {
+        Some(dir) => dir,
+        None => app
+            .path()
+            .app_log_dir()
+            .map_err(|e| format!("cannot resolve the log directory: {e}"))?,
+    };
     let Some(path) = newest_log_file(&dir) else {
         return Ok(LogSnapshot {
             path: None,

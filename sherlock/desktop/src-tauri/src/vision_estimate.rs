@@ -231,7 +231,9 @@ struct CachedCalibration {
 }
 
 fn cache_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|dir| dir.join("frank_sherlock").join("vision_calibration.json"))
+    crate::config::user_config_dir()
+        .ok()
+        .map(|dir| dir.join("vision_calibration.json"))
 }
 
 fn cache_key(root: &Path, model: &str, settings: &VisionSettings, gpu_signature: &str) -> String {

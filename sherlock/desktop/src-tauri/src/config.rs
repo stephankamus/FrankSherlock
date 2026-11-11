@@ -4,6 +4,12 @@ use std::path::{Path, PathBuf};
 use crate::error::{AppError, AppResult};
 
 pub const DATA_DIR_ENV: &str = "FRANK_SHERLOCK_DATA_DIR";
+/// Overrides the folder holding `config.json`, `settings.toml` and
+/// `vision_calibration.json` (default: `~/.config/frank_sherlock`).
+pub const CONFIG_DIR_ENV: &str = "FRANK_SHERLOCK_CONFIG_DIR";
+/// Overrides the folder the rotating log files are written to. The default is Tauri's
+/// per-identifier app log directory.
+pub const LOG_DIR_ENV: &str = "FRANK_SHERLOCK_LOG_DIR";
 
 #[derive(Debug, Clone)]
 pub struct AppPaths {
@@ -106,13 +112,38 @@ fn default_base_dir() -> AppResult<PathBuf> {
 // UI config (~/.config/frank_sherlock/config.json)
 // ---------------------------------------------------------------------------
 
-fn user_config_path() -> AppResult<PathBuf> {
+/// Folder holding `config.json`, `settings.toml` and the vision calibration cache.
+///
+/// Defaults to `~/.config/frank_sherlock`. `FRANK_SHERLOCK_CONFIG_DIR` lets a second
+/// instance (another library, another publish target) keep its own UI and runtime
+/// settings instead of sharing the installed app's files.
+pub fn user_config_dir() -> AppResult<PathBuf> {
+    if let Ok(value) = env::var(CONFIG_DIR_ENV) {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Ok(PathBuf::from(trimmed));
+        }
+    }
     if let Some(config_dir) = dirs::config_dir() {
-        return Ok(config_dir.join("frank_sherlock").join("config.json"));
+        return Ok(config_dir.join("frank_sherlock"));
     }
     Err(AppError::Config(
         "could not resolve user config directory".to_string(),
     ))
+}
+
+/// Custom log folder, when `FRANK_SHERLOCK_LOG_DIR` is set. `None` keeps Tauri's
+/// per-identifier app log directory.
+pub fn log_dir_override() -> Option<PathBuf> {
+    env::var(LOG_DIR_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn user_config_path() -> AppResult<PathBuf> {
+    Ok(user_config_dir()?.join("config.json"))
 }
 
 pub fn load_user_config() -> AppResult<serde_json::Value> {
@@ -734,12 +765,7 @@ impl RuntimeSettings {
 }
 
 fn runtime_settings_path() -> AppResult<PathBuf> {
-    if let Some(config_dir) = dirs::config_dir() {
-        return Ok(config_dir.join("frank_sherlock").join("settings.toml"));
-    }
-    Err(AppError::Config(
-        "could not resolve user config directory".to_string(),
-    ))
+    Ok(user_config_dir()?.join("settings.toml"))
 }
 
 pub fn ensure_runtime_settings_file() -> AppResult<PathBuf> {
@@ -1164,6 +1190,29 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn config_dir_and_log_dir_env_overrides_are_honoured() {
+        let _guard = ENV_LOCK.lock().expect("lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let custom = dir.path().join("profile-config");
+        env::set_var(CONFIG_DIR_ENV, custom.as_os_str());
+        env::set_var(LOG_DIR_ENV, custom.as_os_str());
+
+        assert_eq!(user_config_dir().expect("config dir"), custom);
+        assert_eq!(
+            user_config_path().expect("config path"),
+            custom.join("config.json")
+        );
+        assert_eq!(
+            runtime_settings_path().expect("settings path"),
+            custom.join("settings.toml")
+        );
+        assert_eq!(log_dir_override(), Some(custom));
+
+        env::remove_var(CONFIG_DIR_ENV);
+        env::remove_var(LOG_DIR_ENV);
+    }
 
     #[test]
     fn resolve_from_env_override() {

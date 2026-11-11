@@ -5,9 +5,9 @@
   "license": "GPL-3.0-only",
   "type": "module",
   "scripts": {
-    "dev": "vite --host --port 1420",
+    "dev": "vite --host",
     "build": "vite build",
-    "preview": "vite preview --host --port 1420",
+    "preview": "vite preview --host",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",

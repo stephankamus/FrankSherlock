@@ -125,12 +125,61 @@ FRANK_SHERLOCK_DATA_DIR=/tmp/frank-test npm run tauri:dev
 
 The environment variable overrides `~/.local/share/frank_sherlock` for the database, thumbnails and caches (see [`config.rs`](../sherlock/desktop/src-tauri/src/config.rs)).
 
+## 8. Running two libraries side by side (profiles)
+
+Use one profile per library when personal photos and, for example, animes must not
+share an index, settings or publish target:
+
+```bash
+# Terminal 1 — personal photos, Vite on 1420
+bash scripts/dev-profile.sh photos ~/Pictures
+
+# Terminal 2 — animes, Vite on 1421 and its own database
+bash scripts/dev-profile.sh animes /mnt/nas/Anime
+```
+
+The launcher starts `tauri dev` with a per-profile environment:
+
+| Variable | Default under `~/.local/share/frank-sherlock-profiles/<profile>/` | Contents |
+|---|---|---|
+| `FRANK_SHERLOCK_DATA_DIR` | `data/` | `index.sqlite`, thumbnails, caches, face crops, models, Python venvs |
+| `FRANK_SHERLOCK_CONFIG_DIR` | `config/` | `config.json`, `settings.toml`, `vision_calibration.json` |
+| `FRANK_SHERLOCK_LOG_DIR` | `logs/` | the log file the live-log modal reads |
+| `SHERLOCK_DEV_PORT` | `1420` for `photos`, `1421` for `animes` | Vite dev server port, mirrored into a generated `build.devUrl` overlay |
+
+`FRANK_SHERLOCK_PROFILE_ROOT` moves the whole profile tree elsewhere. Any profile name
+other than `photos`/`fotos` and `anime`/`animes` needs an explicit `--port`:
+
+```bash
+bash scripts/dev-profile.sh scratch --port 1422
+bash scripts/dev-profile.sh animes /mnt/nas/Anime -- --no-watch
+```
+
+The optional folder is passed to the application as `argv[1]`; omit it and pick the
+folder in the UI. Because `config.json` is per profile, each instance also keeps its own
+**Publish folder** — still choose a different folder for each library in
+Settings → Publicação, otherwise the second profile would overwrite the first web
+library's `current.json`.
+
+Disk and GPU notes:
+
+- `models/`, `surya_venv/` and `raw_venv/` are per data directory. After the first run,
+  symlink the read-only parts if you do not want a second copy:
+  `ln -s <photos>/data/models <anime>/data/models` (and the two venvs).
+- Ollama is shared by both processes. Avoid running two heavy scans at the same time;
+  they compete for the same GPU and will reload models. `SHERLOCK_OLLAMA_BASE` can point
+  one profile at a separate Ollama instance or proxy.
+- Two `tauri dev` watchers share the Cargo target directory and serialize on its lock.
+  Start the instances one after the other; pass `--no-watch` to the second if you do not
+  need hot reload in both.
+
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
 | Blank WebKit window on Wayland with NVIDIA | `WEBKIT_DISABLE_DMABUF_RENDERER=1 GDK_BACKEND=wayland,x11 npm run tauri:dev` |
 | `symbol lookup error: /snap/core20/.../libpthread.so.0: undefined symbol: __libc_pthread_init` | Snap-packaged editor leaked GTK paths into the terminal. Run `bash scripts/dev-linux.sh` |
+| `ENOSPC: System limit for number of file watchers reached` | Vite was watching `src-tauri/target`; the `server.watch.ignored` entries in `vite.config.ts` prevent it. Restart any dev instance started before that change. If the limit is still tight: `sudo sysctl fs.inotify.max_user_watches=524288` |
 | `failed to run 'cargo metadata'` from `tauri dev` | `cargo` is not on `PATH`; use `bash scripts/dev-linux.sh` or `export PATH="$HOME/.cargo/bin:$PATH"` |
 | `webkit2gtk-4.1` not found by `pkg-config` | Install `libwebkit2gtk-4.1-dev` and `libjavascriptcoregtk-4.1-dev` |
 | `error: linker cc not found` | Install `build-essential` |

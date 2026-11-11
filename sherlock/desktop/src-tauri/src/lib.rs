@@ -3730,8 +3730,8 @@ pub fn run() {
     };
 
     tauri::Builder::default()
-        .plugin(
-            tauri_plugin_log::Builder::default()
+        .plugin({
+            let mut builder = tauri_plugin_log::Builder::default()
                 .level(log::LevelFilter::Info)
                 // The plugin's defaults are 40 KB and `KeepOne`: past 40 KB the file
                 // is **deleted**, so a scan that logs one line per file erases its
@@ -3739,9 +3739,20 @@ pub fn run() {
                 // of 191 and lost the warnings that explain the crashes). Keep a few
                 // rotated files instead, which is what the diagnosis needs.
                 .max_file_size(16_u128 * 1024 * 1024)
-                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(3))
-                .build(),
-        )
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(3));
+            // A profile launched with its own data/config directories also gets its own
+            // log file, so the live-log modal never mixes two libraries.
+            if let Some(dir) = config::log_dir_override() {
+                builder = builder.targets([
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Folder {
+                        path: dir,
+                        file_name: None,
+                    }),
+                ]);
+            }
+            builder.build()
+        })
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
