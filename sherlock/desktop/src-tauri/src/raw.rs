@@ -230,6 +230,27 @@ fn output_dir_rel_path(source_rel_path: &str) -> String {
     normalize_rel_path(&parent.join(OUTPUT_DIR_NAME).to_string_lossy())
 }
 
+/// Does a recorded conversion satisfy the requested NEF strategy?
+///
+/// `RawConversion::mode` holds the decoder the sidecar actually used (`heic`, `preview`
+/// or `demosaic`), while `options.nef_mode` is the *strategy* the user picked (`auto`
+/// being the default). Comparing them with `==` made every HEIC copy — and every NEF
+/// copy resolved through an embedded preview — look pending, so pressing Convert again
+/// redid the whole library instead of only the files missing a copy.
+///
+/// `auto` is satisfied by either resolution (and by `heic`, which has no strategies); an
+/// explicit `preview`/`demosaic` is satisfied only by itself, so changing the strategy
+/// still regenerates the copies. An empty value is a legacy row written before the
+/// sidecar reported a mode: treat it as compatible rather than reconverting forever.
+pub fn mode_matches(recorded: &str, requested: &str) -> bool {
+    match requested {
+        "auto" => matches!(recorded, "" | "auto" | "heic" | "preview" | "demosaic"),
+        "preview" => matches!(recorded, "" | "auto" | "preview"),
+        "demosaic" => matches!(recorded, "" | "auto" | "demosaic"),
+        _ => recorded == requested,
+    }
+}
+
 /// True when this candidate still needs work: no recorded conversion, a different
 /// source (size or mtime changed), a missing output, or different options.
 pub fn needs_conversion(
@@ -251,7 +272,7 @@ pub fn needs_conversion(
     }
     conversion.max_side != options.max_side
         || conversion.quality != options.quality
-        || conversion.mode != options.nef_mode
+        || !mode_matches(&conversion.mode, &options.nef_mode)
 }
 
 /// Walk the root and collect convertible files, skipping our own output folder.
@@ -338,10 +359,13 @@ pub fn probe_writable(dir: &Path) -> bool {
 
 /// Build the report shown before the job starts.
 ///
-/// Pure arithmetic over the walk result: no filesystem access beyond what the walk
-/// already did, so opening the modal stays cheap on a large library.
+/// Pure arithmetic over the walk result plus one `exists()` per recorded source: the
+/// database row alone is not proof that the copy is still there, and counting a row whose
+/// `FrankSherlock-JPG` folder was deleted (or a write that failed) as "already converted"
+/// is what let the modal promise a handful of pending files while the job — which does
+/// check the output — redid the whole library.
 pub fn build_report(
-    _root: &Path,
+    root: &Path,
     candidates: &[RawCandidate],
     conversions: &[RawConversion],
 ) -> RawScanReport {
@@ -377,7 +401,9 @@ pub fn build_report(
             report.heic += 1;
         }
 
-        if conversions_by_source.contains_key(candidate.rel_path.as_str()) {
+        let done = conversions_by_source.contains_key(candidate.rel_path.as_str())
+            && output_abs_path(root, &candidate.rel_path).exists();
+        if done {
             entry.already_converted += 1;
         } else {
             report.pending += 1;
@@ -971,6 +997,50 @@ mod tests {
     }
 
     #[test]
+    fn needs_conversion_accepts_the_decoder_mode_the_sidecar_reports() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = dir.path().join("a.jpg");
+        std::fs::write(&output, b"x").expect("write");
+
+        // The sidecar reports the decoder it used ("heic" for HEIC, "preview" or
+        // "demosaic" for NEF), while the options carry the requested strategy. Treating
+        // the two as "options changed" is what made Convert redo the whole library while
+        // the modal promised only the remaining files.
+        let heic = conversion("a.heic", 10, 20);
+        assert!(!needs_conversion(
+            &candidate("a.heic", 10, 20),
+            Some(&heic),
+            &ConversionOptions::default(),
+            &output
+        ));
+
+        let nef = RawConversion {
+            source_ext: "nef".to_string(),
+            mode: "preview".to_string(),
+            ..conversion("a.nef", 10, 20)
+        };
+        assert!(!needs_conversion(
+            &candidate("a.nef", 10, 20),
+            Some(&nef),
+            &ConversionOptions::default(),
+            &output
+        ));
+
+        // Asking for full development is a real change when the copy came from the
+        // embedded preview.
+        let demosaic = ConversionOptions {
+            nef_mode: "demosaic".to_string(),
+            ..ConversionOptions::default()
+        };
+        assert!(needs_conversion(
+            &candidate("a.nef", 10, 20),
+            Some(&nef),
+            &demosaic,
+            &output
+        ));
+    }
+
+    #[test]
     fn needs_conversion_when_the_source_changed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let output = dir.path().join("a.jpg");
@@ -1134,6 +1204,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
         std::fs::create_dir_all(root.join("x")).expect("dirs");
+        std::fs::create_dir_all(root.join(OUTPUT_DIR_NAME)).expect("dirs");
+        std::fs::write(root.join(output_rel_path("a.heic")), b"copy").expect("write");
         let candidates = vec![
             candidate("a.heic", 1000, 1),
             candidate("a.nef", 2000, 1),
@@ -1158,6 +1230,23 @@ mod tests {
             .find(|d| d.rel_path.is_empty())
             .expect("root dir entry");
         assert_eq!(root_dir.already_converted, 1);
+    }
+
+    #[test]
+    fn build_report_does_not_trust_a_row_whose_copy_is_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let candidates = vec![candidate("a.heic", 1000, 1)];
+        let conversions = vec![RawConversion {
+            output_rel_path: output_rel_path("a.heic"),
+            ..conversion("a.heic", 1000, 1)
+        }];
+
+        // No `FrankSherlock-JPG/a__heic.jpg` on disk: the modal has to show it as
+        // pending, or Convert would promise one number and the job redo another.
+        let report = build_report(root, &candidates, &conversions);
+        assert_eq!(report.pending, 1);
+        assert_eq!(report.dirs[0].already_converted, 0);
     }
 
     #[test]
