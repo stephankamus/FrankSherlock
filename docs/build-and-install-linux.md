@@ -119,6 +119,7 @@ FRANK_SHERLOCK_DATA_DIR=/tmp/frank-build-test sherlock_app
 | `dlopen(): error loading libfuse.so.2` during AppImage bundling | Missing FUSE 2 runtime | `sudo apt install libfuse2t64` |
 | `symbol lookup error ... /snap/core20/.../libpthread.so.0` when running | Snap-packaged editor leaked GTK/GIO paths into the terminal | Run from a normal terminal, or use [`scripts/dev-linux.sh`](../scripts/dev-linux.sh) for dev runs; installed apps launched from the desktop menu are unaffected |
 | Blank WebKit window on Wayland with NVIDIA | WebKit DMA-BUF issue | `WEBKIT_DISABLE_DMABUF_RENDERER=1` |
+| `GLib-GIO-ERROR: Settings schema 'org.gnome.settings-daemon.plugins.xsettings' does not contain a key named 'antialiasing'` on startup | `gnome-settings-daemon` 46 moved `antialiasing`/`hinting`/`rgba-order` to the `.deprecated` schema and GTK3's GDK Wayland backend still reads the old one (crash happens before WebKit starts, so a WebKitGTK update does not help) | `bash scripts/fix-gnome-xsettings-schema.sh` — installs a per-user schema override (no root, survives upgrades); `GDK_BACKEND=x11` also avoids it. See [`dev-setup-linux.md`](dev-setup-linux.md#gnome-schema-crash-on-ubuntu-2404) |
 
 ## 8. Rebuild after pulling upstream changes
 

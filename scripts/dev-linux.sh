@@ -52,6 +52,17 @@ done
 # rustup installs here; a freshly installed toolchain is not on PATH yet.
 export PATH="$HOME/.cargo/bin:$PATH"
 
+# gnome-settings-daemon 46 moved antialiasing/hinting/rgba-order to the
+# ".deprecated" schema while GDK's Wayland backend still reads them from the old
+# one, so the app dies with `does not contain a key named 'antialiasing'` during
+# gtk_init_check(). Repair it per user.
+if ! gsettings list-keys org.gnome.settings-daemon.plugins.xsettings 2>/dev/null |
+    grep -qx antialiasing; then
+    echo "dev-linux: restoring GTK3 font keys in org.gnome.settings-daemon.plugins.xsettings"
+    bash "$SCRIPT_DIR/fix-gnome-xsettings-schema.sh" ||
+        echo "dev-linux: warning: could not restore the schema, the app may abort at startup" >&2
+fi
+
 cd "$DESKTOP_DIR"
 
 if [[ "$clean" == 1 ]]; then

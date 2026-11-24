@@ -148,6 +148,17 @@ if [[ "${LD_PRELOAD:-}" == *"/snap/"* ]]; then
 fi
 export PATH="$HOME/.cargo/bin:$PATH"
 
+# gnome-settings-daemon 46 moved antialiasing/hinting/rgba-order to the
+# ".deprecated" schema while GDK's Wayland backend still reads them from the old
+# one, so the app dies with `does not contain a key named 'antialiasing'` during
+# gtk_init_check(). Repair it per user.
+if ! gsettings list-keys org.gnome.settings-daemon.plugins.xsettings 2>/dev/null |
+    grep -qx antialiasing; then
+    echo "dev-profile: restoring GTK3 font keys in org.gnome.settings-daemon.plugins.xsettings"
+    bash "$SCRIPT_DIR/fix-gnome-xsettings-schema.sh" ||
+        echo "dev-profile: warning: could not restore the schema, the app may abort at startup" >&2
+fi
+
 profile_root="${FRANK_SHERLOCK_PROFILE_ROOT:-$HOME/.local/share/frank-sherlock-profiles/$profile}"
 mkdir -p "$profile_root/data" "$profile_root/config" "$profile_root/logs"
 

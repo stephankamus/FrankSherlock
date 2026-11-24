@@ -173,10 +173,45 @@ Disk and GPU notes:
   Start the instances one after the other; pass `--no-watch` to the second if you do not
   need hot reload in both.
 
+## GNOME schema crash on Ubuntu 24.04
+
+`tauri dev` aborts before the window opens with:
+
+```
+GLib-GIO-ERROR **: Settings schema 'org.gnome.settings-daemon.plugins.xsettings' does not contain a key named 'antialiasing'
+```
+
+`gnome-settings-daemon` 46 moved `antialiasing`, `hinting` and `rgba-order` to the
+`org.gnome.settings-daemon.plugins.xsettings.deprecated` schema, but GDK's Wayland
+backend still reads them from the non-deprecated one with an unguarded
+`g_settings_get_enum()` during `gtk_init_check()`. GLib kills the process on the failed
+lookup, before any WebKit or application code runs — a backtrace stops at
+`gtk::rt::init` → `gtk_init_check` → `libgdk-3.so.0` → `g_settings_get_enum`.
+
+So this is a GTK3 (3.24.41) bug, not a WebKitGTK one: updating `libwebkit2gtk-4.1`
+cannot fix it, and `noble` has no newer GTK3 (`3.24.41-4ubuntu1.3` is the newest
+candidate). It also explains why the crash is backend-dependent — `GDK_BACKEND=x11`
+escapes it, because the X11 backend takes these values from the XSETTINGS property.
+
+Restore the keys for your user instead — no root needed, and package upgrades do not
+undo it:
+
+```bash
+bash scripts/fix-gnome-xsettings-schema.sh            # install / repair
+bash scripts/fix-gnome-xsettings-schema.sh --dry-run  # show what it would do
+bash scripts/fix-gnome-xsettings-schema.sh --revert   # remove the override
+```
+
+The script copies the system schema (plus the gnome-settings-daemon enum table) into
+`$XDG_DATA_HOME/glib-2.0/schemas`, adds the three keys back and recompiles the schema
+cache. That directory outranks `/usr/share/glib-2.0/schemas`, which is why only this user
+is affected.
+
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
+| `GLib-GIO-ERROR: Settings schema 'org.gnome.settings-daemon.plugins.xsettings' does not contain a key named 'antialiasing'` | `gnome-settings-daemon` 46 moved the key and GTK3's GDK Wayland backend still reads it. Run `bash scripts/fix-gnome-xsettings-schema.sh` (temporary alternative: `GDK_BACKEND=x11`) |
 | Blank WebKit window on Wayland with NVIDIA | `WEBKIT_DISABLE_DMABUF_RENDERER=1 GDK_BACKEND=wayland,x11 npm run tauri:dev` |
 | `symbol lookup error: /snap/core20/.../libpthread.so.0: undefined symbol: __libc_pthread_init` | Snap-packaged editor leaked GTK paths into the terminal. Run `bash scripts/dev-linux.sh` |
 | `ENOSPC: System limit for number of file watchers reached` | Vite was watching `src-tauri/target`; the `server.watch.ignored` entries in `vite.config.ts` prevent it. Restart any dev instance started before that change. If the limit is still tight: `sudo sysctl fs.inotify.max_user_watches=524288` |
