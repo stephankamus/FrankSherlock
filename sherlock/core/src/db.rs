@@ -2026,8 +2026,15 @@ fn query_backlog_rows(
     // `include_faces` is what the scan's face toggle turns on: with it off the
     // selection is exactly what it was before faces existed, so an index full of
     // rows without faces does not turn every pass into a face pass.
+    //
+    // The media gate mirrors [`list_files_needing_face_scan`]. Video and PDF rows never
+    // get a `faces_scanned_at` — nothing detects faces on them — so an ungated clause
+    // selected the entire video library on every pass. The pipeline then ran the legacy
+    // classification path for each one, which is hours of ffmpeg and model requests
+    // spent re-classifying files that were already classified.
     let face_clause = if include_faces {
-        " OR faces_scanned_at IS NULL"
+        " OR (faces_scanned_at IS NULL AND media_type IN \
+         ('photo', 'screenshot', 'meme', 'anime', 'illustration', 'artwork'))"
     } else {
         ""
     };
@@ -11395,6 +11402,39 @@ mod tests {
         let row = rows.iter().find(|row| row.id == file_id).expect("row");
         assert!(row.needs_faces(), "and it is pending for faces");
         assert!(!row.needs_classification);
+    }
+
+    /// A video never records a face scan, so the face clause must not drag the whole
+    /// video library into every pass. That is what made a rescan of a few hundred new
+    /// files spend hours re-classifying thousands of already-classified videos.
+    #[test]
+    fn backlog_does_not_select_videos_for_faces_alone() {
+        let (_dir, db_path) = test_db_path();
+        init_database(&db_path).expect("init");
+        let root_id = upsert_root(&db_path, "/tmp/faces-video").expect("root");
+
+        let mut video = sample_record(root_id, "clip.mp4", "fp-clip");
+        video.media_type = "video".to_string();
+        upsert_file_record(&db_path, &video).expect("video");
+        // Classified and thumbnailed: faces are the only thing "missing", and a video
+        // can never have them.
+        update_file_thumb_and_dhash(
+            &db_path,
+            root_id,
+            "clip.mp4",
+            "/tmp/demo/thumbs/clip.mp4",
+            None,
+        )
+        .expect("thumb");
+        let video_id = file_id_by_path(&db_path, root_id, "clip.mp4");
+
+        assert!(
+            list_backlog_rows(&db_path, root_id, true)
+                .expect("backlog with faces")
+                .iter()
+                .all(|row| row.id != video_id),
+            "a classified video with a thumbnail has nothing left to do"
+        );
     }
 
     #[test]

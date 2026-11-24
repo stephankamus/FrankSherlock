@@ -1499,6 +1499,19 @@ fn face_pool_slices(block: &CtxBlock, configured_threads: u32) -> (Vec<CtxBlock>
 /// pipeline exists to fill, so faces get one thread and wait their turn.
 const FACE_THREADS_WITH_GPU_WORK: usize = 1;
 
+/// Media types the face detector is allowed to run on.
+///
+/// Mirrors the gate in `db::list_files_needing_face_scan` (and in the backlog query):
+/// video and PDF rows never record a `faces_scanned_at`, so counting them as "pending
+/// faces" made the pass's faces ratio never reach 100% — the sidebar showed
+/// `Faces: 7 / 3.494` forever.
+fn media_can_have_faces(media_type: &str) -> bool {
+    matches!(
+        media_type,
+        "photo" | "screenshot" | "meme" | "anime" | "illustration" | "artwork"
+    )
+}
+
 /// A group of backlog rows that resolve to the same context window.
 struct CtxBlock {
     /// `num_ctx` this block runs at. Ollama treats it as part of the runner
@@ -2597,7 +2610,13 @@ fn run_pipeline_blocks(
     // Faces are opt-in per pass, and they need two things the scan cannot provide by
     // itself: the models already on disk (a scan never downloads them) and an engine
     // nobody else is using (the Detect Faces button takes the same one).
-    let faces_wanted = ctx.face_detection && rows.iter().any(|row| row.needs_faces());
+    //
+    // Only rows the detector can actually process count: a pass whose only "pending"
+    // rows are videos would otherwise load ~180 MB of models to do nothing.
+    let faces_wanted = ctx.face_detection
+        && rows
+            .iter()
+            .any(|row| row.needs_faces() && media_can_have_faces(&row.media_type));
     // Availability is decided once, before any work: the models, the runtime library
     // and the engine being free. A pass that cannot do faces says why in one line
     // rather than discovering it row by row.
@@ -2627,7 +2646,9 @@ fn run_pipeline_blocks(
     };
     let faces_enabled = _face_guard.is_some();
     let faces_total = if faces_enabled {
-        rows.iter().filter(|row| row.needs_faces()).count() as u64
+        rows.iter()
+            .filter(|row| row.needs_faces() && media_can_have_faces(&row.media_type))
+            .count() as u64
     } else {
         0
     };
@@ -2799,9 +2820,15 @@ fn run_pipeline_blocks(
                 // spent a request.
                 let mut answered = false;
                 let item_ok = if item.legacy {
-                    classify_and_update(ctx, item.row.id, &item.row.abs_path);
-                    classified += 1;
-                    answered = true;
+                    // A video or PDF arrives here for a thumbnail or for faces as well
+                    // as for a missing description. Re-sending it to the model just
+                    // because it was selected is minutes of ffmpeg plus requests per
+                    // file, and it is what turned a 300-file rescan into hours.
+                    if item.row.needs_classification {
+                        classify_and_update(ctx, item.row.id, &item.row.abs_path);
+                        classified += 1;
+                        answered = true;
+                    }
                     true
                 } else if item.failed {
                     // The producer already counted it in `unreadable`. Returning `true`
