@@ -1864,25 +1864,50 @@ fn produce_backlog_items(
             continue;
         }
 
-        let Some(decoded) = thumbnail::decode_source(abs) else {
-            // Not counted toward the circuit breaker and not persisted: a file the
-            // NAS no longer has (or an unmounted share) says nothing about Ollama,
-            // and hiding the row would need a rescan to undo.
-            consecutive_unreadable += 1;
-            counters.unreadable.fetch_add(1, Ordering::Relaxed);
-            let item = BacklogItem {
-                row,
-                prepared: None,
-                dhash: None,
-                legacy: false,
-                failed: true,
-                skipped: false,
-                dedupe_hint: None,
-            };
-            if tx.send(item).is_err() {
-                break;
+        let decoded = match thumbnail::decode_source_checked(abs) {
+            Ok(decoded) => decoded,
+            Err(failure) => {
+                match &failure {
+                    thumbnail::DecodeFailure::Corrupt(reason) => {
+                        // The bytes were read and are not an image. Leaving this row
+                        // pending made every pass re-read the same file (and trip the
+                        // share heuristics five files at a time), and its
+                        // `faces_scanned_at = NULL` kept the Faces counter waiting for
+                        // a detection that can never happen. Persist it and say it has
+                        // no faces; a replacement file resets both through
+                        // `stamp_modified_rows`.
+                        mark_failed(ctx, row.id, "decode", reason);
+                        if let Err(e) = db::mark_faces_scanned(&ctx.db_path, row.id) {
+                            log::warn!(
+                                "Backlog: could not record that {} has no faces: {e}",
+                                row.rel_path
+                            );
+                        }
+                        counters.failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    thumbnail::DecodeFailure::Unreadable => {
+                        // Not counted toward the circuit breaker and not persisted: a
+                        // file the NAS no longer has (or an unmounted share) says
+                        // nothing about Ollama, and hiding the row would need a rescan
+                        // to undo.
+                        consecutive_unreadable += 1;
+                        counters.unreadable.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                let item = BacklogItem {
+                    row,
+                    prepared: None,
+                    dhash: None,
+                    legacy: false,
+                    failed: true,
+                    skipped: false,
+                    dedupe_hint: None,
+                };
+                if tx.send(item).is_err() {
+                    break;
+                }
+                continue;
             }
-            continue;
         };
         consecutive_unreadable = 0;
 
@@ -2439,19 +2464,24 @@ fn prepare_scan_rows(
 /// Failure kinds worth persisting on the row.
 ///
 /// Only the ones that are a property of **this file with this model**: a repetition
-/// loop, a context overflow, a body that does not parse after four attempts. Those are
-/// worth recording — but they are **not** proof that the file is hopeless, which is
-/// what [`MAX_CLASSIFY_ATTEMPTS`] exists for.
+/// loop, a context overflow, a body that does not parse after four attempts, or bytes
+/// that are not a decodable image. Those are worth recording — but they are **not**
+/// proof that the file is hopeless, which is what [`MAX_CLASSIFY_ATTEMPTS`] exists
+/// for.
 ///
-/// The environmental ones (`io`, `timeout`, `empty_frame`, `no_response`, `decode`,
-/// `prepare`, and an empty `unknown`) are deliberately **not** persisted: an
-/// unmounted share, a wedged runner or a row whose file was deleted on the NAS would
-/// otherwise be hidden from the backlog forever. That is not hypothetical — on
-/// 2026-10-26 a pass marked 44 rows as failed because their files no longer existed,
-/// and the same 44 fed the circuit breaker until the job aborted. Those rows belong
-/// back in the queue, where the next discovery can drop or heal them.
+/// The environmental ones (`io`, `timeout`, `empty_frame`, `no_response`, `prepare`,
+/// and an empty `unknown`) are deliberately **not** persisted: an unmounted share, a
+/// wedged runner or a row whose file was deleted on the NAS would otherwise be hidden
+/// from the backlog forever. That is not hypothetical — on 2026-10-26 a pass marked 44
+/// rows as failed because their files no longer existed, and the same 44 fed the
+/// circuit breaker until the job aborted. Those rows belong back in the queue, where
+/// the next discovery can drop or heal them.
+///
+/// `decode` is only recorded when the file's bytes *were read* and did not parse
+/// ([`thumbnail::DecodeFailure::Corrupt`]); a read error stays `io`-like and keeps the
+/// row pending.
 fn is_permanent_failure(kind: &str) -> bool {
-    matches!(kind, "repeat_limit" | "ctx_overflow" | "parse")
+    matches!(kind, "repeat_limit" | "ctx_overflow" | "parse" | "decode")
 }
 
 /// How many passes a file-intrinsic failure may be recorded before the row is taken
@@ -4276,6 +4306,68 @@ mod tests {
         );
     }
 
+    /// A corrupt image is read but cannot be decoded — the `Illegal start bytes:0`
+    /// files from the NAS. It must burn the attempt budget and leave the faces queue,
+    /// instead of being re-read on every pass and tripping the share heuristics.
+    #[test]
+    fn corrupt_image_leaves_the_backlog_and_the_faces_queue() {
+        let (ctx, root_id, root_path, dirs) = backlog_fixture();
+        // Same path, no longer an image.
+        std::fs::write(dirs[0].path().join("a.png"), b"\0\0\0\0not an image").expect("write");
+
+        let thumb_dir = ctx.thumb_dir_for(&thumbnail::root_key(&root_path));
+        for pass in 1..=MAX_CLASSIFY_ATTEMPTS {
+            let rows = db::list_backlog_rows(&ctx.db_path, root_id, false).expect("backlog");
+            assert_eq!(rows.len(), 1, "pass {pass}: the row is still pending");
+
+            let counters = BacklogCounters::default();
+            let (tx, rx) = std::sync::mpsc::sync_channel::<BacklogItem>(4);
+            produce_backlog_items(
+                tx,
+                &ctx,
+                root_id,
+                &thumb_dir,
+                &block_of(rows, crate::llm::MIN_NUM_CTX),
+                None,
+                &counters,
+                0,
+                None,
+                false,
+                FACE_THREADS_WITH_GPU_WORK,
+                None,
+            );
+
+            let item = rx.try_recv().expect("the row is reported as failed");
+            assert!(item.failed, "no vision request is spent on a corrupt file");
+            assert_eq!(counters.failed.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                counters.unreadable.load(Ordering::Relaxed),
+                0,
+                "a corrupt file is not evidence that the share stopped answering"
+            );
+
+            if pass == 1 {
+                let rows = db::list_backlog_rows(&ctx.db_path, root_id, false).expect("backlog");
+                assert!(
+                    rows[0].faces_scanned_at.is_some(),
+                    "an undecodable file has no faces to detect and must leave that queue"
+                );
+            }
+        }
+
+        assert!(
+            db::list_backlog_rows(&ctx.db_path, root_id, false)
+                .expect("backlog")
+                .is_empty(),
+            "after {MAX_CLASSIFY_ATTEMPTS} passes the corrupt row must leave the backlog"
+        );
+        assert_eq!(
+            db::failed_classification_count(&ctx.db_path, root_id).expect("count"),
+            1,
+            "and it is counted as failed, so 'Retry failed' is the way back in"
+        );
+    }
+
     /// Cancelling must stop before decoding anything, and must not leave a
     /// thumbnail behind.
     #[test]
@@ -4488,12 +4580,14 @@ mod tests {
         assert!(is_permanent_failure("repeat_limit"));
         assert!(is_permanent_failure("ctx_overflow"));
         assert!(is_permanent_failure("parse"));
+        // Only recorded when the bytes were read and did not parse; a read error is
+        // classified as unreadable and keeps the row pending.
+        assert!(is_permanent_failure("decode"));
         for kind in [
             "io",
             "timeout",
             "empty_frame",
             "no_response",
-            "decode",
             "prepare",
             "unknown",
         ] {
